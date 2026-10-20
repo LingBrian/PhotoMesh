@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="1070" viewBox="0 0 1540 1070">
+<defs><marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L9 4 L0 8Z" fill="#457fae"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="48" y="55" font-family="Noto Sans CJK SC" font-size="29" font-weight="bold" fill="#233348">P2P 照片上传与增量同步时序（示意）</text>
+<rect x="94" y="85" width="232" height="61" rx="12" fill="#edf4fb" stroke="#8fabc5"/>
+<text x="210" y="122" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="20" fill="#223249">Android 终端</text>
+<line x1="210" x2="210" y1="146" y2="990" stroke="#a3b7c9" stroke-dasharray="8 6"/>
+<rect x="644" y="85" width="232" height="61" rx="12" fill="#edf4fb" stroke="#8fabc5"/>
+<text x="760" y="122" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="20" fill="#223249">Windows 主节点</text>
+<line x1="760" x2="760" y1="146" y2="990" stroke="#a3b7c9" stroke-dasharray="8 6"/>
+<rect x="1204" y="85" width="232" height="61" rx="12" fill="#edf4fb" stroke="#8fabc5"/>
+<text x="1320" y="122" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="20" fill="#223249">NAS 主节点</text>
+<line x1="1320" x2="1320" y1="146" y2="990" stroke="#a3b7c9" stroke-dasharray="8 6"/>
+<line x1="226" y1="239" x2="744" y2="239" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="485.0" y="230" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">1. 创建上传会话、返回断点偏移</text>
+<line x1="226" y1="302" x2="744" y2="302" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="485.0" y="293" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">2. 分块上传 + 确认偏移</text>
+<path d="M760 365 h128 v22 h-128" fill="none" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="900" y="371" font-family="Noto Sans CJK SC" font-size="17" fill="#24394f">3. SHA-256 校验、原图原子提交</text>
+<path d="M760 428 h128 v22 h-128" fill="none" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="900" y="434" font-family="Noto Sans CJK SC" font-size="17" fill="#24394f">4. 写入 Asset + 签名事件</text>
+<line x1="776" y1="491" x2="1304" y2="491" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1040.0" y="482" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">5. P2P 安全认证及协议协商</text>
+<line x1="1304" y1="554" x2="776" y2="554" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1040.0" y="545" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">6. 发送缺失事件游标</text>
+<line x1="776" y1="617" x2="1304" y2="617" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1040.0" y="608" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">7. 仅有权限的事件批次</text>
+<path d="M1320 680 h128 v22 h-128" fill="none" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1460" y="686" font-family="Noto Sans CJK SC" font-size="17" fill="#24394f">8. 签名/ACL 校验，幂等入库</text>
+<line x1="1304" y1="743" x2="776" y2="743" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1040.0" y="734" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">9. 持久化 ACK</text>
+<line x1="776" y1="806" x2="1304" y2="806" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1040.0" y="797" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">10. 网络中断：暂存队列、指数退避</text>
+<line x1="1304" y1="869" x2="776" y2="869" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1040.0" y="860" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">11. 网络恢复：重新握手与反熵对账</text>
+<line x1="776" y1="932" x2="1304" y2="932" stroke="#457fae" stroke-width="2" marker-end="url(#ar)"/>
+<text x="1040.0" y="923" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#24394f">12. 缺失事件重放并 ACK</text>
+<rect x="60" y="1002" width="1410" height="44" rx="8" fill="#f1f7fc"/>
+<text x="765" y="1030" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" fill="#315373">原图默认留在所属节点；同步签名事件与授权元数据，按需单独请求原图。</text></svg>

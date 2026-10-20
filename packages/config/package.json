@@ -1,0 +1,7 @@
+{
+  "name": "@photomesh/config",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "exports": { "./tsconfig/base.json": "./tsconfig/base.json" }
+}

@@ -1,0 +1,8 @@
+packages:
+  - apps/web
+  - apps/desktop
+  - apps/node-agent
+  - packages/*
+
+allowBuilds:
+  esbuild: true

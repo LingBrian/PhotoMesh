@@ -1,0 +1,171 @@
+openapi: 3.1.0
+info:
+  title: PhotoMesh Node API (Design Draft)
+  version: 0.1.0
+  description: |
+    草案：用于最初合约讨论，不可直接作为已实现服务。
+    P2P 内部事件通道、端到端加密流程与会话身份另有协议安全设计。
+servers:
+  - url: https://localhost:8443
+security:
+  - deviceBearer: []
+paths:
+  /v1/health:
+    get:
+      summary: 核心服务健康检查（不返回敏感元数据）
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, protocolMin, protocolMax]
+                properties:
+                  status: {type: string, enum: [ok, degraded]}
+                  protocolMin: {type: integer}
+                  protocolMax: {type: integer}
+  /v1/libraries:
+    get:
+      summary: 当前主体有权查看的照片库
+      responses:
+        '200':
+          description: Library list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Library'}
+        '401': {description: Unauthorized}
+        '403': {description: Forbidden}
+  /v1/assets:
+    get:
+      summary: 授权范围内的游标分页时间线
+      parameters:
+        - in: query
+          name: libraryId
+          required: true
+          schema: {type: string}
+        - in: query
+          name: cursor
+          schema: {type: string}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Assets page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AssetPage'}
+        '403': {description: Library access denied}
+  /v1/uploads:
+    post:
+      summary: 创建有期限的分块上传会话
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: {type: string, minLength: 16}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UploadCreate'}
+      responses:
+        '201':
+          description: Upload session created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadSession'}
+        '403': {description: Denied}
+  /v1/uploads/{sessionId}:
+    get:
+      summary: 查询允许续传的偏移位置
+      parameters:
+        - in: path
+          name: sessionId
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Current state
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadSession'}
+  /v1/sync/hello:
+    post:
+      summary: 受信任节点 P2P 版本协商（仅内部受认证通道）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nodeId, protocolMin, protocolMax, nonce]
+              properties:
+                nodeId: {type: string}
+                protocolMin: {type: integer}
+                protocolMax: {type: integer}
+                nonce: {type: string}
+      responses:
+        '200':
+          description: Negotiated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agreedProtocol]
+                properties:
+                  agreedProtocol: {type: integer}
+        '403': {description: Node not paired or invalid signature}
+components:
+  securitySchemes:
+    deviceBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: device-bound-token
+  schemas:
+    Library:
+      type: object
+      required: [libraryId, title, encryptionPolicy]
+      properties:
+        libraryId: {type: string}
+        title: {type: string}
+        encryptionPolicy: {type: string, enum: [none, optional_e2ee, required_e2ee]}
+    Asset:
+      type: object
+      required: [assetId, libraryId, originNodeId, kind, sha256, availability]
+      properties:
+        assetId: {type: string}
+        libraryId: {type: string}
+        originNodeId: {type: string}
+        kind: {type: string, enum: [photo, video, live_photo]}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        capturedAt: {type: string, format: date-time}
+        availability: {type: string, enum: [online, cached, offline, missing]}
+    AssetPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Asset'}
+        nextCursor: {type: [string, 'null']}
+    UploadCreate:
+      type: object
+      required: [libraryId, filename, totalBytes, sha256]
+      properties:
+        libraryId: {type: string}
+        filename: {type: string, minLength: 1}
+        totalBytes: {type: integer, minimum: 0}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    UploadSession:
+      type: object
+      required: [sessionId, offset, expiresAt, state]
+      properties:
+        sessionId: {type: string}
+        offset: {type: integer, minimum: 0}
+        expiresAt: {type: string, format: date-time}
+        state: {type: string, enum: [created, uploading, verifying, completed, failed]}

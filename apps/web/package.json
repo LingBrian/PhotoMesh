@@ -1,0 +1,22 @@
+{
+  "name": "@photomesh/web",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "lint": "eslint src test vite.config.ts",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "build": "vite build"
+  },
+  "dependencies": { "@photomesh/i18n": "workspace:*", "vue": "^3.5.22", "vue-i18n": "^11.1.12" },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.11",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^3.1.1"
+  }
+}

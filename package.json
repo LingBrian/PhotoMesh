@@ -1,0 +1,27 @@
+{
+  "name": "photomesh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.25.0",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "test:mobile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/flutter-test.ps1",
+    "build": "turbo run build",
+    "build:mobile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/flutter-build.ps1",
+    "contracts:check": "pnpm --filter @photomesh/contracts test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.0.1",
+    "eslint-plugin-vue": "^10.5.1",
+    "globals": "^16.4.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.0",
+    "turbo": "^2.5.8"
+  }
+}

@@ -1,0 +1,13 @@
+flowchart TB
+    AND[Android / Flutter 终端] --- W[Windows Node Agent]
+    WEB[Vue Web 通过可信节点] --- W
+    DESK[Tauri + Vue Windows 桌面] --- W
+    W <-->|P2P 签名事件 / 授权索引| N[NAS Node Agent]
+    N <-->|P2P 签名事件 / 授权索引| L[Linux Node Agent]
+    W <-->|P2P| L
+    W --> OB1[(Windows SQLite + 原图)]
+    N --> OB2[(NAS SQLite + 原图)]
+    L --> OB3[(Linux SQLite + 原图)]
+    N -.允许时.-> AI[可选可信 AI Worker]
+    W -. 用户可选 .-> REL[自建 VPN / Relay]
+    N -. 用户可选 .-> REL

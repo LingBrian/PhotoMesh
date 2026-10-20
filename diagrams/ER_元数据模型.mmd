@@ -1,0 +1,36 @@
+erDiagram
+    IDENTITY ||--o{ DEVICE : owns
+    IDENTITY ||--o{ LIBRARY : owns
+    DEVICE ||--o{ NODE : hosts
+    LIBRARY ||--o{ ASSET : contains
+    LIBRARY ||--o{ ALBUM : defines
+    LIBRARY ||--o{ ACL_GRANT : permits
+    LIBRARY ||--o{ KEY_EPOCH : protects
+    ASSET ||--o{ ASSET_FILE : represents
+    ASSET_FILE ||--o{ FILE_LOCATION : stored_at
+    NODE ||--o{ FILE_LOCATION : holds
+    ALBUM ||--o{ ALBUM_MEMBERSHIP : has
+    ASSET ||--o{ ALBUM_MEMBERSHIP : joins
+    ASSET ||--o{ ASSET_TAG : tagged
+    ASSET ||--o{ TOMBSTONE : deletes
+    DEVICE ||--o{ EVENT : emits
+    LIBRARY ||--o{ EVENT : records
+    NODE ||--o{ SYNC_PEER : syncs
+    NODE ||--o{ JOB : runs
+
+    IDENTITY { string identity_id PK string public_key string status }
+    DEVICE { string device_id PK string identity_id FK string device_pubkey string trust_state }
+    NODE { string node_id PK string device_id FK string capabilities string state }
+    LIBRARY { string library_id PK string owner_id FK string encryption_policy int acl_epoch }
+    ACL_GRANT { string grant_id PK string library_id FK string subject_id string role int epoch }
+    KEY_EPOCH { string key_id PK string library_id FK int epoch string wrapped_ref }
+    ASSET { string asset_id PK string library_id FK string origin_node_id datetime capture_ts datetime deleted_at }
+    ASSET_FILE { string file_id PK string asset_id FK string sha256 long byte_size string media_role }
+    FILE_LOCATION { string location_id PK string file_id FK string node_id FK string path_ref string storage_class }
+    ALBUM { string album_id PK string library_id FK string title string kind }
+    ALBUM_MEMBERSHIP { string album_id FK string asset_id FK string add_tag string removed_by }
+    ASSET_TAG { string asset_id FK string tag string add_tag string removed_by }
+    EVENT { string event_id PK string author_device_id FK string library_id FK int author_seq string signature }
+    SYNC_PEER { string peer_id PK string node_id FK string ack_cursor }
+    TOMBSTONE { string entity_id PK string asset_id FK datetime retention_until string event_id }
+    JOB { string job_id PK string node_id FK string type string status string checkpoint }

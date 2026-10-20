@@ -1,0 +1,25 @@
+{
+  "name": "@photomesh/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "lint": "eslint src test vite.config.ts",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "build": "vite build"
+  },
+  "dependencies": { "@photomesh/i18n": "workspace:*", "@tauri-apps/api": "^2.8.0", "vue": "^3.5.22", "vue-i18n": "^11.1.12" },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.11",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^3.1.1"
+  }
+}

@@ -1,0 +1,27 @@
+sequenceDiagram
+    autonumber
+    participant A as Android 客户端
+    participant W as Windows 主节点
+    participant N as NAS 主节点
+    A->>W: 已授权配对 / 上传会话
+    W-->>A: 受限写入令牌 + 分块偏移
+    loop 分块上传/可续传
+        A->>W: PUT chunk + chunk 校验
+        W-->>A: 已持久化偏移 ACK
+    end
+    W->>W: 最终 SHA-256 校验 / 原子提交原图
+    W->>W: 事务写入 Asset + 签名事件 Outbox
+    W-->>A: 上传成功 + AssetId
+    W->>N: 已认证 P2P Hello + 版本/能力协商
+    N-->>W: 游标/缺失事件摘要
+    W->>N: 仅有权限事件批量同步
+    N->>N: 校验签名/权限/因果 + 幂等入库
+    N-->>W: 已持久化事件 ACK
+    Note over W,N: NAS 只同步授权元数据，不默认复制 Windows 原图
+    Note over W,N: 模拟网络中断 / 节点重启
+    W-xN: 连接断开
+    N->>N: 保留本地游标、缓存与待同步任务
+    N->>W: 网络恢复后重新连接 / 对账
+    W-->>N: 缺失事件重放 / 防重复
+    N-->>W: 最终 ACK
+    Note over A,N: NAS 按需请求原图时必须再次校验资产和文件权限

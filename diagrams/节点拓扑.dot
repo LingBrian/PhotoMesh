@@ -1,0 +1,17 @@
+digraph G {
+  graph [rankdir=TB,bgcolor="white",nodesep="0.8",ranksep="0.85",pad="0.25"];
+  node [shape=box, style="rounded,filled", fillcolor="#f4f8fc",color="#91aac3",fontname="Noto Sans CJK SC",fontsize=16,margin="0.26,0.15"];
+  edge [color="#5b8eb6",penwidth=1.5,dir=both];
+  W [label="Windows 主节点\nSQLite + 原图"];
+  N [label="NAS 主节点\nSQLite + 原图"];
+  L [label="Linux 主节点\nSQLite + 原图"];
+  W -> N [label="授权元数据/签名事件"];
+  N -> L [label="P2P"];
+  W -> L [label="P2P"];
+  A [label="Android / Flutter 上传",fillcolor="#e9f6ed"];
+  V [label="Windows / Web 统一相册",fillcolor="#e9f6ed"];
+  A -> N [label="上传/续传",dir=forward];
+  V -> W [label="权限校验",dir=forward];
+  AI [label="可选可信 AI Worker",fillcolor="#fff6e8"];
+  N -> AI [style=dashed,label="获授权后可用",dir=forward];
+}

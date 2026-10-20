@@ -1,0 +1,10 @@
+{
+  "name": "@photomesh/i18n",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "exports": {
+    "./locales/zh-CN.json": "./locales/zh-CN.json",
+    "./locales/en.json": "./locales/en.json"
+  }
+}

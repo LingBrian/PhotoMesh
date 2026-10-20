@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PhotoMesh",
+  "version": "0.1.0",
+  "identifier": "org.photomesh.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "title": "PhotoMesh", "width": 1100, "height": 760, "minWidth": 720, "minHeight": 520 }],
+    "security": { "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline';" }
+  },
+  "bundle": { "active": true, "targets": "all" }
+}

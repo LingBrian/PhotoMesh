@@ -1,0 +1,19 @@
+{
+  "name": "@photomesh/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "lint": "eslint test",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
+    "ajv": "^8.17.1",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.4",
+    "yaml": "^2.8.1"
+  }
+}

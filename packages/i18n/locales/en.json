@@ -1,0 +1,9 @@
+{
+  "home": {
+    "eyebrow": "Self-hosted · Original-safe · Multi-node",
+    "title": "PhotoMesh",
+    "description": "The gallery service foundation is ready. Library and sync features will follow in later stages.",
+    "desktopTitle": "A local-first photo node",
+    "desktopDescription": "The Tauri 2 desktop shell is ready. Library access will use authorized APIs in a later stage."
+  }
+}

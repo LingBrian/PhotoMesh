@@ -1,0 +1,9 @@
+{
+  "home": {
+    "eyebrow": "自托管 · 原图安全 · 多节点",
+    "title": "PhotoMesh",
+    "description": "相册服务基座已就绪。图库与同步功能将在后续阶段加入。",
+    "desktopTitle": "本地优先的相册节点",
+    "desktopDescription": "Tauri 2 桌面壳已准备好，图库访问将在后续通过授权 API 接入。"
+  }
+}
