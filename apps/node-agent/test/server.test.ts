@@ -28,6 +28,7 @@ describe('node-agent health endpoint', () => {
   it('returns a structured 404 for unknown paths', async () => {
     const response = await request('/private');
     expect(response.status).toBe(404);
-    expect(await response.json()).toEqual({ error: 'not_found' });
+    expect(await response.json()).toMatchObject({ error: 'not_found' });
+    expect(response.headers.get('x-request-id')).toBeTruthy();
   });
 });

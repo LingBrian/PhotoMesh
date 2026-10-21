@@ -102,10 +102,27 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
+  desktop-native:
+    name: tauri-rust-check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @photomesh/desktop build
+      - run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
   required-ci:
     name: required-ci
     if: always()
-    needs: [lint, typecheck, unit, flutter, contracts, build]
+    needs: [lint, typecheck, unit, flutter, contracts, build, desktop-native]
     runs-on: ubuntu-latest
     steps:
       - name: Require every CI check
@@ -116,12 +133,14 @@ jobs:
           FLUTTER_RESULT: ${{ needs.flutter.result }}
           CONTRACTS_RESULT: ${{ needs.contracts.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          DESKTOP_NATIVE_RESULT: ${{ needs.desktop-native.result }}
         run: |
-          printf 'lint=%s typecheck=%s unit=%s flutter=%s contracts=%s build=%s\n' \
-            "$LINT_RESULT" "$TYPECHECK_RESULT" "$UNIT_RESULT" "$FLUTTER_RESULT" "$CONTRACTS_RESULT" "$BUILD_RESULT"
+          printf 'lint=%s typecheck=%s unit=%s flutter=%s contracts=%s build=%s desktop-native=%s\n' \
+            "$LINT_RESULT" "$TYPECHECK_RESULT" "$UNIT_RESULT" "$FLUTTER_RESULT" "$CONTRACTS_RESULT" "$BUILD_RESULT" "$DESKTOP_NATIVE_RESULT"
           test "$LINT_RESULT" = success
           test "$TYPECHECK_RESULT" = success
           test "$UNIT_RESULT" = success
           test "$FLUTTER_RESULT" = success
           test "$CONTRACTS_RESULT" = success
           test "$BUILD_RESULT" = success
+          test "$DESKTOP_NATIVE_RESULT" = success

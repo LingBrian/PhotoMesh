@@ -75,11 +75,14 @@ paths:
             schema: {$ref: '#/components/schemas/UploadCreate'}
       responses:
         '201':
-          description: Upload session created
+          description: Upload session created or replayed idempotently
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
+        '400': {description: Invalid request}
         '403': {description: Denied}
+        '409': {description: Idempotency key reused for a different request}
+        '413': {description: Upload exceeds configured limits}
   /v1/uploads/{sessionId}:
     get:
       summary: 查询允许续传的偏移位置
@@ -94,6 +97,64 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
+        '403': {description: Denied}
+        '404': {description: Session not found}
+        '410': {description: Session expired}
+  /v1/uploads/{sessionId}/chunks/{chunkIndex}:
+    put:
+      summary: Write one immutable, resumable upload chunk
+      parameters:
+        - in: path
+          name: sessionId
+          required: true
+          schema: {type: string}
+        - in: path
+          name: chunkIndex
+          required: true
+          schema: {type: integer, minimum: 0}
+        - in: header
+          name: Upload-Offset
+          required: true
+          schema: {type: integer, minimum: 0}
+        - in: header
+          name: Upload-Chunk-SHA256
+          required: true
+          schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        '200':
+          description: Chunk accepted and offset durably advanced
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadSession'}
+        '403': {description: Denied}
+        '409': {description: Offset or chunk idempotency conflict}
+        '413': {description: Chunk exceeds configured limits}
+        '422': {description: Chunk checksum mismatch}
+        '507': {description: Managed storage has insufficient capacity}
+  /v1/uploads/{sessionId}/complete:
+    post:
+      summary: Verify complete SHA-256 and atomically commit immutable original
+      parameters:
+        - in: path
+          name: sessionId
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Original published and metadata committed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadComplete'}
+        '403': {description: Denied}
+        '409': {description: Upload incomplete or session not writable}
+        '410': {description: Session expired}
+        '422': {description: Complete file checksum mismatch}
+        '507': {description: Managed storage has insufficient capacity}
   /v1/sync/hello:
     post:
       summary: 受信任节点 P2P 版本协商（仅内部受认证通道）
@@ -155,10 +216,14 @@ components:
         nextCursor: {type: [string, 'null']}
     UploadCreate:
       type: object
-      required: [libraryId, filename, totalBytes, sha256]
+      required: [libraryId, filename, sourceKind, totalBytes, sha256]
       properties:
         libraryId: {type: string}
         filename: {type: string, minLength: 1}
+        originalPath: {type: string, description: Exact source path metadata; never used as a write destination}
+        sourceKind: {type: string, enum: [upload, import]}
+        sourceNodeId: {type: string}
+        kind: {type: string, enum: [photo, video, live_photo], default: photo}
         totalBytes: {type: integer, minimum: 0}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     UploadSession:
@@ -169,3 +234,13 @@ components:
         offset: {type: integer, minimum: 0}
         expiresAt: {type: string, format: date-time}
         state: {type: string, enum: [created, uploading, verifying, completed, failed]}
+    UploadComplete:
+      type: object
+      required: [sessionId, assetId, fileId, sha256, byteLength, storageRef]
+      properties:
+        sessionId: {type: string}
+        assetId: {type: string}
+        fileId: {type: string}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        byteLength: {type: integer, minimum: 0}
+        storageRef: {type: string}

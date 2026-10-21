@@ -10,6 +10,14 @@
     "test": "vitest run --coverage",
     "build": "tsc -p tsconfig.build.json"
   },
-  "dependencies": {},
-  "devDependencies": { "@types/node": "^22.18.12", "@vitest/coverage-v8": "^3.2.4", "typescript": "~5.9.3", "vitest": "^3.2.4" }
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.18.12",
+    "@vitest/coverage-v8": "^3.2.4",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.4"
+  }
 }
