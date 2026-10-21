@@ -2,10 +2,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
-const composeFile = path.resolve('deploy/compose/docker-compose.sync.yml');
+const composeFile = path.resolve(
+  process.env.PHOTOMESH_COMPOSE_FILE ?? 'deploy/compose/docker-compose.sync.yml'
+);
 const composeProject = process.env.PHOTOMESH_COMPOSE_PROJECT ?? 'photomesh-sync-final';
 const token = 'photomesh-compose-fixture-token';
-const node = { service: 'windows-sim', baseUrl: 'http://127.0.0.1:18443' };
+const node = {
+  service: 'windows-sim',
+  baseUrl: process.env.PHOTOMESH_TEST_BASE_URL ?? 'http://127.0.0.1:18443'
+};
 const libraryId = `mobile-smoke-${randomUUID()}`;
 const chunkBytes = 4 * 1024 * 1024;
 let useWslDocker = false;
