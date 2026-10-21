@@ -51,6 +51,27 @@ export interface CompletedLocationRecord {
   pathRef: string;
 }
 
+export interface ExternalLocationRecord {
+  locationId: string;
+  fileId: string;
+  assetId: string;
+  nodeId: string;
+  libraryId: string;
+  kind: AssetKind;
+  filename: string;
+  originalPath: string;
+  byteSize: number;
+  sha256: string;
+  storageRef: string;
+  now: string;
+}
+
+export interface IndexedExternalLocation {
+  locationId: string;
+  originalPath: string;
+  availability: 'online' | 'cached' | 'offline' | 'missing';
+}
+
 export interface UploadRepository {
   getUploadSession(sessionId: string): UploadSessionRecord | undefined;
   getUploadSessionByIdempotency(scope: string, key: string): UploadSessionRecord | undefined;
@@ -287,6 +308,44 @@ export class SqliteRepository implements UploadRepository {
     } | undefined;
     if (!row) return undefined;
     return { originalFilename: row.original_filename, originalPath: row.original_path, sourceKind: row.source_kind, sourceNodeId: row.source_node_id, pathRef: row.path_ref };
+  }
+
+  listExternalLocations(nodeId: string): IndexedExternalLocation[] {
+    return this.db.prepare(`SELECT location_id, original_path, availability FROM file_locations
+      WHERE node_id = ? AND storage_class = 'external' AND original_path IS NOT NULL`).all(nodeId)
+      .map((row) => {
+        const value = row as { location_id: string; original_path: string; availability: IndexedExternalLocation['availability'] };
+        return { locationId: value.location_id, originalPath: value.original_path, availability: value.availability };
+      });
+  }
+
+  recordExternalFile(record: ExternalLocationRecord): string {
+    const write = this.db.transaction(() => {
+      const existing = this.db.prepare(`SELECT l.location_id, f.sha256 FROM file_locations l
+        JOIN asset_files f ON f.file_id = l.file_id
+        WHERE l.node_id = ? AND l.storage_class = 'external' AND l.original_path = ?
+        ORDER BY l.created_at DESC LIMIT 1`).get(record.nodeId, record.originalPath) as { location_id: string; sha256: string } | undefined;
+      if (existing?.sha256 === record.sha256) {
+        this.db.prepare("UPDATE file_locations SET availability = 'online' WHERE location_id = ?").run(existing.location_id);
+        return existing.location_id;
+      }
+      if (existing) this.db.prepare("UPDATE file_locations SET availability = 'missing' WHERE location_id = ?").run(existing.location_id);
+      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at)
+        VALUES (?, ?, ?, ?, NULL, ?)`).run(record.assetId, record.libraryId, record.nodeId, record.kind, record.now);
+      this.db.prepare(`INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at)
+        VALUES (?, ?, ?, ?, 'original', ?, ?)`).run(record.fileId, record.assetId, record.sha256, record.byteSize, record.storageRef, record.now);
+      this.db.prepare(`INSERT INTO file_locations (location_id, file_id, node_id, original_filename, original_path,
+        source_kind, source_node_id, path_ref, storage_class, availability, created_at)
+        VALUES (?, ?, ?, ?, ?, 'import', NULL, ?, 'external', 'online', ?)`)
+        .run(record.locationId, record.fileId, record.nodeId, record.filename, record.originalPath, record.originalPath, record.now);
+      return record.locationId;
+    });
+    return write.immediate();
+  }
+
+  setExternalAvailability(locationId: string, availability: IndexedExternalLocation['availability']): void {
+    this.db.prepare("UPDATE file_locations SET availability = ? WHERE location_id = ? AND storage_class = 'external'")
+      .run(availability, locationId);
   }
 }
 

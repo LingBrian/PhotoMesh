@@ -26,3 +26,45 @@ Every upload route calls `authorizeUpload`. The server denies access when no aut
 Chunk bytes are flushed under a generated staging reference before their manifest and offset are committed in SQLite. Finalization streams chunks to a same-volume temporary object, verifies the complete SHA-256, and uses a no-replace hard-link publication. After restart, retry the same chunk request or call the completion endpoint again; a published object with uncommitted metadata is re-hashed and finalized idempotently. Once metadata is committed, the session's managed staging subtree is removed; a completion replay retries that cleanup if needed.
 
 Unit tests use an in-memory SQLite database and `VirtualFileSystem` with injectable capacity and operation failures. Adapter tests use generated temporary directories only; they do not inspect or modify user photo directories.
+
+## Read-only external directories
+
+`PHOTOMESH_EXTERNAL_ROOTS` is the explicit root allowlist. Each entry requires a stable `rootId`, `libraryId`, absolute `path`, and `pathStyle` (`win32` or `posix`). Configured roots must not overlap; overlapping canonical roots are rejected because the current location schema intentionally has no root-ownership column. The scanner hashes files in bounded streams, writes only SQLite metadata, preserves each original path as an independent source record (even when two paths have identical bytes), and never writes through an external path. NTFS roots default to case-insensitive conflict detection; ext4/Btrfs roots default to case-sensitive behavior. Set `caseSensitive` explicitly for NTFS directories with per-directory case sensitivity enabled.
+
+The agent watches discovered directories and also performs a full scheduled scan every 15 minutes, because platform and NAS watchers can drop events. A watcher event triggers a debounced rescan. Symlinks are followed only when their resolved targets are within an explicitly configured root; directory cycles are reported and skipped. Inaccessible paths become `offline`; confirmed absent paths become `missing`. An incomplete directory scan does not infer deletions. Neither state transition deletes an asset, source file, or global metadata.
+
+### Windows PowerShell (NTFS)
+
+Run the agent with the intended source folder in the explicit allowlist. The source folder is never opened for writing:
+
+```powershell
+$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
+$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\Photos","pathStyle":"win32"}]'
+pnpm --filter @photomesh/node-agent build
+pnpm --filter @photomesh/node-agent start
+```
+
+### Linux/NAS container (ext4 or Btrfs)
+
+Mount the external library read-only and keep agent metadata on a separate writable volume:
+
+```yaml
+services:
+  node-agent:
+    image: photomesh/node-agent:local
+    environment:
+      PHOTOMESH_DATA_DIR: /data
+      PHOTOMESH_EXTERNAL_ROOTS: >-
+        [{"rootId":"nas-photos","libraryId":"family","path":"/external/photos","pathStyle":"posix"}]
+    volumes:
+      - photomesh-data:/data
+      - /srv/photos:/external/photos:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+volumes:
+  photomesh-data:
+```
+
+Use a container UID that can read the mounted library and write `/data`; do not loosen source permissions for the scanner. The periodic scan remains active if the NAS filesystem does not provide reliable watcher events.
+The example does not publish the agent API port; the starter agent binds to loopback by default. Put an explicitly configured TLS/authenticated reverse proxy in front of it before exposing any API outside the container.

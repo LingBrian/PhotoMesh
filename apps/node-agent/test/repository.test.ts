@@ -95,6 +95,44 @@ describe('SQLite repository and migrations', () => {
     db.close();
   });
 
+  it('stores each external source path independently and only changes its availability index', async () => {
+    const db = new Database(':memory:');
+    const repository = new SqliteRepository(db);
+    await repository.migrate();
+    const base = {
+      nodeId: 'node-1', libraryId: 'library-1', kind: 'photo' as const, filename: 'same.jpg',
+      byteSize: 3, sha256: 'a'.repeat(64), now: '2026-10-21T00:00:00.000Z'
+    };
+    repository.recordExternalFile({ ...base, locationId: 'location-a', fileId: 'file-a', assetId: 'asset-a', originalPath: '/photos/a.jpg', storageRef: 'external:a' });
+    repository.recordExternalFile({ ...base, locationId: 'location-b', fileId: 'file-b', assetId: 'asset-b', originalPath: '/photos/b.jpg', storageRef: 'external:b' });
+
+    expect(repository.listExternalLocations('node-1')).toHaveLength(2);
+    expect(db.prepare('SELECT count(*) AS count FROM assets').get()).toEqual({ count: 2 });
+    repository.setExternalAvailability('location-a', 'missing');
+    expect(repository.listExternalLocations('node-1')).toEqual(expect.arrayContaining([
+      { locationId: 'location-a', originalPath: '/photos/a.jpg', availability: 'missing' },
+      { locationId: 'location-b', originalPath: '/photos/b.jpg', availability: 'online' }
+    ]));
+    expect(db.prepare('SELECT count(*) AS count FROM asset_files').get()).toEqual({ count: 2 });
+
+    db.close();
+  });
+
+  it('creates a new immutable file record when an external path changes content', async () => {
+    const db = new Database(':memory:');
+    const repository = new SqliteRepository(db);
+    await repository.migrate();
+    const common = { nodeId: 'n', libraryId: 'l', kind: 'photo' as const, filename: 'a.jpg', originalPath: '/photos/a.jpg', now: 'now', byteSize: 1 };
+    repository.recordExternalFile({ ...common, locationId: 'l1', fileId: 'f1', assetId: 'a1', sha256: 'a'.repeat(64), storageRef: 'ext:1' });
+    repository.recordExternalFile({ ...common, locationId: 'l2', fileId: 'f2', assetId: 'a2', sha256: 'b'.repeat(64), storageRef: 'ext:2' });
+    expect(repository.listExternalLocations('n')).toEqual(expect.arrayContaining([
+      { locationId: 'l1', originalPath: '/photos/a.jpg', availability: 'missing' },
+      { locationId: 'l2', originalPath: '/photos/a.jpg', availability: 'online' }
+    ]));
+    expect(db.prepare('SELECT count(*) AS count FROM asset_files').get()).toEqual({ count: 2 });
+    db.close();
+  });
+
   it('rolls back SQL errors, rejects duplicate/out-of-order migrations, and rejects unknown applied migrations', async () => {
     const db = new Database(':memory:');
     const repository = new SqliteRepository(db);
