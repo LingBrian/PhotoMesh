@@ -11,6 +11,7 @@
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "test:mobile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/flutter-test.ps1",
+    "test:mobile-compose": "node scripts/mobile-compose-smoke.mjs",
     "test:sync-compose": "node scripts/sync-compose-smoke.mjs",
     "build": "turbo run build",
     "build:mobile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/flutter-build.ps1",

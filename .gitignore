@@ -12,5 +12,8 @@ apps/mobile/.dart_tool/
 apps/mobile/.flutter-plugins*
 apps/mobile/build/
 apps/mobile/.packages
+apps/mobile/android/local.properties
+apps/mobile/android/.gradle/
+apps/mobile/android/app/build/
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
