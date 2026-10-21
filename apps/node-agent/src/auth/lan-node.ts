@@ -7,12 +7,15 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { publicKeyFromProtobuf, publicKeyToProtobuf } from '@libp2p/crypto/keys';
 import { peerIdFromPublicKey, peerIdFromString } from '@libp2p/peer-id';
 import { multiaddr } from '@multiformats/multiaddr';
+import { parseJsonWithoutDuplicateKeys } from './strict-json.js';
 import type { LocalIdentity } from './local-identity.js';
 import { PAIRING_PROTOCOL_VERSION, PairingRejectedError, PairingService, type PairingQrPayload } from './pairing-service.js';
+import { isSyncExchangeRequest, SYNC_PROTOCOL, SyncService, type SyncExchangeRequest, type SyncExchangeResponse, type SyncTransport } from '../sync/sync-service.js';
 
 const PAIR_PROTOCOL = '/photomesh/pairing/1.0.0';
 const INDEX_PROTOCOL = '/photomesh/library-index/1.0.0';
 const MAX_FRAME_BYTES = 32 * 1024;
+const MAX_SYNC_FRAME_BYTES = 18 * 1024 * 1024;
 
 export interface DiscoveredPeer { peerId: string; addresses: string[] }
 
@@ -22,12 +25,15 @@ export interface LanNodeOptions {
   /** Explicit private LAN interface addresses only; wildcard/public binds are rejected. */
   listenAddresses: readonly string[];
   listenPort?: number;
+  syncService?: SyncService;
 }
 
-export class LanPairingNode {
+export class LanPairingNode implements SyncTransport {
   private readonly discovered = new Map<string, Set<string>>();
+  private readonly syncTasks = new Map<string, Promise<{ rounds: number; received: number; sent: number }>>();
+  private syncTimer: ReturnType<typeof setInterval> | undefined;
 
-  private constructor(private readonly node: Libp2p, private readonly pairing: PairingService, private readonly publicKey: Uint8Array) {}
+  private constructor(private readonly node: Libp2p, private readonly pairing: PairingService, private readonly publicKey: Uint8Array, private readonly syncService?: SyncService) {}
 
   static async start(options: LanNodeOptions): Promise<LanPairingNode> {
     const privateAddresses = [...new Set(options.listenAddresses)].map(normalizePrivateLanAddress);
@@ -37,13 +43,16 @@ export class LanPairingNode {
       addresses: { listen: privateAddresses.map((address) => `${address}/tcp/${options.listenPort ?? 0}`) },
       transports: [tcp()], connectionEncrypters: [noise()], streamMuxers: [yamux()], peerDiscovery: [mdns()]
     });
-    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey);
+    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey, options.syncService);
     node.addEventListener('peer:discovery', (event) => {
       const detail = event.detail as { id: { toString(): string }; multiaddrs?: Array<{ toString(): string }> };
       const peerId = detail.id.toString();
       const addresses = lan.discovered.get(peerId) ?? new Set<string>();
       for (const address of detail.multiaddrs ?? []) addresses.add(address.toString());
       lan.discovered.set(peerId, addresses);
+      if (options.pairing.listPeers().some((peer) => peer.peerId === peerId && peer.trustState === 'trusted')) {
+        void lan.syncWithPeer(peerId).catch(() => undefined);
+      }
     });
     node.handle(PAIR_PROTOCOL, async (stream, connection) => {
       try {
@@ -61,6 +70,7 @@ export class LanPairingNode {
           inviteId: message.inviteId, secret: message.secret, proposedLabel: message.label,
           authenticatedRemote: { peerId: authenticatedPeerId, publicKey: publicKeyBytes }
         });
+        if (options.syncService) void options.syncService.syncWithPeer(authenticatedPeerId, lan).catch(() => undefined);
         await writeFrame(stream, { ok: true, peerId: result.peerId, grantedLibraryIds: result.grantedLibraryIds });
       } catch {
         await writeFrame(stream, { ok: false, error: 'pairing_rejected' }).catch(() => undefined);
@@ -79,7 +89,23 @@ export class LanPairingNode {
         await writeFrame(stream, { ok: false, error: 'invalid_request' }).catch(() => undefined);
       }
     });
+    if (options.syncService) node.handle(SYNC_PROTOCOL, async (stream, connection) => {
+      try {
+        const message = await readFrame(stream, MAX_SYNC_FRAME_BYTES);
+        if (!isSyncExchangeRequest(message)) throw new Error('invalid sync request');
+        const response = await options.syncService!.handleExchange(connection.remotePeer.toString(), message);
+        await writeFrame(stream, { ...response }, MAX_SYNC_FRAME_BYTES);
+      } catch {
+        await writeFrame(stream, { ok: false, error: 'sync_rejected' }, MAX_SYNC_FRAME_BYTES).catch(() => undefined);
+      }
+    });
     await node.start();
+    if (options.syncService) {
+      lan.syncTimer = setInterval(() => {
+        for (const peer of options.pairing.listPeers()) if (peer.trustState === 'trusted') void lan.syncWithPeer(peer.peerId).catch(() => undefined);
+      }, 10_000);
+      lan.syncTimer.unref?.();
+    }
     return lan;
   }
 
@@ -120,6 +146,7 @@ export class LanPairingNode {
           throw new PairingRejectedError('host identity could not be verified');
         }
         this.pairing.trustScannedHost(invite.hostPeerId, publicKeyToProtobuf(authenticatedHost.publicKey), 'Paired PhotoMesh node');
+        if (this.syncService) void this.syncService.syncWithPeer(invite.hostPeerId, this).catch(() => undefined);
         return { hostPeerId: invite.hostPeerId };
       } catch (error) { lastError = error; }
     }
@@ -132,6 +159,23 @@ export class LanPairingNode {
     const response = await readFrame(stream);
     if (response.ok !== true || !Array.isArray(response.items)) throw new PairingRejectedError('library access denied');
     return response.items;
+  }
+
+  async exchange(peerId: string, request: SyncExchangeRequest): Promise<SyncExchangeResponse> {
+    const stream = await this.node.dialProtocol(peerIdFromString(peerId), SYNC_PROTOCOL);
+    await writeFrame(stream, { ...request }, MAX_SYNC_FRAME_BYTES);
+    const response = await readFrame(stream, MAX_SYNC_FRAME_BYTES);
+    if (response.ok === false || typeof response.hello !== 'object' || response.hello === null) throw new Error('peer rejected sync exchange');
+    return response as unknown as SyncExchangeResponse;
+  }
+
+  async syncWithPeer(peerId: string): Promise<{ rounds: number; received: number; sent: number }> {
+    if (!this.syncService) throw new Error('event sync is not configured');
+    const running = this.syncTasks.get(peerId);
+    if (running) return running;
+    const task = this.syncService.syncWithPeer(peerId, this).finally(() => this.syncTasks.delete(peerId));
+    this.syncTasks.set(peerId, task);
+    return task;
   }
 
   async dialManualIp(host: string, port: number, peerId: string): Promise<DiscoveredPeer> {
@@ -147,7 +191,11 @@ export class LanPairingNode {
     return revoked;
   }
 
-  async stop(): Promise<void> { await this.node.stop(); }
+  async stop(): Promise<void> {
+    if (this.syncTimer) clearInterval(this.syncTimer);
+    this.syncTimer = undefined;
+    await this.node.stop();
+  }
 }
 
 interface JsonFrame { [key: string]: unknown }
@@ -155,17 +203,17 @@ interface JsonFrame { [key: string]: unknown }
 interface FrameChunk { byteLength: number; subarray(start?: number, end?: number): Uint8Array }
 interface WritableFrameStream { send(data: Uint8Array): boolean; close(): Promise<void> }
 
-async function readFrame(source: AsyncIterable<FrameChunk>): Promise<JsonFrame> {
+async function readFrame(source: AsyncIterable<FrameChunk>, maximum = MAX_FRAME_BYTES): Promise<JsonFrame> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of source) {
     size += chunk.byteLength;
-    if (size > MAX_FRAME_BYTES) throw new Error('frame too large');
+    if (size > maximum) throw new Error('frame too large');
     const buffer = Buffer.from(chunk.subarray());
     const newline = buffer.indexOf(10);
     if (newline >= 0) {
       chunks.push(buffer.subarray(0, newline));
-      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const parsed = parseJsonWithoutDuplicateKeys(Buffer.concat(chunks).toString('utf8'));
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('invalid frame');
       return parsed as JsonFrame;
     }
@@ -174,9 +222,9 @@ async function readFrame(source: AsyncIterable<FrameChunk>): Promise<JsonFrame> 
   throw new Error('incomplete frame');
 }
 
-async function writeFrame(stream: WritableFrameStream, value: JsonFrame): Promise<void> {
+async function writeFrame(stream: WritableFrameStream, value: JsonFrame, maximum = MAX_FRAME_BYTES): Promise<void> {
   const frame = Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
-  if (frame.byteLength > MAX_FRAME_BYTES) throw new Error('frame too large');
+  if (frame.byteLength > maximum) throw new Error('frame too large');
   stream.send(frame);
   await stream.close();
 }

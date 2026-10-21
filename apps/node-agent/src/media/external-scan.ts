@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { basename as posixBasename, isAbsolute as posixIsAbsolute, join as posixJoin, relative as posixRelative, resolve as posixResolve, sep as posixSep } from 'node:path/posix';
 import { basename as winBasename, isAbsolute as winIsAbsolute, join as winJoin, relative as winRelative, resolve as winResolve, sep as winSep } from 'node:path/win32';
 import type { AssetKind, ExternalLocationRecord, IndexedExternalLocation } from '../db/repository.js';
+import type { EventDraftFactory } from '../sync/event-envelope.js';
 
 export type ExternalEntryKind = 'file' | 'directory' | 'symlink' | 'other';
 export type ExternalPathStyle = 'posix' | 'win32';
@@ -24,7 +25,7 @@ export interface ExternalFileSystem {
 
 export interface ExternalScanRepository {
   listExternalLocations(nodeId: string): IndexedExternalLocation[];
-  recordExternalFile(record: ExternalLocationRecord): string;
+  recordExternalFile(record: ExternalLocationRecord, eventFactory?: EventDraftFactory): string;
   setExternalAvailability(locationId: string, availability: ExternalAvailability): void;
 }
 
@@ -66,6 +67,8 @@ export interface ExternalScanOptions {
   debounceMs?: number;
   now?: () => string;
   id?: () => string;
+  createEventDraft?: (record: ExternalLocationRecord) => EventDraftFactory;
+  signPendingEvents?: () => Promise<void>;
 }
 
 interface PathOps {
@@ -138,6 +141,7 @@ export class ExternalScanService {
         }
         this.refreshWatches(results.flatMap((result) => result.directories));
       } while (this.rerun);
+      await this.options.signPendingEvents?.();
       return results;
     })();
     try {
@@ -277,7 +281,7 @@ export class ExternalScanService {
           libraryId: root.libraryId, kind: kindFromPath(filename), filename, originalPath: displayPath,
           byteSize, sha256: hash.digest('hex'), storageRef: `external:${this.id()}`, now: this.now()
         };
-        this.options.repository.recordExternalFile(record);
+        this.options.repository.recordExternalFile(record, this.options.createEventDraft?.(record));
         seen.add(displayPath);
         result.indexed += 1;
       } catch (error) {

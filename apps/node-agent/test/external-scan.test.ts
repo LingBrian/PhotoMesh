@@ -2,6 +2,7 @@ import { normalize as normalizePosix } from 'node:path/posix';
 import { describe, expect, it, vi } from 'vitest';
 import type { ExternalLocationRecord, IndexedExternalLocation } from '../src/db/repository.js';
 import { ExternalScanService, type AuthorizedExternalRoot, type ExternalFileSystem, type ExternalStat, type ExternalWatcher } from '../src/media/external-scan.js';
+import { makeUnsignedEvent } from '../src/sync/event-envelope.js';
 
 type NodeValue = { kind: ExternalStat['kind']; bytes?: Uint8Array; target?: string; denied?: boolean; modifiedAt?: number };
 
@@ -60,10 +61,11 @@ class FakeRepository {
   listExternalLocations(nodeId: string): IndexedExternalLocation[] {
     return [...this.rows.values()].filter(({ record }) => record.nodeId === nodeId).map(({ record, availability }) => ({ locationId: record.locationId, originalPath: record.originalPath, availability }));
   }
-  recordExternalFile(record: ExternalLocationRecord): string {
+  recordExternalFile(record: ExternalLocationRecord, eventFactory?: import('../src/sync/event-envelope.js').EventDraftFactory): string {
     const existing = [...this.rows.values()].find(({ record: prior }) => prior.originalPath === record.originalPath && prior.nodeId === record.nodeId);
     if (existing?.record.sha256 === record.sha256) { existing.availability = 'online'; return existing.record.locationId; }
     if (existing) existing.availability = 'missing';
+    eventFactory?.({ authorSequence: this.rows.size + 1, causalParents: [] });
     this.rows.set(record.locationId, { record, availability: 'online' });
     return record.locationId;
   }
@@ -84,6 +86,29 @@ function root(path = '/photos', pathStyle: 'posix' | 'win32' = 'posix'): Authori
 }
 
 describe('external read-only directory scanning', () => {
+  it('reserves one asset index event per newly indexed source and signs after the scan batch', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addFile('/photos/a.jpg', 'original-a'); fs.addFile('/photos/b.jpg', 'original-b');
+    const repository = new FakeRepository();
+    let drafts = 0;
+    let signed = 0;
+    const service = new ExternalScanService({
+      nodeId: 'QmTestPeerId123456789', roots: [root()], fileSystem: fs, repository,
+      createEventDraft: (record) => (context) => {
+        drafts += 1;
+        return makeUnsignedEvent({ libraryId: record.libraryId, authorPeerId: 'QmTestPeerId123456789',
+          authorSequence: context.authorSequence, causalParents: context.causalParents, eventType: 'asset.indexed',
+          createdAt: '2026-10-21T00:00:00.000Z', payload: { assetId: record.assetId, originNodeId: record.nodeId,
+            kind: record.kind, sha256: record.sha256, byteLength: record.byteSize } });
+      },
+      signPendingEvents: async () => { signed += 1; }
+    });
+    await service.scanAll();
+    expect(drafts).toBe(2);
+    expect(signed).toBe(1);
+    expect(fs.nodes.get('/photos/a.jpg')?.bytes).toEqual(new TextEncoder().encode('original-a'));
+  });
+
   it('rejects traversal and symlink escapes and detects symlink cycles', async () => {
     const fs = new VirtualExternalFileSystem();
     fs.addDirectory('/photos'); fs.addFile('/photos/keep.jpg', 'original');

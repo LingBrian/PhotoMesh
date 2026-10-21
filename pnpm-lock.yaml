@@ -93,6 +93,9 @@ importers:
       better-sqlite3:
         specifier: ^13.0.3
         version: 13.0.3
+      canonicalize:
+        specifier: ^5.1.0
+        version: 5.1.0
       libp2p:
         specifier: ^3.5.1
         version: 3.5.1
@@ -1205,6 +1208,11 @@ packages:
   camelcase@5.3.1:
     resolution: {integrity: sha512-L28STB170nwWS63UjtlEOE3dldQApaJXZkOI1uMFfzf3rRuPegHaHesyee+YxQ+W6SvRDQV6UrdOdRiR153wJg==}
     engines: {node: '>=6'}
+
+  canonicalize@5.1.0:
+    resolution: {integrity: sha512-bab9+WefZljqQ8jT0qRwVmTyzAUU63K97QIQD3agynIBrb6sa5M2eAy8Hv8K3p4V9+ONVYZKtGYl4Dg+/5Gumw==}
+    engines: {node: '>=22'}
+    hasBin: true
 
   cborg@6.1.4:
     resolution: {integrity: sha512-JqjDDfTuED2qUvy570NGQUXqfzC34H++AHJIZnLAmiAdHNqHJKbtzox5yViRz5rc0gM9OPSX7n7Sh+BNU263Xw==}
@@ -3123,6 +3131,8 @@ snapshots:
   call-me-maybe@1.0.2: {}
 
   camelcase@5.3.1: {}
+
+  canonicalize@5.1.0: {}
 
   cborg@6.1.4: {}
 

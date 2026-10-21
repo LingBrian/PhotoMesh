@@ -3,6 +3,9 @@ import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { SqliteRepository } from '../src/db/repository.js';
 import { UploadError, UploadService, type CreateUploadRequest } from '../src/uploads/service.js';
+import { loadOrCreateLocalIdentity } from '../src/auth/local-identity.js';
+import { SyncRepository } from '../src/sync/sync-repository.js';
+import { makeUnsignedEvent, signEvent } from '../src/sync/event-envelope.js';
 import { VirtualFileSystem } from './support/virtual-file-system.js';
 
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
@@ -44,6 +47,58 @@ const request = {
 };
 
 describe('immutable resumable upload pipeline', () => {
+  it('commits an unsigned sync draft atomically with upload metadata and recovers its signature on retry', async () => {
+    const { db, repository, fileSystem } = await fixture();
+    const secrets = new Map<string, string>();
+    const identity = await loadOrCreateLocalIdentity(repository, {
+      get: (name) => secrets.get(name), set: (name, value) => { secrets.set(name, value); }
+    });
+    const syncRepository = new SyncRepository(db);
+    let interrupted = true;
+    const service = new UploadService({
+      repository, fileSystem, nodeId: identity.peerId,
+      createEventDraft: (session, assetId) => (context) => makeUnsignedEvent({
+        libraryId: session.libraryId, authorPeerId: identity.peerId, authorSequence: context.authorSequence,
+        causalParents: context.causalParents, eventType: 'asset.indexed', createdAt: '2026-10-21T00:00:00.000Z',
+        payload: { assetId, originNodeId: identity.peerId, kind: session.kind, sha256: session.expectedSha256, byteLength: session.totalBytes }
+      }),
+      signPendingEvents: async () => {
+        if (interrupted) { interrupted = false; throw new Error('injected signing interruption'); }
+        for (const draft of syncRepository.getUnsignedLocalDrafts(identity.peerId)) {
+          syncRepository.completeLocalDraft(await signEvent(draft, identity));
+        }
+      }
+    });
+    const session = await service.createSession('0123456789abcdef', request);
+    await service.putChunk(session.sessionId, 0, 0, sourceBytes, sha256(sourceBytes));
+    await expect(service.complete(session.sessionId)).rejects.toThrow('injected signing interruption');
+    expect(repository.getUploadSession(session.sessionId)?.state).toBe('completed');
+    expect(db.prepare("SELECT state FROM sync_event_log WHERE event_type = 'asset.indexed'").get()).toEqual({ state: 'signing' });
+    const completed = await service.complete(session.sessionId);
+    expect(completed.assetId).toBeTruthy();
+    expect(db.prepare("SELECT state, signature FROM sync_event_log WHERE event_type = 'asset.indexed'").get())
+      .toMatchObject({ state: 'ready', signature: expect.any(String) });
+    expect(syncRepository.getProjection(request.libraryId, completed.assetId)?.sha256).toBe(request.sha256);
+    expect(fileSystem.read('/source/2026/original.jpg')).toEqual(sourceBytes);
+    db.close();
+  });
+
+  it('rolls back asset, location, and event rows together if event reservation fails', async () => {
+    const { db, repository, fileSystem } = await fixture();
+    const service = new UploadService({
+      repository, fileSystem, nodeId: 'node-local',
+      createEventDraft: () => () => { throw new Error('injected event reservation failure'); }
+    });
+    const session = await service.createSession('0123456789abcdef', request);
+    await service.putChunk(session.sessionId, 0, 0, sourceBytes, sha256(sourceBytes));
+    await expect(service.complete(session.sessionId)).rejects.toThrow('injected event reservation failure');
+    expect(db.prepare('SELECT count(*) AS count FROM assets').get()).toEqual({ count: 0 });
+    expect(db.prepare('SELECT count(*) AS count FROM file_locations').get()).toEqual({ count: 0 });
+    expect(db.prepare('SELECT count(*) AS count FROM sync_event_log').get()).toEqual({ count: 0 });
+    expect(fileSystem.read('/source/2026/original.jpg')).toEqual(sourceBytes);
+    db.close();
+  });
+
   it('commits only after complete SHA-256 verification and preserves source metadata and bytes', async () => {
     const { db, repository, fileSystem, service } = await fixture();
     const session = await service.createSession('0123456789abcdef', request);

@@ -1,0 +1,65 @@
+services:
+  windows-sim:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/node-agent.Dockerfile
+    environment:
+      NODE_ENV: test
+      PORT: "8443"
+      PHOTOMESH_DATA_DIR: /data
+      PHOTOMESH_FIXTURE_MODE: "true"
+      PHOTOMESH_FIXTURE_SECRET_DIR: /data/secrets
+      PHOTOMESH_API_BIND_ADDRESS: 172.29.0.2
+      PHOTOMESH_LAN_BIND_ADDRESSES: 172.29.0.2
+      PHOTOMESH_P2P_PORT: "4001"
+      PHOTOMESH_ADMIN_TOKEN: photomesh-compose-fixture-token
+    volumes:
+      - windows-sim-data:/data
+    ports:
+      - "127.0.0.1:18443:8443"
+    networks:
+      sync-lan:
+        ipv4_address: 172.29.0.2
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://172.29.0.2:8443/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nas-sim:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/node-agent.Dockerfile
+    environment:
+      NODE_ENV: test
+      PORT: "8443"
+      PHOTOMESH_DATA_DIR: /data
+      PHOTOMESH_FIXTURE_MODE: "true"
+      PHOTOMESH_FIXTURE_SECRET_DIR: /data/secrets
+      PHOTOMESH_API_BIND_ADDRESS: 172.29.0.3
+      PHOTOMESH_LAN_BIND_ADDRESSES: 172.29.0.3
+      PHOTOMESH_P2P_PORT: "4001"
+      PHOTOMESH_ADMIN_TOKEN: photomesh-compose-fixture-token
+    volumes:
+      - nas-sim-data:/data
+    ports:
+      - "127.0.0.1:18444:8443"
+    networks:
+      sync-lan:
+        ipv4_address: 172.29.0.3
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://172.29.0.3:8443/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+networks:
+  sync-lan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes:
+  windows-sim-data:
+  nas-sim-data:

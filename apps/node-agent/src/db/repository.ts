@@ -1,6 +1,8 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { migrations, type Migration } from './migrations.js';
+import { SyncRepository } from '../sync/sync-repository.js';
+import type { EventDraftFactory } from '../sync/event-envelope.js';
 
 export type UploadState = 'created' | 'uploading' | 'verifying' | 'completed' | 'failed';
 export type AssetKind = 'photo' | 'video' | 'live_photo';
@@ -106,7 +108,7 @@ export interface UploadRepository {
   recordChunk(record: UploadChunkRecord, expectedOffset: number, now: string): void;
   markVerifying(sessionId: string, now: string): void;
   markFailed(sessionId: string, now: string): void;
-  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string): void;
+  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string, eventFactory?: EventDraftFactory): void;
   getLocationForSession(sessionId: string): CompletedLocationRecord | undefined;
 }
 
@@ -319,12 +321,25 @@ export class SqliteRepository implements UploadRepository {
         COALESCE((SELECT CASE WHEN l.availability IN ('online', 'cached') THEN l.availability ELSE l.availability END
           FROM file_locations l WHERE l.file_id = f.file_id ORDER BY CASE l.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END LIMIT 1), 'missing') AS availability
       FROM assets a JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
-      WHERE a.library_id = ? ORDER BY a.created_at DESC, a.asset_id`).all(libraryId) as Array<{
+      WHERE a.library_id = ? AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p
+        WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+      ORDER BY a.created_at DESC, a.asset_id`).all(libraryId) as Array<{
         asset_id: string; library_id: string; origin_node_id: string; kind: AssetKind; sha256: string;
         availability: LibraryIndexAsset['availability'];
       }>;
-    return rows.map((row) => ({ assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id,
-      kind: row.kind, sha256: row.sha256, availability: row.availability }));
+    const assets = new Map(rows.map((row) => [row.asset_id, {
+      assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id,
+      kind: row.kind, sha256: row.sha256, availability: row.availability
+    }]));
+    const projections = this.db.prepare(`SELECT p.asset_id, p.library_id, p.origin_node_id, p.kind, p.sha256
+      FROM sync_asset_projection p WHERE p.library_id = ? AND p.tombstone_event_id IS NULL`).all(libraryId) as Array<{
+        asset_id: string; library_id: string; origin_node_id: string; kind: AssetKind; sha256: string;
+      }>;
+    for (const row of projections) if (!assets.has(row.asset_id)) assets.set(row.asset_id, {
+      assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id,
+      kind: row.kind, sha256: row.sha256, availability: 'missing'
+    });
+    return [...assets.values()].sort((left, right) => left.assetId.localeCompare(right.assetId));
   }
 
   getUploadSession(sessionId: string): UploadSessionRecord | undefined {
@@ -398,7 +413,7 @@ export class SqliteRepository implements UploadRepository {
     this.db.prepare(`UPDATE jobs SET state = 'failed', updated_at = ? WHERE job_id = ?`).run(now, sessionId);
   }
 
-  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string): void {
+  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string, eventFactory?: EventDraftFactory): void {
     const finalize = this.db.transaction(() => {
       const session = this.getUploadSession(sessionId);
       if (!session) throw new RepositoryConflictError('upload session not found');
@@ -422,6 +437,7 @@ export class SqliteRepository implements UploadRepository {
         WHERE job_id = ?`).run(JSON.stringify({ sessionId, assetId, fileId }), now, sessionId);
       this.db.prepare(`INSERT INTO events (event_id, event_type, aggregate_id, payload_json, created_at)
         VALUES (?, 'asset.uploaded', ?, ?, ?)`).run(randomUUID(), assetId, JSON.stringify({ assetId, fileId, libraryId: session.libraryId }), now);
+      if (eventFactory) new SyncRepository(this.db, () => now).reserveLocalEventDraft(session.libraryId, nodeId, eventFactory);
     });
     finalize.immediate();
   }
@@ -445,7 +461,7 @@ export class SqliteRepository implements UploadRepository {
       });
   }
 
-  recordExternalFile(record: ExternalLocationRecord): string {
+  recordExternalFile(record: ExternalLocationRecord, eventFactory?: EventDraftFactory): string {
     const write = this.db.transaction(() => {
       const existing = this.db.prepare(`SELECT l.location_id, f.sha256 FROM file_locations l
         JOIN asset_files f ON f.file_id = l.file_id
@@ -464,6 +480,7 @@ export class SqliteRepository implements UploadRepository {
         source_kind, source_node_id, path_ref, storage_class, availability, created_at)
         VALUES (?, ?, ?, ?, ?, 'import', NULL, ?, 'external', 'online', ?)`)
         .run(record.locationId, record.fileId, record.nodeId, record.filename, record.originalPath, record.originalPath, record.now);
+      if (eventFactory) new SyncRepository(this.db, () => record.now).reserveLocalEventDraft(record.libraryId, record.nodeId, eventFactory);
       return record.locationId;
     });
     return write.immediate();

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { AssetKind, CreateUploadSessionRecord, SourceKind, UploadChunkRecord, UploadRepository, UploadSessionRecord } from '../db/repository.js';
 import { RepositoryConflictError } from '../db/repository.js';
 import type { FileDigest, UploadFileSystem } from './file-system.js';
+import type { EventDraftFactory } from '../sync/event-envelope.js';
 
 export interface CreateUploadRequest {
   libraryId: string;
@@ -50,6 +51,8 @@ export interface UploadServiceOptions {
   maxFileBytes?: number;
   maxChunkBytes?: number;
   sessionTtlMs?: number;
+  createEventDraft?: (session: UploadSessionRecord, assetId: string) => EventDraftFactory;
+  signPendingEvents?: () => Promise<void>;
 }
 
 export class UploadService {
@@ -60,6 +63,8 @@ export class UploadService {
   private readonly maxFileBytes: number;
   private readonly maxChunkBytes: number;
   private readonly sessionTtlMs: number;
+  private readonly createEventDraft: ((session: UploadSessionRecord, assetId: string) => EventDraftFactory) | undefined;
+  private readonly signPendingEvents: (() => Promise<void>) | undefined;
   private readonly locks = new Map<string, Promise<void>>();
 
   constructor(options: UploadServiceOptions) {
@@ -70,6 +75,8 @@ export class UploadService {
     this.maxFileBytes = options.maxFileBytes ?? 100 * 1024 * 1024 * 1024;
     this.maxChunkBytes = options.maxChunkBytes ?? 8 * 1024 * 1024;
     this.sessionTtlMs = options.sessionTtlMs ?? 24 * 60 * 60 * 1000;
+    this.createEventDraft = options.createEventDraft;
+    this.signPendingEvents = options.signPendingEvents;
   }
 
   async createSession(idempotencyKey: string, input: CreateUploadRequest, idempotencyScope = 'local'): Promise<UploadSessionResponse> {
@@ -222,6 +229,7 @@ export class UploadService {
   private async completeLocked(sessionId: string): Promise<UploadCompleteResponse> {
     let session = this.requireSession(sessionId);
     if (session.state === 'completed' && session.assetId && session.fileId) {
+      await this.signPendingEvents?.();
       await this.cleanupStaging(sessionId);
       return toCompleteResponse(session);
     }
@@ -253,7 +261,10 @@ export class UploadService {
         this.repository.markFailed(sessionId, this.now());
         throw new UploadError('CHECKSUM_MISMATCH', 'Published object checksum does not match the declared content');
       }
-      this.repository.finalizeUpload(sessionId, randomUUID(), randomUUID(), randomUUID(), this.nodeId, this.now());
+      const assetId = randomUUID();
+      this.repository.finalizeUpload(sessionId, assetId, randomUUID(), randomUUID(), this.nodeId, this.now(),
+        this.createEventDraft?.(session, assetId));
+      await this.signPendingEvents?.();
       const completed = this.requireSession(sessionId);
       await this.cleanupStaging(sessionId);
       return toCompleteResponse(completed);

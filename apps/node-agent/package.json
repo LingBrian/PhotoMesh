@@ -21,6 +21,7 @@
     "@multiformats/multiaddr": "^13.0.3",
     "@napi-rs/keyring": "^2.1.2",
     "better-sqlite3": "^13.0.3",
+    "canonicalize": "^5.1.0",
     "libp2p": "^3.5.1",
     "qrcode": "^1.5.4"
   },

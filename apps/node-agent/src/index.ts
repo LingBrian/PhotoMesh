@@ -7,13 +7,16 @@ import { NodeUploadFileSystem } from './uploads/file-system.js';
 import { UploadService } from './uploads/service.js';
 import { ExternalScanService, type AuthorizedExternalRoot } from './media/external-scan.js';
 import { NodeExternalFileSystem, NodeExternalWatcher } from './media/node-external-adapters.js';
-import { SystemSecretStore } from './auth/key-store.js';
+import { FixtureFileSecretStore, SystemSecretStore } from './auth/key-store.js';
 import { loadOrCreateLocalIdentity } from './auth/local-identity.js';
 import { PairingService } from './auth/pairing-service.js';
 import { PairingApprovalQueue } from './auth/pairing-approval-queue.js';
 import { LanPairingNode } from './auth/lan-node.js';
 import type { PairingServerControl } from './server.js';
 import { timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
+import { SyncRepository } from './sync/sync-repository.js';
+import { SyncService } from './sync/sync-service.js';
 
 const port = Number(process.env.PORT ?? 8443);
 const dataDirectory = resolve(process.env.PHOTOMESH_DATA_DIR ?? './data');
@@ -26,21 +29,26 @@ const repository = new SqliteRepository(database, {
   }
 });
 await repository.migrate();
-const uploadService = new UploadService({
-  repository,
-  fileSystem: new NodeUploadFileSystem(join(dataDirectory, 'managed')),
-  nodeId: process.env.PHOTOMESH_NODE_ID ?? 'local-node'
-});
 const pairingApprovals = new PairingApprovalQueue();
 let pairing: PairingService | undefined;
 let lanNode: LanPairingNode | undefined;
+let syncService: SyncService | undefined;
+let nodeId = process.env.PHOTOMESH_NODE_ID ?? 'local-node';
 try {
-  const identity = await loadOrCreateLocalIdentity(repository, new SystemSecretStore());
+  const fixtureMode = process.env.PHOTOMESH_FIXTURE_MODE === 'true';
+  const secretStore = fixtureMode && process.env.PHOTOMESH_FIXTURE_SECRET_DIR
+    ? new FixtureFileSecretStore(process.env.PHOTOMESH_FIXTURE_SECRET_DIR)
+    : new SystemSecretStore();
+  const identity = await loadOrCreateLocalIdentity(repository, secretStore);
+  nodeId = identity.peerId;
   pairing = new PairingService(repository, identity.peerId, pairingApprovals.request);
+  syncService = new SyncService(new SyncRepository(database), identity, pairing);
+  await syncService.signPendingLocalEvents();
+  await syncService.reconcileLocalAssets();
   const listenAddresses = (process.env.PHOTOMESH_LAN_BIND_ADDRESSES ?? '').split(',').map((value) => value.trim()).filter(Boolean);
   if (listenAddresses.length > 0) {
     lanNode = await LanPairingNode.start({
-      identity, pairing, listenAddresses,
+      identity, pairing, listenAddresses, syncService,
       listenPort: Number(process.env.PHOTOMESH_P2P_PORT ?? 0)
     });
     process.stdout.write(`PhotoMesh LAN pairing enabled on ${listenAddresses.length} configured interface(s)\n`);
@@ -49,6 +57,18 @@ try {
   // Do not expose native key-store or identity errors, which may include platform details.
   process.stderr.write('PhotoMesh LAN pairing unavailable; secure identity storage or bind configuration is unavailable\n');
 }
+const uploadService = new UploadService({
+  repository,
+  fileSystem: new NodeUploadFileSystem(join(dataDirectory, 'managed')),
+  nodeId,
+  ...(syncService ? {
+    createEventDraft: (session: import('./db/repository.js').UploadSessionRecord, assetId: string) => syncService!.createAssetIndexedDraft({
+      libraryId: session.libraryId, assetId, originNodeId: nodeId,
+      kind: session.kind, sha256: session.expectedSha256, byteLength: session.totalBytes
+    }),
+    signPendingEvents: () => syncService!.signPendingLocalEvents()
+  } : {})
+});
 
 const pairingControl: PairingServerControl | undefined = pairing ? {
   createInvite: () => {
@@ -79,8 +99,14 @@ const authorizePairingAdmin = (token: string | undefined): boolean => {
   const provided = Buffer.from(token);
   return expected.byteLength === provided.byteLength && timingSafeEqual(expected, provided);
 };
-const server = createNodeAgentServer({ uploadService, authorizePairingAdmin, ...(pairingControl ? { pairingControl } : {}) });
-server.listen(port, '127.0.0.1', () => process.stdout.write(`PhotoMesh node-agent listening on 127.0.0.1:${port}\n`));
+const host = process.env.PHOTOMESH_API_BIND_ADDRESS ?? '127.0.0.1';
+if (!isSafeServiceBind(host)) throw new Error('PHOTOMESH_API_BIND_ADDRESS must be loopback or an explicit private LAN IP');
+const server = createNodeAgentServer({
+  uploadService, authorizePairingAdmin,
+  authorizeUpload: (request) => authorizePairingAdmin(request.token) ? { principalId: 'local-admin' } : undefined,
+  ...(pairingControl ? { pairingControl } : {})
+});
+server.listen(port, host, () => process.stdout.write(`PhotoMesh node-agent listening on ${host}:${port}\n`));
 
 const rootsJson = process.env.PHOTOMESH_EXTERNAL_ROOTS;
 let externalScan: ExternalScanService | undefined;
@@ -91,8 +117,15 @@ if (rootsJson) {
     throw new Error('PHOTOMESH_EXTERNAL_ROOTS must be an array of explicitly authorized root objects');
   }
   externalScan = new ExternalScanService({
-    nodeId: process.env.PHOTOMESH_NODE_ID ?? 'local-node', roots,
-    fileSystem: new NodeExternalFileSystem(), repository, watcher: new NodeExternalWatcher()
+    nodeId, roots,
+    fileSystem: new NodeExternalFileSystem(), repository, watcher: new NodeExternalWatcher(),
+    ...(syncService ? {
+      createEventDraft: (record) => syncService!.createAssetIndexedDraft({
+        libraryId: record.libraryId, assetId: record.assetId, originNodeId: nodeId,
+        kind: record.kind, sha256: record.sha256, byteLength: record.byteSize
+      }),
+      signPendingEvents: () => syncService!.signPendingLocalEvents()
+    } : {})
   });
   void externalScan.start().then((results) => {
     const indexed = results.reduce((total, result) => total + result.indexed, 0);
@@ -107,3 +140,17 @@ const shutdown = (): void => {
 };
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
+
+function isSafeServiceBind(host: string): boolean {
+  const family = isIP(host);
+  if (family === 0) return false;
+  const normalized = host.toLowerCase().split('%')[0] ?? '';
+  if (normalized === '127.0.0.1' || normalized === '::1') return true;
+  if (family === 4) {
+    const octets = normalized.split('.').map(Number);
+    if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+    return octets[0] === 10 || (octets[0] === 172 && octets[1]! >= 16 && octets[1]! <= 31) ||
+      (octets[0] === 192 && octets[1] === 168);
+  }
+  return /^(fc|fd)/.test(normalized);
+}
