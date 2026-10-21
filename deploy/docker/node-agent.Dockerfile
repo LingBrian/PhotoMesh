@@ -5,9 +5,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 make g+
 RUN corepack enable
 RUN mkdir -p /data && chown node:node /data
 WORKDIR /workspace
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/node-agent/package.json apps/node-agent/package.json
+RUN pnpm install --filter @photomesh/node-agent --frozen-lockfile
 COPY . .
-RUN pnpm install --filter @photomesh/node-agent --frozen-lockfile \
-    && pnpm --filter @photomesh/node-agent build
+RUN pnpm --filter @photomesh/node-agent build
 
 ENV NODE_ENV=production
 USER node

@@ -112,6 +112,7 @@ export class SyncService {
   async handleExchange(remotePeerId: string, request: SyncExchangeRequest): Promise<SyncExchangeResponse> {
     const remote = this.pairing.listPeers().find((peer) => peer.peerId === remotePeerId && peer.trustState === 'trusted');
     if (!remote) throw new SyncAuthorizationError();
+    if (request.hello.nodeId !== remotePeerId) throw new SyncProtocolConflictError('hello identity does not match authenticated peer');
     const negotiation = negotiateProtocol(this.hello(), request.hello);
     if (!isStringArray(request.grantedLibraryIds, 256) || !Array.isArray(request.cursors) || request.cursors.length > 4096 ||
         !Array.isArray(request.events) || request.events.length > SYNC_BATCH_LIMIT) throw new SyncProtocolConflictError('invalid sync batch');
@@ -148,6 +149,7 @@ export class SyncService {
       const events = this.repository.eventsMissingForPeer(peerId, this.repository.getAcknowledgedCursors(peerId), SYNC_BATCH_LIMIT);
       this.repository.recordOfferedEvents(peerId, events);
       const response = await transport.exchange(peerId, { hello: this.hello(), grantedLibraryIds, cursors, events });
+      if (response.hello.nodeId !== peerId) throw new SyncProtocolConflictError('hello identity does not match authenticated peer');
       const negotiation = negotiateProtocol(this.hello(), response.hello);
       if (response.agreedProtocol !== negotiation.protocol || response.schemaVersion !== negotiation.schemaVersion) {
         throw new SyncProtocolConflictError('peer returned an inconsistent protocol negotiation');

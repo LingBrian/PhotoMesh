@@ -103,6 +103,24 @@ describe('P2P signed event synchronization', () => {
     expect(receiver.syncRepository.getProjection('family', 'relay-asset')).toBeUndefined();
   });
 
+  it('retains an unknown signed schema event without applying it or advancing the author cursor', async () => {
+    const host = await createNode();
+    const receiver = await createNode();
+    await trustEachOther(host, receiver);
+    const indexed = makeUnsignedEvent({
+      libraryId: 'family', authorPeerId: host.identity.peerId, authorSequence: 1, causalParents: [],
+      eventType: 'asset.indexed', createdAt: '2026-10-21T00:00:00.000Z',
+      payload: { assetId: 'future-asset', originNodeId: host.identity.peerId, kind: 'photo', sha256: 'd'.repeat(64), byteLength: 12 }
+    });
+    const future = await signEvent({ ...indexed, schemaVersion: 2, eventType: 'asset.indexed.v2' }, host.identity);
+
+    expect(receiver.syncRepository.ingest(host.identity.peerId, future)).toMatchObject({ status: 'unsupported', appliedEventIds: [] });
+    expect(receiver.database.prepare('SELECT state, error_code FROM sync_inbox WHERE event_id = ?').get(future.eventId))
+      .toEqual({ state: 'unsupported', error_code: 'unsupported_event_version' });
+    expect(receiver.syncRepository.getProjection('family', 'future-asset')).toBeUndefined();
+    expect(receiver.syncRepository.getCursors(['family'])).toEqual([]);
+  });
+
   it('does not let an ahead-of-log cursor delete unacknowledged outbox events', async () => {
     const a = await createNode();
     const b = await createNode();
@@ -235,5 +253,29 @@ describe('P2P signed event synchronization', () => {
       hello: b.sync.hello(), agreedProtocol: 2, schemaVersion: 1, grantedLibraryIds: [], cursors: [], events: [], results: []
     }) };
     await expect(a.sync.syncWithPeer(b.identity.peerId, transport)).rejects.toThrow('inconsistent protocol negotiation');
+  });
+
+  it('rejects an exchange hello whose node identity differs from the authenticated peer', async () => {
+    const host = await createNode();
+    const remote = await createNode();
+    await trustEachOther(host, remote);
+
+    await expect(host.sync.handleExchange(remote.identity.peerId, {
+      hello: { ...remote.sync.hello(), nodeId: 'impersonated-node-123' },
+      grantedLibraryIds: ['family'], cursors: [], events: []
+    })).rejects.toThrow('hello identity does not match authenticated peer');
+  });
+
+  it('rejects a sync response hello whose node identity differs from the requested peer', async () => {
+    const local = await createNode();
+    const remote = await createNode();
+    await trustEachOther(local, remote);
+    const transport = { exchange: async () => ({
+      hello: { ...remote.sync.hello(), nodeId: 'impersonated-node-123' },
+      agreedProtocol: 1, schemaVersion: 1, grantedLibraryIds: ['family'], cursors: [], events: [], results: []
+    }) };
+
+    await expect(local.sync.syncWithPeer(remote.identity.peerId, transport))
+      .rejects.toThrow('hello identity does not match authenticated peer');
   });
 });
