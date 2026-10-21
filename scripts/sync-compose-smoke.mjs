@@ -67,7 +67,7 @@ async function upload(node, filename, bytes) {
 
 function databaseSnapshot(service) {
   const query = "import Database from 'better-sqlite3'; import {readFileSync} from 'node:fs'; import {createHash} from 'node:crypto'; const db=new Database('/data/photomesh.sqlite'); const originals=db.prepare(\"select f.sha256,f.storage_ref from asset_files f join assets a on a.asset_id=f.asset_id where a.library_id=? and f.media_role='original'\").all('compose-library').map(r=>{try{const bytes=readFileSync('/data/managed/'+r.storage_ref); return {sha256:r.sha256,exists:true,matches:createHash('sha256').update(bytes).digest('hex')===r.sha256};}catch{return {sha256:r.sha256,exists:false,matches:false};}}); const x={assets:db.prepare('select count(*) n from assets where library_id=?').get('compose-library').n, projections:db.prepare('select count(*) n from sync_asset_projection where library_id=? and tombstone_event_id is null').get('compose-library').n, hashes:db.prepare('select sha256 from sync_asset_projection where library_id=?').all('compose-library').map(r=>r.sha256),originals}; console.log(JSON.stringify(x)); db.close();";
-  return JSON.parse(compose(['exec', '-T', service, 'node', '--input-type=module', '-e', query]));
+  return JSON.parse(compose(['exec', '-T', '-w', '/workspace/apps/node-agent', service, 'node', '--input-type=module', '-e', query]));
 }
 
 async function waitForBoth(hashes) {
