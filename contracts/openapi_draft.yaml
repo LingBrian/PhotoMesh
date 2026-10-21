@@ -60,6 +60,135 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/AssetPage'}
         '403': {description: Library access denied}
+  /v1/pairing/invitations:
+    post:
+      summary: 创建短期一次性 LAN 配对邀请（返回供客户端编码为二维码的载荷）
+      responses:
+        '201':
+          description: 2 分钟有效、一次性使用的邀请
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PairingInvite'}
+        '403': {description: Pairing administration denied}
+  /v1/pairing/join:
+    post:
+      summary: 扫描邀请二维码后，以本地节点身份通过 Noise 通道加入对端
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PairingJoin'}
+      responses:
+        '200':
+          description: Remote Peer ID verified and trusted locally
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hostPeerId]
+                properties:
+                  hostPeerId: {type: string}
+        '400': {description: Invalid request}
+        '403': {description: 'Invite expired, replayed, declined, or identity mismatch'}
+  /v1/pairing/peers:
+    get:
+      summary: 列出可信、已撤销节点和待审批设备
+      responses:
+        '200':
+          description: Trust and approval state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [peers, pending]
+                properties:
+                  peers: {type: array, items: {$ref: '#/components/schemas/TrustedPeer'}}
+                  pending: {type: array, items: {$ref: '#/components/schemas/PendingPeerApproval'}}
+        '403': {description: Pairing administration denied}
+  /v1/pairing/peers/{peerId}/approval:
+    post:
+      summary: 本地用户确认或拒绝经过 Noise 身份验证的配对请求
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PairingApproval'}
+      responses:
+        '200': {description: Approval recorded}
+        '403': {description: Pairing administration denied}
+        '404': {description: Pending request not found}
+  /v1/pairing/peers/{peerId}:
+    delete:
+      summary: 撤销节点并关闭现存 P2P 连接
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string}
+      responses:
+        '200': {description: Peer revoked}
+        '403': {description: Pairing administration denied}
+        '404': {description: Peer not found}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}:
+    put:
+      summary: 明确授予可信节点对单个图库的只读权限
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string}
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string}
+      responses:
+        '204': {description: Read grant recorded}
+        '403': {description: Pairing administration denied}
+        '409': {description: Peer is not trusted}
+  /v1/pairing/discovered:
+    get:
+      summary: 获取 mDNS 发现的未信任节点地址（发现不代表信任）
+      responses:
+        '200':
+          description: Discovered peer hints
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [peers]
+                properties:
+                  peers:
+                    type: array
+                    items:
+                      type: object
+                      required: [peerId, addresses]
+                      properties:
+                        peerId: {type: string}
+                        addresses: {type: array, items: {type: string}}
+        '403': {description: Pairing administration denied}
+  /v1/pairing/manual-discovery:
+    post:
+      summary: 通过明确私有 LAN IP 建立 Noise 身份验证连接
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host, port, peerId]
+              properties:
+                host: {type: string}
+                port: {type: integer, minimum: 1, maximum: 65535}
+                peerId: {type: string}
+      responses:
+        '200': {description: Authenticated peer address}
+        '400': {description: Invalid address}
+        '403': {description: Pairing administration denied}
   /v1/uploads:
     post:
       summary: 创建有期限的分块上传会话
@@ -188,6 +317,65 @@ components:
       scheme: bearer
       bearerFormat: device-bound-token
   schemas:
+    PairingInvite:
+      type: object
+      required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]
+      properties:
+        protocol: {type: string, const: photomesh-pairing}
+        version: {type: integer, const: 1}
+        hostPeerId: {type: string}
+        addresses: {type: array, items: {type: string}}
+        inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+        secret: {type: string, minLength: 43, maxLength: 43}
+        expiresAt: {type: string, format: date-time}
+        qrDataUrl: {type: string, pattern: '^data:image/png;base64,'}
+    PairingJoin:
+      type: object
+      required: [invite, label]
+      properties:
+        invite:
+          type: object
+          required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt]
+          properties:
+            protocol: {type: string, const: photomesh-pairing}
+            version: {type: integer, const: 1}
+            hostPeerId: {type: string}
+            addresses: {type: array, maxItems: 32, items: {type: string, maxLength: 512}}
+            inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+            secret: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+            expiresAt: {type: string, format: date-time}
+        label: {type: string, maxLength: 80}
+        manualIp:
+          type: object
+          required: [host, port]
+          properties:
+            host: {type: string}
+            port: {type: integer, minimum: 1, maximum: 65535}
+    TrustedPeer:
+      type: object
+      required: [peerId, publicKey, label, trustState, createdAt, revokedAt]
+      properties:
+        peerId: {type: string}
+        publicKey: {type: string}
+        label: {type: string}
+        trustState: {type: string, enum: [trusted, revoked]}
+        createdAt: {type: string, format: date-time}
+        revokedAt: {type: [string, 'null'], format: date-time}
+    PendingPeerApproval:
+      type: object
+      required: [peerId, publicKey, proposedLabel, requestedAt]
+      properties:
+        peerId: {type: string}
+        publicKey: {type: string}
+        proposedLabel: {type: string}
+        requestedAt: {type: string, format: date-time}
+    PairingApproval:
+      type: object
+      required: [approved]
+      properties:
+        approved: {type: boolean}
+        label: {type: string, maxLength: 80}
+        libraryIds: {type: array, uniqueItems: true, items: {type: string, maxLength: 128}}
     Library:
       type: object
       required: [libraryId, title, encryptionPolicy]

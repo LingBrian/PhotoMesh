@@ -101,5 +101,43 @@ export const migrations: readonly Migration[] = [
         PRIMARY KEY (session_id, chunk_index)
       );
     `
+  },
+  {
+    id: '0002_lan_pairing',
+    sql: `
+      CREATE TABLE node_identity (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        peer_id TEXT NOT NULL UNIQUE,
+        public_key TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE pairing_invites (
+        invite_id TEXT PRIMARY KEY,
+        secret_sha256 TEXT NOT NULL CHECK (length(secret_sha256) = 64 AND secret_sha256 NOT GLOB '*[^0-9a-f]*'),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT
+      );
+      CREATE INDEX pairing_invites_expiry_idx ON pairing_invites (expires_at, consumed_at);
+
+      CREATE TABLE trusted_peers (
+        peer_id TEXT PRIMARY KEY,
+        public_key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        trust_state TEXT NOT NULL CHECK (trust_state IN ('trusted', 'revoked')),
+        created_at TEXT NOT NULL,
+        revoked_at TEXT
+      );
+
+      CREATE TABLE library_grants (
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        permission TEXT NOT NULL CHECK (permission IN ('read')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (peer_id, library_id, permission)
+      );
+      CREATE INDEX library_grants_library_idx ON library_grants (library_id, peer_id);
+    `
   }
 ];

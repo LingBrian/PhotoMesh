@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { migrations, type Migration } from './migrations.js';
 
@@ -69,6 +69,31 @@ export interface ExternalLocationRecord {
 export interface IndexedExternalLocation {
   locationId: string;
   originalPath: string;
+  availability: 'online' | 'cached' | 'offline' | 'missing';
+}
+
+export interface PairingInviteRecord {
+  inviteId: string;
+  secretSha256: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface TrustedPeerRecord {
+  peerId: string;
+  publicKey: string;
+  label: string;
+  trustState: 'trusted' | 'revoked';
+  createdAt: string;
+  revokedAt: string | null;
+}
+
+export interface LibraryIndexAsset {
+  assetId: string;
+  libraryId: string;
+  originNodeId: string;
+  kind: AssetKind;
+  sha256: string;
   availability: 'online' | 'cached' | 'offline' | 'missing';
 }
 
@@ -199,6 +224,107 @@ export class SqliteRepository implements UploadRepository {
         throw new MigrationError(`failed applying migration ${migration.id}`, { cause: error });
       }
     }
+  }
+
+  setLocalIdentity(peerId: string, publicKey: string, createdAt: string): void {
+    const existing = this.db.prepare('SELECT peer_id, public_key FROM node_identity WHERE singleton = 1').get() as
+      { peer_id: string; public_key: string } | undefined;
+    if (existing) {
+      if (existing.peer_id !== peerId || existing.public_key !== publicKey) {
+        throw new RepositoryConflictError('local node identity cannot be silently replaced');
+      }
+      return;
+    }
+    this.db.prepare('INSERT INTO node_identity (singleton, peer_id, public_key, created_at) VALUES (1, ?, ?, ?)')
+      .run(peerId, publicKey, createdAt);
+  }
+
+  getLocalIdentity(): { peerId: string; publicKey: string } | undefined {
+    const row = this.db.prepare('SELECT peer_id, public_key FROM node_identity WHERE singleton = 1').get() as
+      { peer_id: string; public_key: string } | undefined;
+    return row ? { peerId: row.peer_id, publicKey: row.public_key } : undefined;
+  }
+
+  createPairingInvite(record: PairingInviteRecord): void {
+    this.db.prepare(`INSERT INTO pairing_invites (invite_id, secret_sha256, created_at, expires_at)
+      VALUES (@inviteId, @secretSha256, @createdAt, @expiresAt)`).run(record);
+  }
+
+  consumePairingInvite(inviteId: string, secretSha256: string, now: string): boolean {
+    const consume = this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT secret_sha256, expires_at, consumed_at FROM pairing_invites WHERE invite_id = ?`)
+        .get(inviteId) as { secret_sha256: string; expires_at: string; consumed_at: string | null } | undefined;
+      if (!row || row.consumed_at !== null || row.expires_at <= now || !safeHashEquals(row.secret_sha256, secretSha256)) return false;
+      const result = this.db.prepare(`UPDATE pairing_invites SET consumed_at = ?
+        WHERE invite_id = ? AND consumed_at IS NULL AND expires_at > ?`).run(now, inviteId, now);
+      return result.changes === 1;
+    });
+    return consume.immediate();
+  }
+
+  trustPeer(record: TrustedPeerRecord): void {
+    const existing = this.getTrustedPeer(record.peerId);
+    if (existing?.trustState === 'revoked') throw new RepositoryConflictError('revoked peer identity cannot be re-trusted');
+    this.db.prepare(`INSERT INTO trusted_peers (peer_id, public_key, label, trust_state, created_at, revoked_at)
+      VALUES (@peerId, @publicKey, @label, 'trusted', @createdAt, NULL)
+      ON CONFLICT(peer_id) DO UPDATE SET public_key = excluded.public_key, label = excluded.label
+      WHERE trusted_peers.trust_state = 'trusted'`).run(record);
+  }
+
+  getTrustedPeer(peerId: string): TrustedPeerRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM trusted_peers WHERE peer_id = ?').get(peerId) as {
+      peer_id: string; public_key: string; label: string; trust_state: 'trusted' | 'revoked'; created_at: string; revoked_at: string | null;
+    } | undefined;
+    return row ? {
+      peerId: row.peer_id, publicKey: row.public_key, label: row.label,
+      trustState: row.trust_state, createdAt: row.created_at, revokedAt: row.revoked_at
+    } : undefined;
+  }
+
+  listTrustedPeers(): TrustedPeerRecord[] {
+    const rows = this.db.prepare('SELECT * FROM trusted_peers ORDER BY created_at, peer_id').all() as Array<{
+      peer_id: string; public_key: string; label: string; trust_state: 'trusted' | 'revoked'; created_at: string; revoked_at: string | null;
+    }>;
+    return rows.map((row) => ({
+      peerId: row.peer_id, publicKey: row.public_key, label: row.label,
+      trustState: row.trust_state, createdAt: row.created_at, revokedAt: row.revoked_at
+    }));
+  }
+
+  revokePeer(peerId: string, revokedAt: string): boolean {
+    const result = this.db.prepare(`UPDATE trusted_peers SET trust_state = 'revoked', revoked_at = ?
+      WHERE peer_id = ? AND trust_state = 'trusted'`).run(revokedAt, peerId);
+    return result.changes === 1;
+  }
+
+  grantLibraryRead(peerId: string, libraryId: string, createdAt: string): void {
+    if (this.getTrustedPeer(peerId)?.trustState !== 'trusted') throw new RepositoryConflictError('library read grant requires a trusted peer');
+    this.db.prepare(`INSERT OR IGNORE INTO library_grants (peer_id, library_id, permission, created_at)
+      SELECT peer_id, ?, 'read', ? FROM trusted_peers WHERE peer_id = ? AND trust_state = 'trusted'`)
+      .run(libraryId, createdAt, peerId);
+    const grant = this.db.prepare(`SELECT 1 FROM library_grants WHERE peer_id = ? AND library_id = ? AND permission = 'read'`)
+      .get(peerId, libraryId);
+    if (!grant) throw new RepositoryConflictError('library read grant requires a trusted peer');
+  }
+
+  canReadLibrary(peerId: string, libraryId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM trusted_peers p JOIN library_grants g ON g.peer_id = p.peer_id
+      WHERE p.peer_id = ? AND p.trust_state = 'trusted' AND g.library_id = ? AND g.permission = 'read'`)
+      .get(peerId, libraryId) !== undefined;
+  }
+
+  listLibraryIndex(peerId: string, libraryId: string): LibraryIndexAsset[] | undefined {
+    if (!this.canReadLibrary(peerId, libraryId)) return undefined;
+    const rows = this.db.prepare(`SELECT a.asset_id, a.library_id, a.origin_node_id, a.kind, f.sha256,
+        COALESCE((SELECT CASE WHEN l.availability IN ('online', 'cached') THEN l.availability ELSE l.availability END
+          FROM file_locations l WHERE l.file_id = f.file_id ORDER BY CASE l.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END LIMIT 1), 'missing') AS availability
+      FROM assets a JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
+      WHERE a.library_id = ? ORDER BY a.created_at DESC, a.asset_id`).all(libraryId) as Array<{
+        asset_id: string; library_id: string; origin_node_id: string; kind: AssetKind; sha256: string;
+        availability: LibraryIndexAsset['availability'];
+      }>;
+    return rows.map((row) => ({ assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id,
+      kind: row.kind, sha256: row.sha256, availability: row.availability }));
   }
 
   getUploadSession(sessionId: string): UploadSessionRecord | undefined {
@@ -347,6 +473,11 @@ export class SqliteRepository implements UploadRepository {
     this.db.prepare("UPDATE file_locations SET availability = ? WHERE location_id = ? AND storage_class = 'external'")
       .run(availability, locationId);
   }
+}
+
+function safeHashEquals(left: string, right: string): boolean {
+  if (!/^[0-9a-f]{64}$/.test(left) || !/^[0-9a-f]{64}$/.test(right)) return false;
+  return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
 }
 
 function toSessionRecord(row: SessionRow): UploadSessionRecord {
