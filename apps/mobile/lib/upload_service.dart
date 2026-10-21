@@ -64,13 +64,15 @@ class UploadService {
       final resolvedPath = await _resolveSource?.call(job);
       if (resolvedPath != null) current = current.copyWith(filePath: resolvedPath);
       if (resolvedPath == null && job.assetId != null && _resolveSource != null) {
-        return _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: 'SOURCE_UNAVAILABLE'));
+        return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: 'SOURCE_UNAVAILABLE'));
       }
       if (await _files.length(current.filePath) != current.totalBytes) {
-        return _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SOURCE_CHANGED'));
+        return await _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SOURCE_CHANGED'));
       }
       final digest = await sha256.bind(_files.openRead(current.filePath)).first;
-      if (digest.toString() != current.sha256) return _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SOURCE_CHANGED'));
+      if (digest.toString() != current.sha256) {
+        return await _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SOURCE_CHANGED'));
+      }
 
       current = current.copyWith(state: UploadJobState.uploading, clearError: true);
       await _queue.save(current);
@@ -103,14 +105,14 @@ class UploadService {
       if (session['state'] == 'completed') return await _completeAndConfirm(node, headers, current, sessionId);
       var offset = session['offset'] as int;
       if (offset < 0 || offset > current.totalBytes || (offset != current.totalBytes && offset % _chunkBytes != 0)) {
-        return _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SERVER_OFFSET_INVALID'));
+        return await _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SERVER_OFFSET_INVALID'));
       }
       current = current.copyWith(offset: offset);
       await _queue.save(current);
       var index = offset ~/ _chunkBytes;
       while (offset < current.totalBytes) {
         if (_networkAllowed != null && !await _networkAllowed()) {
-          return _save(current.copyWith(state: UploadJobState.paused, errorCode: 'NETWORK_POLICY_BLOCKED'));
+          return await _save(current.copyWith(state: UploadJobState.paused, errorCode: 'NETWORK_POLICY_BLOCKED'));
         }
         final end = min(offset + _chunkBytes, current.totalBytes);
         final bytes = await _readRange(current.filePath, offset, end);
@@ -123,7 +125,9 @@ class UploadService {
         _expectSuccess(response, {200});
         final body = jsonDecode(response.body) as Map<String, dynamic>;
         final acceptedOffset = body['offset'] as int;
-        if (acceptedOffset != end) return _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SERVER_OFFSET_INVALID'));
+        if (acceptedOffset != end) {
+          return await _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SERVER_OFFSET_INVALID'));
+        }
         offset = acceptedOffset;
         index++;
         current = current.copyWith(offset: offset);

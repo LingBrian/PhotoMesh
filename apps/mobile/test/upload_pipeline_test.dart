@@ -8,9 +8,11 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:photomesh_mobile/background_sync.dart';
 import 'package:photomesh_mobile/node_settings.dart';
+import 'package:photomesh_mobile/photo_library.dart';
 import 'package:photomesh_mobile/upload_job.dart';
 import 'package:photomesh_mobile/upload_queue.dart';
 import 'package:photomesh_mobile/upload_service.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 class _Settings implements NodeSettingsStore {
@@ -28,6 +30,19 @@ class _MemoryFiles implements UploadFileAccess {
   @override
   Stream<List<int>> openRead(String path, {int? start, int? end}) =>
       Stream.value(bytes.sublist(start ?? 0, end ?? bytes.length));
+}
+
+class _PermissionGateway implements PhotoLibraryGateway {
+  PermissionState state = PermissionState.denied;
+
+  @override
+  Future<PermissionState> currentPermission() async => state;
+  @override
+  Future<PermissionState> requestPermission() async => state;
+  @override
+  Future<AssetEntity?> byId(String assetId) async => null;
+  @override
+  Future<List<AssetEntity>> latest({int page = 0, int pageSize = 80}) async => const [];
 }
 
 UploadJob _job(List<int> bytes) {
@@ -194,6 +209,26 @@ void main() {
     expect(await queue.runnable(), isEmpty);
     await queue.resumeGalleryJobs();
     expect((await queue.get(galleryJob.id))?.state, UploadJobState.queued);
+  });
+
+  test('marks gallery jobs when permission is denied and resumes limited access', () async {
+    final base = _job([43, 44, 45]);
+    final job = UploadJob(
+      id: 'permission-transition-job', assetId: 'media-store-id', filePath: base.filePath,
+      originalPath: base.originalPath, filename: base.filename, totalBytes: base.totalBytes,
+      sha256: base.sha256, idempotencyKey: base.idempotencyKey, state: UploadJobState.queued,
+      createdAt: base.createdAt, updatedAt: base.updatedAt,
+    );
+    await queue.enqueue(job);
+    final gateway = _PermissionGateway();
+    final library = PhotoLibraryService(queue: queue, gateway: gateway);
+
+    await library.checkPermission();
+    expect((await queue.get(job.id))?.state, UploadJobState.needsPermission);
+
+    gateway.state = PermissionState.limited;
+    await library.checkPermission();
+    expect((await queue.get(job.id))?.state, UploadJobState.queued);
   });
 
   test('does not start a gallery upload when the source is unavailable after permission revocation', () async {

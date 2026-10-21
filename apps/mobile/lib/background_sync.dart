@@ -5,6 +5,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/widgets.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:photo_manager/photo_manager.dart' show PermissionStateExt;
 import 'package:workmanager/workmanager.dart';
 
 import 'node_settings.dart';
@@ -63,7 +64,7 @@ class BackgroundSync {
       _periodicTask,
       _scanTask,
       frequency: const Duration(minutes: 15),
-      existingPeriodicWorkPolicy: ExistingPeriodicWorkPolicy.update,
+      existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
       constraints: Constraints(networkType: policy == NetworkPolicy.wifiOnly ? NetworkType.unmetered : NetworkType.connected),
     );
   }
@@ -71,7 +72,7 @@ class BackgroundSync {
   Future<void> runNow() => Workmanager().registerOneOffTask(
         'photomesh.upload.${DateTime.now().millisecondsSinceEpoch}',
         _scanTask,
-        constraints: const Constraints(networkType: NetworkType.connected),
+        constraints: Constraints(networkType: NetworkType.connected),
         existingWorkPolicy: ExistingWorkPolicy.keep,
       );
 }

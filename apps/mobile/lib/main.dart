@@ -290,11 +290,13 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
     final queue = _queue;
     if (queue == null || !mounted) return;
     final rows = await queue.list();
-    if (mounted) setState(() {
-      _queueItems
-        ..clear()
-        ..addAll(rows);
-    });
+    if (mounted) {
+      setState(() {
+        _queueItems
+          ..clear()
+          ..addAll(rows);
+      });
+    }
   }
 
   String _stateText(UploadJob job) {
