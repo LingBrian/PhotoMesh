@@ -173,6 +173,7 @@ jobs:
     name: Build signed Windows desktop installers
     needs: [validate, gate]
     runs-on: windows-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -186,17 +187,26 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Build and sign Windows installers with an ephemeral CI certificate
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
+      - name: Build Windows NSIS installer
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Write-Output 'Starting Tauri Windows NSIS build.'
           pnpm --filter @photomesh/desktop exec tauri build --bundles nsis
           if ($LASTEXITCODE -ne 0) { throw 'Tauri Windows build failed.' }
           $bundleRoot = 'apps/desktop/src-tauri/target/release/bundle'
           $installers = Get-ChildItem -LiteralPath $bundleRoot -File -Recurse | Where-Object { $_.Extension -in @('.msi', '.exe') }
           if (-not $installers) { throw 'No Windows installer was produced.' }
+          $installers | ForEach-Object { Write-Output "Unsigned installer ready: $($_.FullName) ($($_.Length) bytes)." }
+      - name: Sign and verify Windows installers
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundleRoot = 'apps/desktop/src-tauri/target/release/bundle'
+          $installers = Get-ChildItem -LiteralPath $bundleRoot -File -Recurse | Where-Object { $_.Extension -in @('.msi', '.exe') }
+          if (-not $installers) { throw 'No Windows installer is available to sign.' }
           $out = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Write-Output 'Creating an ephemeral Windows signing certificate.'
