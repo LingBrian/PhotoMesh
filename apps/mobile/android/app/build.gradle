@@ -4,6 +4,8 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
+def releaseKeystorePath = System.getenv("PHOTOMESH_ANDROID_KEYSTORE")
+
 android {
     namespace "org.photomesh.mobile"
     compileSdk flutter.compileSdkVersion
@@ -21,6 +23,22 @@ android {
         targetSdk flutter.targetSdkVersion
         versionCode flutter.versionCode
         versionName flutter.versionName
+    }
+
+    if (releaseKeystorePath) {
+        signingConfigs {
+            release {
+                storeFile file(releaseKeystorePath)
+                storePassword System.getenv("PHOTOMESH_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("PHOTOMESH_ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("PHOTOMESH_ANDROID_KEY_PASSWORD")
+            }
+        }
+        buildTypes {
+            release {
+                signingConfig signingConfigs.release
+            }
+        }
     }
 }
 

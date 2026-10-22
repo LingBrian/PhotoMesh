@@ -29,6 +29,7 @@
 | [`03_开发路线图与任务清单.md`](03_开发路线图与任务清单.md) | M0 起阶段依赖、交付任务与完成证据。 |
 | [`04_测试与发布验收方案.md`](04_测试与发布验收方案.md) | 测试层级、性能、安全、迁移、发布门槛和验收方法。 |
 | [`05_ADR_未决决策与风险.md`](05_ADR_未决决策与风险.md) | 架构决策记录、待决事项和风险；实施协议/schema 前应检查批准状态。 |
+| [`预发布发布流程.md`](预发布发布流程.md) | CI 门禁、预发布工作流、平台构建产物、签名/校验和 Stable 发布边界。 |
 | [`architecture/Monorepo_目录结构.md`](architecture/Monorepo_目录结构.md) | pnpm/Turborepo、Flutter 边界及目标仓库目录树。 |
 | [`reference/完整中文设计总报告.md`](reference/完整中文设计总报告.md) | 原始中文设计交付报告和历史需求上下文；部分内容是规划或历史提示词。 |
 | [`reference/word-reports/`](reference/word-reports/) | 归档的 Word 版 PRD、技术架构、完整设计报告和 Codex 开发方案；与 Markdown 主文档并存，可能含较早版本内容。 |
@@ -61,6 +62,7 @@
 | 文档 | 内容与用途 |
 | --- | --- |
 | [`modules/apps/node-agent/src/api/README.md`](modules/apps/node-agent/src/api/README.md) | Node Agent API 路由、契约和后端 ACL 约束。 |
+| [`modules/apps/node-agent/README.md`](modules/apps/node-agent/README.md) | Node Agent 存储、上传、只读扫描、配对和 Windows/NAS 配置教程。 |
 | [`modules/apps/node-agent/src/app/README.md`](modules/apps/node-agent/src/app/README.md) | Node Agent 启动装配与健康状态。 |
 | [`modules/apps/node-agent/src/auth/README.md`](modules/apps/node-agent/src/auth/README.md) | 设备身份、配对、授权和信任模型。 |
 | [`modules/apps/node-agent/src/db/README.md`](modules/apps/node-agent/src/db/README.md) | SQLite Repository、迁移、兼容性与备份约束。 |
@@ -69,6 +71,7 @@
 | [`modules/apps/node-agent/src/storage/README.md`](modules/apps/node-agent/src/storage/README.md) | 原图存储、外部只读目录、哈希校验和原子提交。 |
 | [`modules/apps/node-agent/src/sync/README.md`](modules/apps/node-agent/src/sync/README.md) | 签名事件、outbox/inbox、P2P 与协议审查。 |
 | [`modules/apps/node-agent/test/README.md`](modules/apps/node-agent/test/README.md) | Node Agent Vitest 单元/API 测试和覆盖率要求。 |
+| [`modules/apps/mobile/README.md`](modules/apps/mobile/README.md) | Android 权限、自动发现、队列、网络策略、续传和实机验收指南。 |
 | [`modules/packages/api-client-ts/README.md`](modules/packages/api-client-ts/README.md) | 从 OpenAPI 契约生成 TypeScript 客户端。 |
 | [`modules/packages/security/README.md`](modules/packages/security/README.md) | 认证、ACL 和审计接口边界。 |
 | [`modules/packages/storage-core/README.md`](modules/packages/storage-core/README.md) | 可注入文件系统、路径规范化和内容摘要。 |
