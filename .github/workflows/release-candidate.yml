@@ -1,0 +1,53 @@
+name: Release candidate gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_id:
+        description: Local-style candidate identifier (for example 0.1.0-rc.1)
+        required: true
+        type: string
+      evidence_json:
+        description: Optional repository-relative path to operator-collected release evidence JSON
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release-candidate-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run candidate gates and assemble review bundle
+        env:
+          PHOTOMESH_CANDIDATE_ID: ${{ inputs.candidate_id }}
+          PHOTOMESH_RELEASE_EVIDENCE: ${{ inputs.evidence_json }}
+        run: pnpm release:gate
+      - name: Upload review bundle, including blocked candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: photomesh-${{ inputs.candidate_id }}-release-candidate
+          path: artifacts/release-candidates/${{ inputs.candidate_id }}
+          if-no-files-found: error
+          retention-days: 30
+
+# Deliberately no release, publish, tag, or deployment steps here. Stable is a
+# separate human-approved operation.

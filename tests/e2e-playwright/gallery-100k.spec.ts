@@ -1,11 +1,15 @@
 import Database from '../../apps/node-agent/node_modules/better-sqlite3/lib/index.js';
 import { expect, test } from '@playwright/test';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import os from 'node:os';
 import { SqliteRepository } from '../../apps/node-agent/src/db/repository.js';
 import { createNodeAgentServer } from '../../apps/node-agent/src/server.js';
 
 const total = 100_000;
 const limit = 100;
 const pageCounts: number[] = [];
+const performanceSamplesMs: number[] = [];
 const database = new Database(':memory:');
 const repository = new SqliteRepository(database);
 const api = createNodeAgentServer({
@@ -74,6 +78,48 @@ test('virtual timeline pages through 100k records and search stays server pagina
   expect(Math.max(...pageCounts)).toBeLessThanOrEqual(limit);
 
   const search = page.getByRole('searchbox', { name: 'Search gallery' });
+  // Measure the real API + SQLite path, not the synthetic in-browser fixture.
+  // Queries include both selective and common terms and always request the same
+  // bounded page size, matching normal timeline/search use.
+  const queryTerms = ['target', 'photo', 'nas-node', 'fixture', 'asset-09'];
+  database.pragma('shrink_memory');
+  const coldStarted = performance.now();
+  const coldResponse = await page.request.get(`${endpoint}/v1/assets?libraryId=fixture-library&limit=50&q=target`, {
+    headers: { authorization: 'Bearer e2e-token' }
+  });
+  expect(coldResponse.ok()).toBeTruthy();
+  const coldCacheMs = performance.now() - coldStarted;
+  for (let i = 0; i < 1_000; i++) {
+    const started = performance.now();
+    const response = await page.request.get(`${endpoint}/v1/assets?libraryId=fixture-library&limit=50&q=${queryTerms[i % queryTerms.length]}`, {
+      headers: { authorization: 'Bearer e2e-token' }
+    });
+    expect(response.ok()).toBeTruthy();
+    performanceSamplesMs.push(performance.now() - started);
+  }
+  const sortedSamples = [...performanceSamplesMs].sort((a, b) => a - b);
+  const percentile = (p: number): number => sortedSamples[Math.ceil(p * sortedSamples.length) - 1] ?? 0;
+  const report = {
+    schemaVersion: 1,
+    dataset: { assets: total, queries: performanceSamplesMs.length, pageSize: 50, terms: queryTerms },
+    queryApi: {
+      coldCache: { method: 'SQLite PRAGMA shrink_memory before first API query', samples: 1, latencyMs: coldCacheMs },
+      warmCache: { p50Ms: percentile(0.50), p95Ms: percentile(0.95), p99Ms: percentile(0.99), maxMs: sortedSamples.at(-1) ?? 0, samples: performanceSamplesMs.length },
+      p50Ms: percentile(0.50), p95Ms: percentile(0.95), p99Ms: percentile(0.99), maxMs: sortedSamples.at(-1) ?? 0
+    },
+    environment: {
+      platform: process.platform, os: `${os.type()} ${os.release()}`, arch: process.arch, node: process.version,
+      cpuModel: os.cpus()[0]?.model ?? 'unknown', cpuCount: process.availableParallelism?.() ?? null,
+      totalRamMiB: Math.round(os.totalmem() / 1024 / 1024), peakRssMiB: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    },
+    thresholdMs: 1_000,
+    passed: percentile(0.95) < 1_000
+  };
+  const output = process.env.PHOTOMESH_PERF_REPORT ?? 'artifacts/performance/gallery-100k.json';
+  await mkdir(dirname(output), { recursive: true });
+  await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
+  expect(report.queryApi.p95Ms, `100k query API P95 ${report.queryApi.p95Ms.toFixed(2)}ms must be < 1000ms`).toBeLessThan(1_000);
+
   await search.fill('target');
   await expect(page.getByRole('heading', { name: 'target-photo.jpg' })).toBeVisible();
   expect(Math.max(...pageCounts)).toBeLessThanOrEqual(limit);

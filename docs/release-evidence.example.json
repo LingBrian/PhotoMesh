@@ -1,0 +1,15 @@
+{
+  "fileSync": {
+    "totalFiles": 100000,
+    "runCount": 3,
+    "initial": { "sha256Mismatches": 0, "durationSeconds": 0, "cpuPercent": 0, "peakRssMiB": 0 },
+    "incremental": { "sha256Mismatches": 0, "durationSeconds": 0, "changedFiles": 0 },
+    "offlineReconnect": { "sha256Mismatches": 0, "durationSeconds": 0 }
+  },
+  "p2p": { "networkRestoredAt": "ISO-8601", "firstEventAckAt": "ISO-8601", "reconnectSeconds": 0 },
+  "nas": { "device": "model", "architecture": "arm64", "totalRamMiB": 2048, "coreScenariosPassed": true, "peakRssMiB": 0, "freeRamMiB": 0, "aiAndTranscodeDisabled": true },
+  "integrity": { "checkedFiles": 100000, "mismatches": 0, "sourceFilesChanged": 0 },
+  "migration": { "backupCreatedAt": "ISO-8601", "migrationStartedAt": "ISO-8601", "backupCreated": true, "backupSha256": "64-hex-digits", "restoreVerified": true, "restoredDatabaseSha256": "64-hex-digits", "assetCountBefore": 0, "assetCountAfter": 0 },
+  "acl": { "matrixPassed": true, "unauthorizedReads": 0, "cases": ["owner", "admin", "family", "guest", "revoked", "untrusted"] },
+  "measurement": { "startedAt": "ISO-8601", "finishedAt": "ISO-8601", "operator": "reviewer", "host": "host/os/cpu/disk" }
+}

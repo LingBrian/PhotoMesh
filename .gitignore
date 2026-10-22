@@ -17,3 +17,5 @@ apps/mobile/android/.gradle/
 apps/mobile/android/app/build/
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
+artifacts/
+release-evidence.json
