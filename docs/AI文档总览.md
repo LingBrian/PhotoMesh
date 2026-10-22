@@ -31,6 +31,7 @@
 | [`05_ADR_未决决策与风险.md`](05_ADR_未决决策与风险.md) | 架构决策记录、待决事项和风险；实施协议/schema 前应检查批准状态。 |
 | [`architecture/Monorepo_目录结构.md`](architecture/Monorepo_目录结构.md) | pnpm/Turborepo、Flutter 边界及目标仓库目录树。 |
 | [`reference/完整中文设计总报告.md`](reference/完整中文设计总报告.md) | 原始中文设计交付报告和历史需求上下文；部分内容是规划或历史提示词。 |
+| [`reference/word-reports/`](reference/word-reports/) | 归档的 Word 版 PRD、技术架构、完整设计报告和 Codex 开发方案；与 Markdown 主文档并存，可能含较早版本内容。 |
 | [`guides/交付说明.md`](guides/交付说明.md) | 早期设计交付包索引及其关键边界，作为背景材料。 |
 | [`guides/Codex工程开发与测试.md`](guides/Codex工程开发与测试.md) | Codex 分阶段开发/测试参考和早期任务记录；不是当前实现状态证明。 |
 
