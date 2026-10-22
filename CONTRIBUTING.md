@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢参与 PhotoMesh。提交变更前请先阅读根目录 [`AGENTS.md`](AGENTS.md)、产品需求、技术架构、ADR 和 [`project/Monorepo_目录结构.md`](project/Monorepo_目录结构.md)。这些文件定义安全不变量和模块边界。
+感谢参与 PhotoMesh。提交变更前请先阅读根目录 [`AGENTS.md`](AGENTS.md)、产品需求、技术架构、ADR 和 [`docs/architecture/Monorepo_目录结构.md`](docs/architecture/Monorepo_目录结构.md)。所有项目文档的用途见 [`docs/AI文档总览.md`](docs/AI文档总览.md)。这些文件定义安全不变量和模块边界。
 
 ## 开发步骤
 

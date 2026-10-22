@@ -84,4 +84,4 @@ cd apps/mobile; flutter pub get; flutter test
 
 ## 8. Codex 阶段提示词
 
-见 `codex/阶段提示词.md`，按 M0→M1→M2→M3→M4→M5 执行；AI、E2EE 完整共享、插件生态安排在后续阶段。不要将所有愿景功能堆到首个 PR。
+见 `docs/guides/codex/阶段提示词.md`，按 M0→M1→M2→M3→M4→M5 执行；AI、E2EE 完整共享、插件生态安排在后续阶段。不要将所有愿景功能堆到首个 PR。

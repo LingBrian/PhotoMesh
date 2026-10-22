@@ -2,7 +2,7 @@
 
 ```text
 photomesh/
-├── AGENTS.md                       # 根 Codex 行为约束（复制交付包 codex/AGENTS.md）
+├── AGENTS.md                       # 根 Codex 行为约束（规范说明见 docs/guides/codex/AGENTS.md）
 ├── README.md / README.en.md
 ├── LICENSE                         # Apache-2.0
 ├── SECURITY.md / CONTRIBUTING.md / CODE_OF_CONDUCT.md

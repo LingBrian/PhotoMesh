@@ -19,7 +19,7 @@ PhotoMesh is a self-hosted, cross-platform, decentralized photo library. Trusted
 - `packages/contracts` and `contracts/`: OpenAPI draft and component JSON Schema checks.
 - `packages/i18n`: Simplified Chinese and English UI copy.
 
-These entry points demonstrate a working workspace and toolchain; they do not claim product features are complete. See [`codex/阶段提示词.md`](codex/阶段提示词.md) for stages and [`docs/`](docs/) for product and compatibility constraints.
+These entry points demonstrate a working workspace and toolchain; they do not claim product features are complete. See [`docs/guides/codex/阶段提示词.md`](docs/guides/codex/阶段提示词.md) for stages, [`docs/`](docs/) for product and compatibility constraints, and [`docs/AI文档总览.md`](docs/AI文档总览.md) for the documentation index.
 
 ## Development
 
