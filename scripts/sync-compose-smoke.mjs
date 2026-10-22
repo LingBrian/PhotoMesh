@@ -152,7 +152,12 @@ compose(['pause', nodes[1].service]);
 const offlineBytes = Buffer.from(`offline-retry-${randomUUID()}`);
 const offline = await upload(nodes[0], 'offline-retry.bin', offlineBytes);
 compose(['unpause', nodes[1].service]);
+const networkRestoredAtMs = Date.now();
+await waitForHealth(nodes[1]);
 const afterReconnect = await waitForBoth([first.sha256, second.sha256, offline.sha256]);
+const firstEventAckAtMs = Date.now();
+const reconnectMs = firstEventAckAtMs - networkRestoredAtMs;
+if (reconnectMs > 60_000) throw new Error(`P2P recovery took ${reconnectMs}ms; required <= 60000ms`);
 if (afterReconnect[0].assets !== baseline[0].assets + 2 || afterReconnect[1].assets !== baseline[1].assets + 1 ||
     afterReconnect.some((snapshot) => snapshot.originals.length !== snapshot.assets || snapshot.originals.some((original) => !original.exists || !original.matches))) {
   throw new Error('offline retry copied or changed a node original');
@@ -169,4 +174,6 @@ if (afterRestart.some((snapshot) => snapshot.originals.length !== snapshot.asset
 }
 
 process.stdout.write(JSON.stringify({ status: 'passed', hashes: [first.sha256, second.sha256, offline.sha256],
+  p2pRecovery: { networkRestoredAt: new Date(networkRestoredAtMs).toISOString(),
+    firstEventAckAt: new Date(firstEventAckAtMs).toISOString(), reconnectMs, reconnectSeconds: reconnectMs / 1000 },
   afterReconnect, afterRestart, originalsRemainNodeLocal: true }, null, 2) + '\n');

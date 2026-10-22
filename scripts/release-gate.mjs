@@ -42,6 +42,27 @@ function blocked(name, reason, remediation) {
   process.stdout.write(`[blocked] ${name}: ${reason}\n`);
 }
 
+function parseFirstJsonObject(text) {
+  const start = text.indexOf('{');
+  if (start < 0) throw new Error('JSON object not found in command output');
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === '{') depth += 1;
+    else if (character === '}' && --depth === 0) return JSON.parse(text.slice(start, index + 1));
+  }
+  throw new Error('Incomplete JSON object in command output');
+}
+
 async function exists(path) {
   try { await access(path); return true; } catch { return false; }
 }
@@ -102,9 +123,11 @@ async function validateEvidence() {
     } else checksEvidence.push({ name: '100k-initial-incremental-file-sync', status: 'blocked', reason: '需要 100,000 文件首次/增量同步实测及零 SHA-256 差异证据' });
     const reconnectSeconds = evidence.p2p?.reconnectSeconds;
     const measuredReconnect = Date.parse(evidence.p2p?.firstEventAckAt) - Date.parse(evidence.p2p?.networkRestoredAt);
-    checksEvidence.push(reconnectSeconds >= 0 && reconnectSeconds <= 60 && Number.isFinite(measuredReconnect) && Math.abs(measuredReconnect / 1000 - reconnectSeconds) <= 1
-      ? { name: 'p2p-recovery-under-60s', status: 'pass', evidence: evidence.p2p }
-      : { name: 'p2p-recovery-under-60s', status: 'blocked', reason: '需要端点恢复可达到首个事件 ACK 的实测时间，≤60 秒' });
+    if (!checks.some((check) => check.name === 'p2p-recovery-under-60s' && check.status === 'pass')) {
+      checksEvidence.push(reconnectSeconds >= 0 && reconnectSeconds <= 60 && Number.isFinite(measuredReconnect) && Math.abs(measuredReconnect / 1000 - reconnectSeconds) <= 1
+        ? { name: 'p2p-recovery-under-60s', status: 'pass', evidence: evidence.p2p }
+        : { name: 'p2p-recovery-under-60s', status: 'blocked', reason: '需要端点恢复可达到首个事件 ACK 的实测时间，≤60 秒' });
+    }
     const nas = evidence.nas;
     checksEvidence.push(nas?.device && nas.device !== 'model' && nas?.architecture === 'arm64' && nas?.totalRamMiB === 2048 &&
       nas?.coreScenariosPassed === true && nas?.peakRssMiB > 0 && nas?.freeRamMiB > 0 && nas?.aiAndTranscodeDisabled === true
@@ -154,7 +177,18 @@ if (packageOnly) {
   const flutterEnv = flutterBin ? { PATH: `${flutterBin}${delimiter}${process.env.PATH ?? ''}` } : {};
   await run('flutter-test', powershell, ['-NoProfile', '-File', 'scripts/flutter-test.ps1'], { env: flutterEnv });
   await run('playwright-100k-and-query-p95', 'pnpm', ['test:e2e'], { timeout: 45 * 60_000 });
-  await run('p2p-compose-fault-smoke', 'pnpm', ['test:sync-compose'], { timeout: 45 * 60_000 });
+  const syncSmoke = await run('p2p-compose-fault-smoke', 'pnpm', ['test:sync-compose'], { timeout: 45 * 60_000 });
+  if (syncSmoke.status === 'pass') {
+    try {
+      const smoke = parseFirstJsonObject(syncSmoke.output);
+      const recovery = smoke.p2pRecovery;
+      checks.push(recovery?.reconnectMs >= 0 && recovery?.reconnectMs <= 60_000
+        ? { name: 'p2p-recovery-under-60s', status: 'pass', evidence: { ...recovery, source: 'two-node Docker Compose reconnect and event convergence' } }
+        : { name: 'p2p-recovery-under-60s', status: 'fail', reason: 'Docker smoke did not report a valid <=60s recovery measurement' });
+    } catch (error) {
+      checks.push({ name: 'p2p-recovery-under-60s', status: 'fail', reason: `Unable to parse Docker reconnect measurement: ${error.message}` });
+    }
+  }
   await run('dependency-security-audit', 'pnpm', ['audit', '--registry=https://registry.npmjs.org/', '--prod', '--audit-level', 'high'], { timeout: 10 * 60_000 });
 }
 
