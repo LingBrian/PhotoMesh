@@ -54,6 +54,9 @@ test.afterAll(async () => {
 });
 
 test('virtual timeline pages through 100k records and search stays server paginated', async ({ page }) => {
+  // 1000 serial HTTP samples are intentionally measured against the real API;
+  // the end-to-end wall time can exceed Playwright's default two minute cap.
+  test.setTimeout(10 * 60_000);
   page.on('response', async (response) => {
     if (!new URL(response.url()).pathname.endsWith('/v1/assets')) return;
     try { pageCounts.push(((await response.json()) as { items: unknown[] }).items.length); }

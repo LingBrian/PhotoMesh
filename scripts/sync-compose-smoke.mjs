@@ -1,17 +1,69 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:net';
 
 const composeFile = 'deploy/compose/docker-compose.sync.yml';
+const composeProject = `photomesh-sync-smoke-${process.pid}-${randomUUID().slice(0, 8)}`;
 const token = 'photomesh-compose-fixture-token';
 const libraryId = 'compose-library';
+function ipv4ToInt(value) { return value.split('.').reduce((sum, part) => (sum * 256) + Number(part), 0); }
+function subnetRange(cidr) {
+  const [ip, prefixText] = cidr.split('/');
+  const prefix = Number(prefixText);
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  const start = ipv4ToInt(ip) & mask;
+  return [start, start + (0xffffffff ^ mask)];
+}
+function chooseSubnet() {
+  const ids = execFileSync('docker', ['network', 'ls', '-q'], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
+  const networks = ids.length ? JSON.parse(execFileSync('docker', ['network', 'inspect', ...ids], { encoding: 'utf8' })) : [];
+  const occupied = networks.flatMap((network) => (network.IPAM?.Config ?? []).map((config) => config.Subnet).filter(Boolean).map(subnetRange));
+  const start = Math.floor(Math.random() * (16 * 256));
+  for (let offset = 0; offset < 16 * 256; offset += 1) {
+    const n = (start + offset) % (16 * 256);
+    const base = `172.${16 + Math.floor(n / 256)}.${n % 256}.0`;
+    const [candidateStart, candidateEnd] = subnetRange(`${base}/24`);
+    if (!occupied.some(([a, b]) => candidateStart <= b && candidateEnd >= a)) return base;
+  }
+  throw new Error('No unused Docker /24 subnet available in 172.16.0.0/12');
+}
+const networkBase = chooseSubnet();
+process.env.PHOTOMESH_SYNC_SUBNET = `${networkBase}/24`;
+process.env.PHOTOMESH_WINDOWS_SIM_IP = `${networkBase.replace(/\.0$/, '')}.2`;
+process.env.PHOTOMESH_NAS_SIM_IP = `${networkBase.replace(/\.0$/, '')}.3`;
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => server.listen(0, '127.0.0.1', resolve).once('error', reject));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Unable to allocate test port');
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  return address.port;
+}
+const windowsPort = await freePort();
+let nasPort = await freePort();
+while (nasPort === windowsPort) nasPort = await freePort();
+process.env.PHOTOMESH_WINDOWS_SIM_PORT = String(windowsPort);
+process.env.PHOTOMESH_NAS_SIM_PORT = String(nasPort);
 const nodes = [
-  { service: 'windows-sim', base: 'http://127.0.0.1:18443', peerAddress: { host: '172.29.0.2', port: 4001 } },
-  { service: 'nas-sim', base: 'http://127.0.0.1:18444', peerAddress: { host: '172.29.0.3', port: 4001 } }
+  { service: 'windows-sim', base: `http://127.0.0.1:${windowsPort}`, peerAddress: { host: process.env.PHOTOMESH_WINDOWS_SIM_IP, port: 4001 } },
+  { service: 'nas-sim', base: `http://127.0.0.1:${nasPort}`, peerAddress: { host: process.env.PHOTOMESH_NAS_SIM_IP, port: 4001 } }
 ];
 
 function compose(args) {
-  return execFileSync('docker', ['compose', '-f', composeFile, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim();
+  return execFileSync('docker', ['compose', '--project-name', composeProject, '-f', composeFile, ...args], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], maxBuffer: 32 * 1024 * 1024
+  }).trim();
 }
+
+// Every smoke run owns a unique compose project and removes only its own
+// containers, network, and volumes even when an assertion or request fails.
+process.on('exit', () => {
+  try {
+    execFileSync('docker', ['compose', '--project-name', composeProject, '-f', composeFile, 'down', '--volumes', '--remove-orphans'], {
+      stdio: 'ignore', timeout: 120_000, windowsHide: true
+    });
+  } catch { /* preserve the original test result; a failed cleanup remains visible in Docker */ }
+});
 
 async function request(node, path, { method = 'GET', body, headers = {} } = {}) {
   const response = await fetch(`${node.base}${path}`, {

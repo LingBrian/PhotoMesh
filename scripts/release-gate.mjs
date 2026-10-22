@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { join, relative, resolve } from 'node:path';
+import { delimiter, dirname, join, relative, resolve } from 'node:path';
 import process from 'node:process';
 
 const root = resolve(import.meta.dirname, '..');
@@ -15,12 +15,12 @@ const evidencePath = resolve(process.env.PHOTOMESH_RELEASE_EVIDENCE ?? join(root
 const checks = [];
 const packageOnly = process.argv.includes('--package-only');
 
-function command(bin, args, { timeout = 30 * 60_000 } = {}) {
+function command(bin, args, { timeout = 30 * 60_000, env = {} } = {}) {
   const started = performance.now();
   const windowsPnpm = process.platform === 'win32' && bin === 'pnpm';
   const executable = windowsPnpm ? (process.env.ComSpec ?? 'cmd.exe') : bin;
   const commandArgs = windowsPnpm ? ['/d', '/s', '/c', `pnpm ${args.join(' ')}`] : args;
-  const result = spawnSync(executable, commandArgs, { cwd: root, encoding: 'utf8', timeout, windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
+  const result = spawnSync(executable, commandArgs, { cwd: root, encoding: 'utf8', timeout, env: { ...process.env, ...env }, windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
   return {
     status: result.error || result.status !== 0 ? 'fail' : 'pass',
     durationMs: Math.round(performance.now() - started),
@@ -150,10 +150,12 @@ if (packageOnly) {
   await run('contracts', 'pnpm', ['contracts:check']);
   await run('build', 'pnpm', ['build']);
   const powershell = process.platform === 'win32' ? 'powershell' : 'pwsh';
-  await run('flutter-test', powershell, ['-NoProfile', '-File', 'scripts/flutter-test.ps1']);
+  const flutterBin = process.env.PHOTOMESH_FLUTTER_BIN;
+  const flutterEnv = flutterBin ? { PATH: `${flutterBin}${delimiter}${process.env.PATH ?? ''}` } : {};
+  await run('flutter-test', powershell, ['-NoProfile', '-File', 'scripts/flutter-test.ps1'], { env: flutterEnv });
   await run('playwright-100k-and-query-p95', 'pnpm', ['test:e2e'], { timeout: 45 * 60_000 });
   await run('p2p-compose-fault-smoke', 'pnpm', ['test:sync-compose'], { timeout: 45 * 60_000 });
-  await run('dependency-security-audit', 'pnpm', ['audit', '--prod', '--audit-level', 'high'], { timeout: 10 * 60_000 });
+  await run('dependency-security-audit', 'pnpm', ['audit', '--registry=https://registry.npmjs.org/', '--prod', '--audit-level', 'high'], { timeout: 10 * 60_000 });
 }
 
 const perfPath = resolve(process.env.PHOTOMESH_PERF_REPORT ?? join(root, 'artifacts', 'performance', 'gallery-100k.json'));
