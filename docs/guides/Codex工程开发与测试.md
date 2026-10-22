@@ -297,7 +297,7 @@ cd apps/mobile; flutter pub get; flutter test
 
 ## 8. Codex 阶段提示词
 
-见 `codex/阶段提示词.md`，按 M0→M1→M2→M3→M4→M5 执行；AI、E2EE 完整共享、插件生态安排在后续阶段。不要将所有愿景功能堆到首个 PR。
+见 `docs/guides/codex/阶段提示词.md`，按 M0→M1→M2→M3→M4→M5 执行；AI、E2EE 完整共享、插件生态安排在后续阶段。不要将所有愿景功能堆到首个 PR。
 
 
 \newpage
@@ -315,7 +315,7 @@ cd apps/mobile; flutter pub get; flutter test
 ## M0 — 初始化仓库与 CI
 
 ```text
-创建符合 project/Monorepo_目录结构.md 的仓库基座：pnpm workspace + Turborepo、TypeScript strict、Vue3 Web、Tauri2 Desktop、Flutter Mobile 占位和 Node.js Agent，Apache-2.0、README(中/英)、贡献指南、SECURITY.md、AGENTS.md、Issue/PR 模板。提供 Vitest、Flutter test、lint、typecheck、build、GitHub Actions 必过 CI、OpenAPI/JSON Schema 校验。Flutter 通过脚本管理，不当 npm 依赖。先输出目录树和分阶段变更，再逐步创建文件。最后运行现有工具可执行的命令并贴出结果，仅本地提交到 feature 分支。
+创建符合 docs/architecture/Monorepo_目录结构.md 的仓库基座：pnpm workspace + Turborepo、TypeScript strict、Vue3 Web、Tauri2 Desktop、Flutter Mobile 占位和 Node.js Agent，Apache-2.0、README(中/英)、贡献指南、SECURITY.md、AGENTS.md、Issue/PR 模板。提供 Vitest、Flutter test、lint、typecheck、build、GitHub Actions 必过 CI、OpenAPI/JSON Schema 校验。Flutter 通过脚本管理，不当 npm 依赖。先输出目录树和分阶段变更，再逐步创建文件。最后运行现有工具可执行的命令并贴出结果，仅本地提交到 feature 分支。
 ```
 
 ## M1-A — SQLite 数据模型与安全写入

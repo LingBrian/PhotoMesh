@@ -19,7 +19,7 @@ PhotoMesh 是一个自托管、跨平台的去中心化相册项目。它让多�
 - `packages/contracts` 与 `contracts/`：OpenAPI 草案和组件 JSON Schema 校验。
 - `packages/i18n`：简体中文和英语界面文案。
 
-这些入口只证明工作区和工具链可运行，不代表产品功能已完成。阶段计划见 [`codex/阶段提示词.md`](codex/阶段提示词.md)，产品范围和兼容约束见 [`docs/`](docs/) 与 [`project/Monorepo_目录结构.md`](project/Monorepo_目录结构.md)。
+这些入口只证明工作区和工具链可运行，不代表产品功能已完成。阶段计划见 [`docs/guides/codex/阶段提示词.md`](docs/guides/codex/阶段提示词.md)，产品范围和兼容约束见 [`docs/`](docs/)。AI 文档导航见 [`docs/AI文档总览.md`](docs/AI文档总览.md)。
 
 ## 本地开发
 
