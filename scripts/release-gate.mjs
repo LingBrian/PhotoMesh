@@ -35,6 +35,7 @@ async function run(name, bin, args, options) {
   const result = command(bin, args, options);
   checks.push({ name, ...result });
   process.stdout.write(`[${result.status}] ${name} (${result.durationMs}ms)\n`);
+  return result;
 }
 
 function blocked(name, reason, remediation) {
