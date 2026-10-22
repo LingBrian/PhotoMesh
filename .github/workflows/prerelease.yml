@@ -199,6 +199,7 @@ jobs:
           if (-not $installers) { throw 'No Windows installer was produced.' }
           $out = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Write-Output 'Creating an ephemeral Windows signing certificate.'
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=PhotoMesh CI prerelease' -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10)
           $password = [guid]::NewGuid().ToString('N')
           Write-Output "::add-mask::$password"
@@ -209,13 +210,21 @@ jobs:
           Export-Certificate -Cert $cert -FilePath $publicCert | Out-Null
           Import-Certificate -FilePath $publicCert -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
           $kits = [Environment]::GetFolderPath('ProgramFilesX86')
-          $signtool = Get-ChildItem -Path (Join-Path $kits 'Windows Kits\10\bin') -Filter signtool.exe -Recurse |
-            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $signtool) { throw 'Windows SDK signtool.exe was not found.' }
+          $sdkBinRoot = Join-Path $kits 'Windows Kits\10\bin'
+          Write-Output "Looking for x64 signtool.exe in SDK version folders under $sdkBinRoot."
+          $signtoolPath = Get-ChildItem -LiteralPath $sdkBinRoot -Directory -ErrorAction Stop |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+          if (-not $signtoolPath) { throw 'Windows SDK x64 signtool.exe was not found in version folders.' }
+          Write-Output "Using signtool.exe at $signtoolPath."
           foreach ($installer in $installers) {
-            & $signtool.FullName sign /fd SHA256 /f $pfx /p $password $installer.FullName
+            Write-Output "Signing $($installer.Name)."
+            & $signtoolPath sign /fd SHA256 /f $pfx /p $password $installer.FullName
             if ($LASTEXITCODE -ne 0) { throw "Signing failed for $($installer.Name)." }
-            & $signtool.FullName verify /pa /v $installer.FullName
+            Write-Output "Verifying signature for $($installer.Name)."
+            & $signtoolPath verify /pa /v $installer.FullName
             if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $($installer.Name)." }
             Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $out "PhotoMesh-$env:VERSION-windows-x64$($installer.Extension)")
           }
