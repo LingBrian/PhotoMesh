@@ -29,7 +29,7 @@
 | [`03_开发路线图与任务清单.md`](03_开发路线图与任务清单.md) | M0 起阶段依赖、交付任务与完成证据。 |
 | [`04_测试与发布验收方案.md`](04_测试与发布验收方案.md) | 测试层级、性能、安全、迁移、发布门槛和验收方法。 |
 | [`05_ADR_未决决策与风险.md`](05_ADR_未决决策与风险.md) | 架构决策记录、待决事项和风险；实施协议/schema 前应检查批准状态。 |
-| [`预发布发布流程.md`](预发布发布流程.md) | CI 门禁、预发布工作流、平台构建产物、签名/校验和 Stable 发布边界。 |
+| [`预发布发布流程.md`](预发布发布流程.md) | 双节点 Docker 演练、Windows Node Agent 本机试用、预发布客户端安装、CI 构建与校验、NAS 生产部署边界。 |
 | [`architecture/Monorepo_目录结构.md`](architecture/Monorepo_目录结构.md) | pnpm/Turborepo、Flutter 边界及目标仓库目录树。 |
 | [`reference/完整中文设计总报告.md`](reference/完整中文设计总报告.md) | 原始中文设计交付报告和历史需求上下文；部分内容是规划或历史提示词。 |
 | [`reference/word-reports/`](reference/word-reports/) | 归档的 Word 版 PRD、技术架构、完整设计报告和 Codex 开发方案；与 Markdown 主文档并存，可能含较早版本内容。 |

@@ -1,5 +1,7 @@
 # Compose
 
+此 Compose 仅用于隔离的双节点同步模拟，不能作为生产部署模板。Node Agent 容器在 Linux Secret Service 不可用时无法使用真实密钥存储；模拟环境显式使用仅供测试的 fixture 文件密钥和固定管理员 token。
+
 ## 双节点同步模拟
 
 ```powershell
@@ -16,3 +18,5 @@ docker compose -f deploy/compose/docker-compose.sync.yml down -v
 ```
 
 该模拟容器运行在 Linux 内核上，不能替代真实 Windows/NTFS 和 NAS 实机验收。其他重复投递、乱序、因果缺口、墓碑、授权拒绝和 N-1 兼容用例由 Node agent Vitest 集成测试覆盖。
+
+本机 Node Agent 启动、Windows 外部目录只读扫描、网络边界、预发布客户端安装和 GitHub Actions 发版步骤见[部署与预发布教程](../../../预发布发布流程.md)。不要把本页的固定 token、测试配置或 `down -v` 命令用于真实图库。
