@@ -83,7 +83,7 @@ The workflow runs the full acceptance gate before building the Web bundle, Linux
 
 ## Documentation
 
-Start with the [AI documentation index](docs/AI文档总览.md). Product requirements, architecture, ADRs, release acceptance, operations, and pairing docs live under `docs/`.
+Start with the [AI documentation index](docs/AI文档总览.md). Product requirements, architecture, ADRs, release acceptance, operations, and pairing docs live under `docs/`. See the [deployment and prerelease guide](docs/预发布发布流程.md) for local setup, the two-node Docker exercise, Windows Node Agent, and prerelease installation.
 
 ## License
 

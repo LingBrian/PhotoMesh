@@ -83,7 +83,7 @@ gh workflow run prerelease.yml --ref main -f version=0.1.0-rc.1
 
 ## 文档
 
-从 [AI 文档总览](docs/AI文档总览.md) 开始。产品需求、架构、ADR、发布验收、运行和安全配对文档均归档在 `docs/`。
+从 [AI 文档总览](docs/AI文档总览.md) 开始。产品需求、架构、ADR、发布验收、运行和安全配对文档均归档在 `docs/`。部署方式、双节点 Docker 演练、Windows Node Agent 和预发布安装步骤见[部署与预发布教程](docs/预发布发布流程.md)。
 
 ## 许可证
 
