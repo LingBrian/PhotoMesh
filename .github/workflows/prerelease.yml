@@ -192,7 +192,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          pnpm --filter @photomesh/desktop tauri:build
+          pnpm --filter @photomesh/desktop exec tauri build --bundles nsis
           if ($LASTEXITCODE -ne 0) { throw 'Tauri Windows build failed.' }
           $bundleRoot = 'apps/desktop/src-tauri/target/release/bundle'
           $installers = Get-ChildItem -LiteralPath $bundleRoot -File -Recurse | Where-Object { $_.Extension -in @('.msi', '.exe') }
