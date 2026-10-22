@@ -151,6 +151,27 @@ export class ExternalScanService {
     }
   }
 
+  async resolveAuthorizedReadPath(path: string): Promise<string | undefined> {
+    for (const root of this.options.roots) {
+      const ops = pathOps(root.pathStyle);
+      const caseSensitive = root.caseSensitive ?? root.pathStyle !== 'win32';
+      if (!ops.isAbsolute(path) || !ops.isAbsolute(root.path)) continue;
+      const displayRoot = ops.resolve(root.path);
+      const displayPath = ops.resolve(path);
+      if (!isWithin(ops, displayRoot, displayPath, caseSensitive)) continue;
+      try {
+        const canonicalRoot = await this.options.fileSystem.realpath(displayRoot);
+        const canonicalPath = await this.options.fileSystem.realpath(displayPath);
+        if (!isWithin(ops, canonicalRoot, canonicalPath, caseSensitive)) return undefined;
+        if ((await this.options.fileSystem.stat(canonicalPath)).kind !== 'file') return undefined;
+        return canonicalPath;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
   async start(): Promise<ExternalScanResult[]> {
     const results = await this.scanAll();
     if (!this.timer) this.timer = setInterval(() => { void this.scanAll().catch(() => undefined); }, this.options.intervalMs ?? 15 * 60_000);

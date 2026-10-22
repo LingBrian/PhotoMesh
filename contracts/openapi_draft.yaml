@@ -34,9 +34,7 @@ paths:
           description: Library list
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/Library'}
+              schema: {$ref: '#/components/schemas/LibraryPage'}
         '401': {description: Unauthorized}
         '403': {description: Forbidden}
   /v1/assets:
@@ -53,12 +51,54 @@ paths:
         - in: query
           name: limit
           schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - in: query
+          name: q
+          schema: {type: string, maxLength: 256}
       responses:
         '200':
           description: Assets page
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AssetPage'}
+        '403': {description: Library access denied}
+        '400': {description: Invalid cursor or query}
+  /v1/assets/{assetId}/original:
+    get:
+      summary: 在每次请求校验图库 ACL 后流式读取不可变原图
+      parameters:
+        - in: path
+          name: assetId
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Original bytes; source is never modified
+          headers:
+            ETag: {schema: {type: string}}
+            Content-Disposition: {schema: {type: string}}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '404': {description: Asset is absent or not authorized}
+        '409': {description: Source location is offline}
+  /v1/recycle-bin:
+    get:
+      summary: Read visible deletion tombstones without deleting source originals
+      parameters:
+        - in: query
+          name: libraryId
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Active tombstones for the authorized library
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Tombstone'}}
         '403': {description: Library access denied}
   /v1/pairing/invitations:
     post:
@@ -378,22 +418,32 @@ components:
         libraryIds: {type: array, uniqueItems: true, items: {type: string, maxLength: 128}}
     Library:
       type: object
-      required: [libraryId, title, encryptionPolicy]
+      required: [libraryId, title]
       properties:
         libraryId: {type: string}
         title: {type: string}
         encryptionPolicy: {type: string, enum: [none, optional_e2ee, required_e2ee]}
+    LibraryPage:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Library'}}
     Asset:
       type: object
-      required: [assetId, libraryId, originNodeId, kind, sha256, availability]
+      required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version]
       properties:
         assetId: {type: string}
         libraryId: {type: string}
         originNodeId: {type: string}
         kind: {type: string, enum: [photo, video, live_photo]}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
-        capturedAt: {type: string, format: date-time}
+        capturedAt: {type: [string, 'null'], format: date-time}
         availability: {type: string, enum: [online, cached, offline, missing]}
+        filename: {type: string}
+        sourcePath: {type: [string, 'null']}
+        sourceKind: {type: string, enum: [upload, import]}
+        byteSize: {type: integer, minimum: 0}
+        version: {type: string}
     AssetPage:
       type: object
       required: [items]
@@ -402,6 +452,13 @@ components:
           type: array
           items: {$ref: '#/components/schemas/Asset'}
         nextCursor: {type: [string, 'null']}
+    Tombstone:
+      type: object
+      required: [assetId, libraryId, eventId]
+      properties:
+        assetId: {type: string}
+        libraryId: {type: string}
+        eventId: {type: string}
     UploadCreate:
       type: object
       required: [libraryId, filename, sourceKind, totalBytes, sha256]

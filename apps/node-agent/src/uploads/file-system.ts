@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { link, mkdir, open, rm, stat, unlink } from 'node:fs/promises';
+import { link, mkdir, open, realpath, rm, stat, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export type StorageFailureCode = 'ENOSPC' | 'EIO' | 'ENOENT' | 'EEXIST' | 'EPERM';
@@ -27,6 +27,17 @@ export class NodeUploadFileSystem implements UploadFileSystem {
   constructor(rootDirectory: string) {
     if (!isAbsolute(rootDirectory)) throw new Error('managed storage root must be absolute');
     this.root = resolve(rootDirectory);
+  }
+
+  async openReadStream(path: string) {
+    const candidate = this.resolveManagedPath(path);
+    const [root, actual] = await Promise.all([realpath(this.root), realpath(candidate)]);
+    const fromRoot = relative(root, actual);
+    if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+      throw new Error('managed storage symlink escapes storage root');
+    }
+    if (!(await stat(actual)).isFile()) throw new Error('managed media is not a regular file');
+    return createReadStream(actual);
   }
 
   async writeExclusive(path: string, bytes: Uint8Array): Promise<void> {

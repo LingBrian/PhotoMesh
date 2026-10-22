@@ -9,6 +9,10 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   ...vue.configs['flat/recommended'],
   {
+    files: ['**/*.vue'],
+    languageOptions: { parserOptions: { parser: tseslint.parser } }
+  },
+  {
     files: ['**/*.{js,mjs,ts,vue}'],
     languageOptions: { globals: { ...globals.browser, ...globals.node, ...globals.es2022 } },
     rules: {

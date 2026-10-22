@@ -19,6 +19,8 @@ export class NodeExternalFileSystem implements ExternalFileSystem {
   async *readChunks(path: string): AsyncIterable<Uint8Array> {
     for await (const chunk of createReadStream(path)) yield chunk as Uint8Array;
   }
+
+  openReadStream(path: string) { return createReadStream(path); }
 }
 
 export class NodeExternalWatcher implements ExternalWatcher {

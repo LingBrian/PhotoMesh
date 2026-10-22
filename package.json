@@ -10,6 +10,7 @@
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
+    "test:e2e": "playwright test",
     "test:mobile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/flutter-test.ps1",
     "test:mobile-compose": "node scripts/mobile-compose-smoke.mjs",
     "test:sync-compose": "node scripts/sync-compose-smoke.mjs",
@@ -18,6 +19,7 @@
     "contracts:check": "pnpm --filter @photomesh/contracts test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
     "@eslint/js": "^10.0.1",
     "eslint": "^10.0.1",
     "eslint-plugin-vue": "^10.5.1",

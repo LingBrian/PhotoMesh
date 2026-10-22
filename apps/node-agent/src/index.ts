@@ -57,9 +57,12 @@ try {
   // Do not expose native key-store or identity errors, which may include platform details.
   process.stderr.write('PhotoMesh LAN pairing unavailable; secure identity storage or bind configuration is unavailable\n');
 }
+const managedFileSystem = new NodeUploadFileSystem(join(dataDirectory, 'managed'));
+const externalFileSystem = new NodeExternalFileSystem();
+let externalScan: ExternalScanService | undefined;
 const uploadService = new UploadService({
   repository,
-  fileSystem: new NodeUploadFileSystem(join(dataDirectory, 'managed')),
+  fileSystem: managedFileSystem,
   nodeId,
   ...(syncService ? {
     createEventDraft: (session: import('./db/repository.js').UploadSessionRecord, assetId: string) => syncService!.createAssetIndexedDraft({
@@ -93,6 +96,7 @@ const pairingControl: PairingServerControl | undefined = pairing ? {
 } : undefined;
 
 const configuredAdminToken = process.env.PHOTOMESH_ADMIN_TOKEN;
+repository.markExternalLocationsOffline(nodeId);
 const authorizePairingAdmin = (token: string | undefined): boolean => {
   if (!configuredAdminToken || !token) return false;
   const expected = Buffer.from(configuredAdminToken);
@@ -104,12 +108,27 @@ if (!isSafeServiceBind(host)) throw new Error('PHOTOMESH_API_BIND_ADDRESS must b
 const server = createNodeAgentServer({
   uploadService, authorizePairingAdmin,
   authorizeUpload: (request) => authorizePairingAdmin(request.token) ? { principalId: 'local-admin' } : undefined,
+  authorizeLibraryList: (token) => authorizePairingAdmin(token),
+  authorizeLibraryRead: (token) => authorizePairingAdmin(token) ? 'local-admin' : undefined,
+  gallery: {
+    listLibraries: () => repository.listGalleryLibraries(),
+    listAssets: (libraryId, cursor, limit, query) => repository.listGalleryAssets(libraryId, cursor, limit, query),
+    getOriginal: async (assetId) => repository.getGalleryMedia(assetId),
+    openOriginal: async (media) => {
+      if (media.storageRef.startsWith('objects/')) return managedFileSystem.openReadStream(media.storageRef);
+      if (media.storageRef.startsWith('external:') && media.originalPath) {
+        const authorizedPath = await externalScan?.resolveAuthorizedReadPath(media.originalPath);
+        return authorizedPath ? externalFileSystem.openReadStream(authorizedPath) : undefined;
+      }
+      return undefined;
+    },
+    listTombstones: (libraryId) => repository.listActiveTombstones(libraryId)
+  },
   ...(pairingControl ? { pairingControl } : {})
 });
 server.listen(port, host, () => process.stdout.write(`PhotoMesh node-agent listening on ${host}:${port}\n`));
 
 const rootsJson = process.env.PHOTOMESH_EXTERNAL_ROOTS;
-let externalScan: ExternalScanService | undefined;
 if (rootsJson) {
   const roots = JSON.parse(rootsJson) as AuthorizedExternalRoot[];
   if (!Array.isArray(roots) || roots.some((root) => !root || typeof root.rootId !== 'string' || typeof root.libraryId !== 'string' ||
@@ -118,7 +137,7 @@ if (rootsJson) {
   }
   externalScan = new ExternalScanService({
     nodeId, roots,
-    fileSystem: new NodeExternalFileSystem(), repository, watcher: new NodeExternalWatcher(),
+    fileSystem: externalFileSystem, repository, watcher: new NodeExternalWatcher(),
     ...(syncService ? {
       createEventDraft: (record) => syncService!.createAssetIndexedDraft({
         libraryId: record.libraryId, assetId: record.assetId, originNodeId: nodeId,

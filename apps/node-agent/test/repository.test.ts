@@ -4,6 +4,50 @@ import { MigrationError, RepositoryConflictError, SqliteRepository } from '../sr
 import { migrations } from '../src/db/migrations.js';
 
 describe('SQLite repository and migrations', () => {
+  it('serves cursor pages in capture order and applies filename search before paging', async () => {
+    const db = new Database(':memory:');
+    const repository = new SqliteRepository(db);
+    await repository.migrate();
+    for (const [id, date, filename] of [
+      ['asset-a', '2026-05-01T00:00:00.000Z', 'May.jpg'],
+      ['asset-b', '2026-05-03T00:00:00.000Z', 'Weekend.jpg'],
+      ['asset-c', '2026-05-02T00:00:00.000Z', 'Weekend-2.jpg'],
+      ['asset-d', '2026-05-02T00:00:00.000Z', 'Other.jpg']
+    ]) {
+      db.prepare('INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(id, 'library', 'node-a', 'photo', date, date);
+      db.prepare('INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(`file-${id}`, id, 'a'.repeat(64), 10, 'original', `objects/${id}/original.blob`, date);
+      db.prepare(`INSERT INTO file_locations (location_id, file_id, node_id, original_filename, original_path, source_kind,
+        source_node_id, path_ref, storage_class, availability, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(`location-${id}`, `file-${id}`, 'node-a', filename, `/camera/${filename}`, 'upload', 'phone-a', `objects/${id}/original.blob`, 'managed', 'online', date);
+    }
+    const first = repository.listGalleryAssets('library', undefined, 2);
+    expect(first.items.map((asset) => asset.assetId)).toEqual(['asset-b', 'asset-d']);
+    expect(first.nextCursor).toBeTruthy();
+    const second = repository.listGalleryAssets('library', first.nextCursor!, 2);
+    expect(second.items.map((asset) => asset.assetId)).toEqual(['asset-c', 'asset-a']);
+    expect(second.nextCursor).toBeNull();
+    expect(repository.listGalleryAssets('library', undefined, 1, 'Weekend').items.map((asset) => asset.filename)).toEqual(['Weekend.jpg']);
+    expect(repository.listGalleryAssets('library', undefined, 5, '%').items).toEqual([]);
+    for (const id of ['null-a', 'null-b', 'null-c']) {
+      db.prepare('INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at) VALUES (?, ?, ?, ?, NULL, ?)')
+        .run(id, 'library', 'node-a', 'photo', '2026-05-04T00:00:00.000Z');
+      db.prepare('INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(`file-${id}`, id, 'a'.repeat(64), 10, 'original', `objects/${id}/original.blob`, '2026-05-04T00:00:00.000Z');
+    }
+    const nullPage = repository.listGalleryAssets('library', first.nextCursor!, 2);
+    expect(nullPage.items.map((asset) => asset.assetId)).toEqual(['asset-c', 'asset-a']);
+    expect(nullPage.nextCursor).toBeTruthy();
+    const firstNullPage = repository.listGalleryAssets('library', nullPage.nextCursor!, 2);
+    expect(firstNullPage.items.map((asset) => asset.assetId)).toEqual(['null-c', 'null-b']);
+    expect(firstNullPage.nextCursor).toBeTruthy();
+    const finalNullPage = repository.listGalleryAssets('library', firstNullPage.nextCursor!, 2);
+    expect(finalNullPage.items.map((asset) => asset.assetId)).toEqual(['null-a']);
+    expect(finalNullPage.nextCursor).toBeNull();
+    db.close();
+  });
+
   it('applies checksummed migrations and persists upload and core records', async () => {
     const db = new Database(':memory:');
     const repository = new SqliteRepository(db);

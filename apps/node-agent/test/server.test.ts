@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Readable } from 'node:stream';
 import { createNodeAgentServer, type NodeAgentServerOptions, type PairingServerControl } from '../src/server.js';
 
 const servers: ReturnType<typeof createNodeAgentServer>[] = [];
@@ -34,6 +35,49 @@ describe('node-agent health endpoint', () => {
 });
 
 describe('pairing and library authorization endpoints', () => {
+  it('requires fresh library authorization for timeline, original reads, and recycle-bin results', async () => {
+    const readOriginal = vi.fn(() => ({ libraryId: 'library', filename: 'original.jpg', sha256: 'a'.repeat(64), byteSize: 3, availability: 'online', storageRef: 'objects/a/original.blob', originalPath: null }));
+    const openOriginal = vi.fn(async () => Readable.from([Buffer.from('raw')]));
+    const options: NodeAgentServerOptions = {
+      authorizeLibraryList: (token) => token === 'admin',
+      authorizeLibraryRead: (token, libraryId) => token === 'admin' && libraryId === 'library' ? 'local-admin' : undefined,
+      gallery: {
+        listLibraries: () => [{ libraryId: 'library', title: 'library' }],
+        listAssets: () => ({ items: [{ assetId: 'asset' }], nextCursor: null }),
+        getOriginal: async () => readOriginal(),
+        openOriginal,
+        listTombstones: () => [{ assetId: 'deleted', libraryId: 'library', eventId: 'evt' }]
+      }
+    };
+    const noAuth = await request('/v1/libraries', options);
+    expect(noAuth.status).toBe(403);
+    const denied = await request('/v1/assets/asset/original', options);
+    expect(denied.status).toBe(404);
+    expect(await denied.text()).not.toContain('raw');
+    expect(readOriginal).toHaveBeenCalledTimes(1);
+    expect(openOriginal).not.toHaveBeenCalled();
+    const authorizedPage = await request('/v1/assets?libraryId=library&limit=1', options, { headers: { authorization: 'Bearer admin' } });
+    expect(await authorizedPage.json()).toEqual({ items: [{ assetId: 'asset' }], nextCursor: null });
+    const authorizedOriginal = await request('/v1/assets/asset/original', options, { headers: { authorization: 'Bearer admin' } });
+    expect(authorizedOriginal.status).toBe(200);
+    expect(authorizedOriginal.headers.get('etag')).toBe(`"${'a'.repeat(64)}"`);
+    expect(await authorizedOriginal.text()).toBe('raw');
+    expect(openOriginal).toHaveBeenCalledWith(expect.objectContaining({ storageRef: 'objects/a/original.blob' }));
+    const recycle = await request('/v1/recycle-bin?libraryId=library', options, { headers: { authorization: 'Bearer admin' } });
+    expect(recycle.status).toBe(200);
+    expect(await recycle.json()).toMatchObject({ items: [{ assetId: 'deleted' }] });
+  });
+
+  it('adds CORS only for local web and Tauri origins', async () => {
+    const allowed = await request('/v1/health', {}, { headers: { origin: 'http://localhost:5173' } });
+    expect(allowed.headers.get('access-control-allow-origin')).toBe('http://localhost:5173');
+    const preflight = await request('/v1/libraries', {}, { method: 'OPTIONS', headers: { origin: 'tauri://localhost' } });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('access-control-allow-origin')).toBe('tauri://localhost');
+    const denied = await request('/v1/health', {}, { headers: { origin: 'https://attacker.example' } });
+    expect(denied.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
   it('denies library index reads without a trusted principal and a persisted library grant', async () => {
     const readIndex = vi.fn((peerId: string) => peerId === 'trusted-peer' ? [] : undefined);
     const control = pairingControl({ readLibraryIndex: readIndex });

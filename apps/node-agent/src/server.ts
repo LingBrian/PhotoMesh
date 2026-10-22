@@ -7,6 +7,7 @@ import { UploadError, UploadService, type CreateUploadRequest } from './uploads/
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
 import type { TrustedPeerRecord } from './db/repository.js';
+import type { Readable } from 'node:stream';
 
 export interface UploadAuthorizationRequest {
   token: string | undefined;
@@ -26,8 +27,18 @@ export interface NodeAgentServerOptions {
   authorizeUpload?: UploadAuthorizer;
   authorizePairingAdmin?: (token: string | undefined) => boolean;
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
+  authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
+  gallery?: GalleryServerControl;
   pairingControl?: PairingServerControl;
   maxRequestBytes?: number;
+}
+
+export interface GalleryServerControl {
+  listLibraries(): Array<{ libraryId: string; title: string }>;
+  listAssets(libraryId: string, cursor: string | undefined, limit: number, query?: string): { items: unknown[]; nextCursor: string | null };
+  getOriginal(assetId: string): Promise<{ libraryId: string; filename: string; sha256: string; byteSize: number; availability: string; storageRef: string; originalPath: string | null } | undefined>;
+  openOriginal(media: { storageRef: string; originalPath: string | null }): Promise<Readable | undefined> | Readable | undefined;
+  listTombstones(libraryId?: string): unknown[];
 }
 
 export interface PairingServerControl {
@@ -45,8 +56,14 @@ export interface PairingServerControl {
 
 export function createNodeAgentServer(options: NodeAgentServerOptions = {}) {
   return createServer((request, response) => {
+    setCorsHeaders(request, response);
     const requestId = headerValue(request, 'x-request-id') ?? randomUUID();
     response.setHeader('x-request-id', requestId);
+    if (request.method === 'OPTIONS') {
+      response.writeHead(204, { 'access-control-max-age': '600' });
+      response.end();
+      return;
+    }
     void handleRequest(request, response, options, requestId).catch((error: unknown) => {
       const apiError = error instanceof UploadError ? error : new UploadError('STORAGE_IO', 'Request handling failed');
       sendJson(response, statusFor(apiError), { error: apiError.code.toLowerCase(), requestId });
@@ -61,17 +78,69 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
 
+  if (request.method === 'GET' && url.pathname === '/v1/libraries') {
+    if (!await options.authorizeLibraryList?.(bearerToken(request))) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    sendJson(response, 200, { items: options.gallery?.listLibraries() ?? [] });
+    return;
+  }
+
+  const originalPath = url.pathname.match(/^\/v1\/assets\/([^/]+)\/original$/);
+  if (request.method === 'GET' && originalPath?.[1]) {
+    const assetId = decodeURIComponent(originalPath[1]);
+    const media = await options.gallery?.getOriginal(assetId);
+    if (!media) { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    const principal = await options.authorizeLibraryRead?.(bearerToken(request), media.libraryId);
+    if (!principal) { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    if (!['online', 'cached'].includes(media.availability)) {
+      sendJson(response, 409, { error: 'source_offline', requestId }); return;
+    }
+    let stream: Readable | undefined;
+    try { stream = await options.gallery?.openOriginal(media); }
+    catch { sendJson(response, 409, { error: 'source_offline', requestId }); return; }
+    if (!stream) { sendJson(response, 409, { error: 'source_offline', requestId }); return; }
+    response.writeHead(200, {
+      'content-type': 'application/octet-stream', 'content-length': String(media.byteSize),
+      'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(media.filename)}`,
+      'etag': `"${media.sha256}"`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff'
+    });
+    stream.on('error', () => { if (!response.headersSent) sendJson(response, 500, { error: 'media_read_failed', requestId }); else response.destroy(); });
+    stream.pipe(response);
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/v1/recycle-bin') {
+    const libraryId = url.searchParams.get('libraryId') ?? undefined;
+    if (!libraryId || !await options.authorizeLibraryRead?.(bearerToken(request), libraryId)) {
+      sendJson(response, 403, { error: 'forbidden', requestId }); return;
+    }
+    sendJson(response, 200, { items: options.gallery?.listTombstones(libraryId) ?? [] });
+    return;
+  }
+
   if (request.method === 'GET' && url.pathname === '/v1/assets') {
     const libraryId = url.searchParams.get('libraryId');
     const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;
-    const items = peerId && libraryId ? options.pairingControl?.readLibraryIndex(peerId, libraryId) : undefined;
-    if (!items) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
     const rawLimit = Number(url.searchParams.get('limit') ?? 50);
     const cursor = url.searchParams.get('cursor');
     const rawOffset = cursor === null ? 0 : Number(cursor);
-    if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 200 || !Number.isSafeInteger(rawOffset) || rawOffset < 0) {
+    if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 200 ||
+      (options.gallery ? cursor !== null && !/^[A-Za-z0-9_-]{1,2048}$/.test(cursor) : !Number.isSafeInteger(rawOffset) || rawOffset < 0)) {
       sendJson(response, 400, { error: 'invalid_request', requestId }); return;
     }
+    if (options.gallery) {
+      if (!peerId || !libraryId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+      try {
+        const query = url.searchParams.get('q') ?? '';
+        if (query.length > 256) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+        const page = options.gallery.listAssets(libraryId, cursor ?? undefined, rawLimit, query);
+        sendJson(response, 200, page);
+      } catch {
+        sendJson(response, 400, { error: 'invalid_request', requestId });
+      }
+      return;
+    }
+    const items = peerId && libraryId ? options.pairingControl?.readLibraryIndex(peerId, libraryId) : undefined;
+    if (!items) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
     const page = items.slice(rawOffset, rawOffset + rawLimit);
     sendJson(response, 200, { items: page, nextCursor: rawOffset + rawLimit < items.length ? String(rawOffset + rawLimit) : null });
     return;
@@ -311,6 +380,25 @@ function bearerToken(request: IncomingMessage): string | undefined {
 function headerValue(request: IncomingMessage, name: string): string | undefined {
   const value = request.headers[name];
   return Array.isArray(value) ? value[0] : value;
+}
+
+function setCorsHeaders(request: IncomingMessage, response: ServerResponse): void {
+  const origin = headerValue(request, 'origin');
+  if (!origin || !isAllowedLocalOrigin(origin)) return;
+  response.setHeader('access-control-allow-origin', origin);
+  response.setHeader('vary', 'Origin');
+  response.setHeader('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  response.setHeader('access-control-allow-headers', 'Authorization, Content-Type, Idempotency-Key, Upload-Offset, Upload-Chunk-SHA256, X-Request-ID');
+  response.setHeader('access-control-expose-headers', 'Content-Disposition, ETag, X-Request-ID');
+}
+
+function isAllowedLocalOrigin(value: string): boolean {
+  try {
+    const origin = new URL(value);
+    return origin.protocol === 'tauri:' && origin.hostname === 'localhost' ||
+      (origin.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(origin.hostname)) ||
+      (origin.protocol === 'https:' && origin.hostname === 'tauri.localhost');
+  } catch { return false; }
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {

@@ -86,6 +86,18 @@ function root(path = '/photos', pathStyle: 'posix' | 'win32' = 'posix'): Authori
 }
 
 describe('external read-only directory scanning', () => {
+  it('resolves original reads only inside an explicitly authorized real root', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addFile('/photos/visible.jpg', 'visible-original');
+    fs.addDirectory('/private'); fs.addFile('/private/secret.jpg', 'private-original');
+    fs.addSymlink('/photos/escape.jpg', '/private/secret.jpg');
+    const { service } = setup(root(), fs);
+
+    await expect(service.resolveAuthorizedReadPath('/photos/visible.jpg')).resolves.toBe('/photos/visible.jpg');
+    await expect(service.resolveAuthorizedReadPath('/private/secret.jpg')).resolves.toBeUndefined();
+    await expect(service.resolveAuthorizedReadPath('/photos/escape.jpg')).resolves.toBeUndefined();
+  });
+
   it('reserves one asset index event per newly indexed source and signs after the scan batch', async () => {
     const fs = new VirtualExternalFileSystem();
     fs.addDirectory('/photos'); fs.addFile('/photos/a.jpg', 'original-a'); fs.addFile('/photos/b.jpg', 'original-b');

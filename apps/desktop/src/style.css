@@ -1,6 +1,1 @@
-:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #17251f; background: #f4f7f3; }
-body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
-main { max-width: 40rem; padding: 3rem; }
-h1 { font-size: clamp(2rem, 7vw, 4rem); letter-spacing: -.05em; }
-p { color: #53635b; line-height: 1.6; }
-.eyebrow { color: #28734e; }
+@import '../../web/src/gallery.css';

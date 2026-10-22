@@ -99,6 +99,25 @@ export interface LibraryIndexAsset {
   availability: 'online' | 'cached' | 'offline' | 'missing';
 }
 
+export interface GalleryAssetRecord extends LibraryIndexAsset {
+  filename: string;
+  capturedAt: string | null;
+  sourcePath: string | null;
+  sourceKind: SourceKind;
+  byteSize: number;
+  version: string;
+}
+
+export interface GalleryMediaRecord {
+  libraryId: string;
+  filename: string;
+  sha256: string;
+  byteSize: number;
+  storageRef: string;
+  originalPath: string | null;
+  availability: 'online' | 'cached' | 'offline' | 'missing';
+}
+
 export interface UploadRepository {
   getUploadSession(sessionId: string): UploadSessionRecord | undefined;
   getUploadSessionByIdempotency(scope: string, key: string): UploadSessionRecord | undefined;
@@ -342,6 +361,93 @@ export class SqliteRepository implements UploadRepository {
     return [...assets.values()].sort((left, right) => left.assetId.localeCompare(right.assetId));
   }
 
+  listGalleryLibraries(): Array<{ libraryId: string; title: string }> {
+    const rows = this.db.prepare(`SELECT library_id FROM assets UNION SELECT library_id FROM sync_asset_projection
+      ORDER BY library_id`).all() as Array<{ library_id: string }>;
+    return rows.map((row) => ({ libraryId: row.library_id, title: row.library_id }));
+  }
+
+  listGalleryAssets(libraryId: string, cursor: string | undefined, limit: number, query = ''): { items: GalleryAssetRecord[]; nextCursor: string | null } {
+    const position = cursor ? decodeGalleryCursor(cursor) : undefined;
+    const localCursorSql = !position ? '' : position.capturedAt === null
+      ? 'AND a.capture_ts IS NULL AND a.asset_id < ?'
+      : 'AND (a.capture_ts < ? OR a.capture_ts IS NULL OR (a.capture_ts = ? AND a.asset_id < ?))';
+    const localCursorArgs = !position ? [] : position.capturedAt === null
+      ? [position.assetId]
+      : [position.capturedAt, position.capturedAt, position.assetId];
+    const localRows = this.db.prepare(`SELECT a.asset_id, a.library_id, a.origin_node_id, a.kind, a.capture_ts AS captured_at,
+        f.sha256, f.byte_size, COALESCE(l.original_filename, a.asset_id) AS filename, l.original_path AS source_path,
+        COALESCE(l.source_kind, 'import') AS source_kind, COALESCE(l.availability, 'missing') AS availability
+      FROM assets a LEFT JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
+      LEFT JOIN file_locations l ON l.location_id = (SELECT candidate.location_id FROM file_locations candidate
+        WHERE candidate.file_id = f.file_id AND candidate.node_id = a.origin_node_id
+        ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END LIMIT 1)
+      WHERE a.library_id = ? AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p
+        WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+        AND (? = '' OR instr(lower(COALESCE(l.original_filename, a.asset_id)), lower(?)) > 0 OR
+          instr(lower(a.asset_id), lower(?)) > 0 OR instr(lower(a.origin_node_id), lower(?)) > 0 OR
+          instr(lower(COALESCE(l.original_path, '')), lower(?)) > 0)
+        ${localCursorSql}
+      ORDER BY a.capture_ts DESC, a.asset_id DESC LIMIT ?`).all(
+        libraryId, query, query, query, query, query, ...localCursorArgs, limit + 1
+      ) as GalleryAssetSqlRow[];
+    const projectionCursorSql = position?.capturedAt === null ? 'AND p.asset_id < ?' : '';
+    const projectionCursorArgs = position?.capturedAt === null ? [position.assetId] : [];
+    const projectionRows = this.db.prepare(`SELECT p.asset_id, p.library_id, p.origin_node_id, p.kind, NULL AS captured_at,
+        p.sha256, p.byte_length AS byte_size,
+        COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id) AS filename,
+        json_extract(p.metadata_json, '$.sourcePath') AS source_path,
+        COALESCE(json_extract(p.metadata_json, '$.sourceKind'), 'import') AS source_kind, 'missing' AS availability
+      FROM sync_asset_projection p WHERE p.library_id = ? AND p.tombstone_event_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+        AND (? = '' OR instr(lower(COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id)), lower(?)) > 0 OR
+          instr(lower(p.asset_id), lower(?)) > 0 OR instr(lower(p.origin_node_id), lower(?)) > 0 OR
+          instr(lower(COALESCE(json_extract(p.metadata_json, '$.sourcePath'), '')), lower(?)) > 0)
+        ${projectionCursorSql}
+      ORDER BY p.asset_id DESC LIMIT ?`).all(
+        libraryId, query, query, query, query, query, ...projectionCursorArgs, limit + 1
+      ) as GalleryAssetSqlRow[];
+    const records = [...localRows, ...projectionRows].map(toGalleryAsset).sort(compareGalleryAsset);
+    const hasMore = records.length > limit;
+    const page = records.slice(0, limit);
+    const last = page.at(-1);
+    return { items: page, nextCursor: hasMore && last ? encodeGalleryCursor(last.capturedAt, last.assetId) : null };
+  }
+
+  getGalleryMedia(assetId: string): GalleryMediaRecord | undefined {
+    const row = this.db.prepare(`SELECT a.library_id, f.storage_ref, f.sha256, f.byte_size,
+        COALESCE(l.original_filename, a.asset_id) AS filename,
+        COALESCE(l.availability, 'missing') AS availability, l.storage_class, l.original_path
+      FROM assets a JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
+      LEFT JOIN file_locations l ON l.file_id = f.file_id
+      WHERE a.asset_id = ? AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id
+        AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+      ORDER BY CASE l.storage_class WHEN 'managed' THEN 0 ELSE 1 END LIMIT 1`).get(assetId) as {
+        library_id: string; storage_ref: string; sha256: string; byte_size: number; filename: string;
+        availability: GalleryMediaRecord['availability']; storage_class: string | null; original_path: string | null
+      } | undefined;
+    if (!row) return undefined;
+    return { libraryId: row.library_id, storageRef: row.storage_ref, sha256: row.sha256, byteSize: row.byte_size,
+      filename: row.filename, originalPath: row.original_path, availability: row.availability };
+  }
+
+  listActiveTombstones(libraryId?: string): Array<{ assetId: string; libraryId: string; eventId: string }> {
+    const rows = libraryId
+      ? this.db.prepare(`SELECT t.asset_id, t.library_id, t.event_id FROM sync_tombstones t
+          WHERE t.library_id = ? AND t.restored_by_event_id IS NULL ORDER BY t.event_id`).all(libraryId)
+      : this.db.prepare(`SELECT t.asset_id, t.library_id, t.event_id FROM sync_tombstones t
+          WHERE t.restored_by_event_id IS NULL ORDER BY t.library_id, t.event_id`).all();
+    return (rows as Array<{ asset_id: string; library_id: string; event_id: string }>).map((row) => ({
+      assetId: row.asset_id, libraryId: row.library_id, eventId: row.event_id
+    }));
+  }
+
+  markExternalLocationsOffline(nodeId: string): number {
+    const result = this.db.prepare(`UPDATE file_locations SET availability = 'offline'
+      WHERE node_id = ? AND storage_class = 'external' AND availability IN ('online', 'cached')`).run(nodeId);
+    return result.changes;
+  }
+
   getUploadSession(sessionId: string): UploadSessionRecord | undefined {
     const row = this.db.prepare('SELECT * FROM upload_sessions WHERE session_id = ?').get(sessionId) as SessionRow | undefined;
     return row ? toSessionRecord(row) : undefined;
@@ -495,6 +601,56 @@ export class SqliteRepository implements UploadRepository {
 function safeHashEquals(left: string, right: string): boolean {
   if (!/^[0-9a-f]{64}$/.test(left) || !/^[0-9a-f]{64}$/.test(right)) return false;
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
+}
+
+interface GalleryAssetSqlRow {
+  asset_id: string;
+  library_id: string;
+  origin_node_id: string;
+  kind: AssetKind;
+  captured_at: unknown;
+  sha256: string | null;
+  byte_size: number | null;
+  filename: unknown;
+  source_path: unknown;
+  source_kind: unknown;
+  availability: GalleryAssetRecord['availability'];
+}
+
+function toGalleryAsset(row: GalleryAssetSqlRow): GalleryAssetRecord {
+  const capturedAt = typeof row.captured_at === 'string' ? row.captured_at : null;
+  return {
+    assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id, kind: row.kind,
+    sha256: row.sha256 ?? '', availability: row.availability,
+    filename: typeof row.filename === 'string' ? row.filename : row.asset_id,
+    capturedAt, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
+    sourceKind: row.source_kind === 'upload' ? 'upload' : 'import',
+    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id
+  };
+}
+
+function compareGalleryAsset(left: GalleryAssetRecord, right: GalleryAssetRecord): number {
+  if (left.capturedAt !== right.capturedAt) {
+    if (left.capturedAt === null) return 1;
+    if (right.capturedAt === null) return -1;
+    return right.capturedAt.localeCompare(left.capturedAt);
+  }
+  return left.assetId === right.assetId ? 0 : left.assetId < right.assetId ? 1 : -1;
+}
+
+function encodeGalleryCursor(capturedAt: string | null, assetId: string): string {
+  return Buffer.from(JSON.stringify({ capturedAt, assetId }), 'utf8').toString('base64url');
+}
+
+function decodeGalleryCursor(value: string): { capturedAt: string | null; assetId: string } {
+  try {
+    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as { capturedAt?: unknown; assetId?: unknown };
+    if (!(decoded.capturedAt === null || typeof decoded.capturedAt === 'string') || typeof decoded.assetId !== 'string' ||
+      Buffer.from(value, 'base64url').toString('base64url') !== value) throw new Error('invalid cursor');
+    return { capturedAt: decoded.capturedAt, assetId: decoded.assetId };
+  } catch {
+    throw new Error('invalid gallery cursor');
+  }
 }
 
 function toSessionRecord(row: SessionRow): UploadSessionRecord {
