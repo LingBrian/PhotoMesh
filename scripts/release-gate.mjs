@@ -153,7 +153,8 @@ async function validateEvidence() {
     return [
       '100k-initial-incremental-file-sync', 'p2p-recovery-under-60s', '2gb-arm64-nas-core',
       'complete-file-sha256', 'migration-backup-restore', 'cross-node-acl'
-    ].map((name) => ({ name, status: 'blocked', reason: `缺少或无法解析 ${evidencePath}: ${error.message}` }));
+    ].filter((name) => !(name === 'p2p-recovery-under-60s' && checks.some((check) => check.name === name && check.status === 'pass')))
+      .map((name) => ({ name, status: 'blocked', reason: `缺少或无法解析 ${evidencePath}: ${error.message}` }));
   }
 }
 
