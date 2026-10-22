@@ -1,6 +1,6 @@
 {
   "name": "@photomesh/node-agent",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -8,8 +8,29 @@
     "lint": "eslint src test",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --coverage",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js"
   },
-  "dependencies": {},
-  "devDependencies": { "@types/node": "^22.18.12", "@vitest/coverage-v8": "^3.2.4", "typescript": "~5.9.3", "vitest": "^3.2.4" }
+  "dependencies": {
+    "@chainsafe/libp2p-noise": "^17.0.0",
+    "@chainsafe/libp2p-yamux": "^8.0.1",
+    "@libp2p/crypto": "^5.2.0",
+    "@libp2p/mdns": "^12.0.36",
+    "@libp2p/peer-id": "^6.0.18",
+    "@libp2p/tcp": "^11.0.32",
+    "@multiformats/multiaddr": "^13.0.3",
+    "@napi-rs/keyring": "^2.1.2",
+    "better-sqlite3": "^13.0.3",
+    "canonicalize": "^5.1.0",
+    "libp2p": "^3.5.1",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.18.12",
+    "@types/qrcode": "^1.5.6",
+    "@vitest/coverage-v8": "^3.2.4",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.4"
+  }
 }
