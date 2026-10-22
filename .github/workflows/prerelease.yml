@@ -154,7 +154,7 @@ jobs:
           flutter build apk --release --target-platform android-arm64
           output="$GITHUB_WORKSPACE/release-assets"
           mkdir -p "$output"
-          apk="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          apk="build/app/outputs/flutter-apk/app-release.apk"
           apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
           test -n "$apksigner"
           "$apksigner" verify --verbose "$apk"
@@ -192,7 +192,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          pnpm --filter @photomesh/desktop tauri:build
+          pnpm --filter @photomesh/desktop exec tauri build --bundles nsis
           if ($LASTEXITCODE -ne 0) { throw 'Tauri Windows build failed.' }
           $bundleRoot = 'apps/desktop/src-tauri/target/release/bundle'
           $installers = Get-ChildItem -LiteralPath $bundleRoot -File -Recurse | Where-Object { $_.Extension -in @('.msi', '.exe') }
