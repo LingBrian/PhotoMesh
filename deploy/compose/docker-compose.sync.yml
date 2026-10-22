@@ -27,6 +27,10 @@ services:
       retries: 20
 
   nas-sim:
+    platform: linux/amd64
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
     build:
       context: ../..
       dockerfile: deploy/docker/node-agent.Dockerfile

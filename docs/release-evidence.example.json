@@ -7,7 +7,7 @@
     "offlineReconnect": { "sha256Mismatches": 0, "durationSeconds": 0 }
   },
   "p2p": { "networkRestoredAt": "ISO-8601", "firstEventAckAt": "ISO-8601", "reconnectSeconds": 0 },
-  "nas": { "device": "model", "architecture": "arm64", "totalRamMiB": 2048, "coreScenariosPassed": true, "peakRssMiB": 0, "freeRamMiB": 0, "aiAndTranscodeDisabled": true },
+  "nas": { "device": "ARM64 NAS model", "architecture": "arm64", "simulation": false, "totalRamMiB": 2048, "coreScenariosPassed": true, "peakMemoryUsedMiB": 0, "freeRamMiB": 0, "aiAndTranscodeDisabled": true },
   "integrity": { "checkedFiles": 100000, "mismatches": 0, "sourceFilesChanged": 0 },
   "migration": { "backupCreatedAt": "ISO-8601", "migrationStartedAt": "ISO-8601", "backupCreated": true, "backupSha256": "64-hex-digits", "restoreVerified": true, "restoredDatabaseSha256": "64-hex-digits", "assetCountBefore": 0, "assetCountAfter": 0 },
   "acl": { "matrixPassed": true, "unauthorizedReads": 0, "cases": ["owner", "admin", "family", "guest", "revoked", "untrusted"] },
