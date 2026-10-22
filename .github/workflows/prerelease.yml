@@ -154,7 +154,7 @@ jobs:
           flutter build apk --release --target-platform android-arm64
           output="$GITHUB_WORKSPACE/release-assets"
           mkdir -p "$output"
-          apk="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          apk="build/app/outputs/flutter-apk/app-release.apk"
           apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
           test -n "$apksigner"
           "$apksigner" verify --verbose "$apk"
