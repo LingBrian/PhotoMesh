@@ -114,7 +114,8 @@ async function validateEvidence() {
       ? { name: 'complete-file-sha256', status: 'pass', evidence: evidence.integrity }
       : { name: 'complete-file-sha256', status: 'blocked', reason: '需要发布数据集全部文件源/目标 SHA-256 对比记录' });
     checksEvidence.push(evidence.migration?.backupCreated === true && /^[a-f0-9]{64}$/.test(evidence.migration?.backupSha256 ?? '') &&
-      evidence.migration?.restoreVerified === true && evidence.migration?.assetCountBefore === evidence.migration?.assetCountAfter &&
+      evidence.migration?.restoreVerified === true && /^[a-f0-9]{64}$/.test(evidence.migration?.restoredDatabaseSha256 ?? '') &&
+      evidence.migration?.assetCountBefore === evidence.migration?.assetCountAfter &&
       evidence.migration?.migrationStartedAt && Date.parse(evidence.migration.migrationStartedAt) > Date.parse(evidence.migration.backupCreatedAt ?? '')
       ? { name: 'migration-backup-restore', status: 'pass', evidence: evidence.migration }
       : { name: 'migration-backup-restore', status: 'blocked', reason: '需要迁移前数据库备份与隔离恢复校验记录' });
