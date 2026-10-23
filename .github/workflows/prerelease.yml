@@ -154,7 +154,10 @@ jobs:
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath (Join-Path $out "PhotoMesh-$env:VERSION-node-agent-windows-x64.zip")
           $installer = (Get-Content -Raw 'install.ps1').Replace('__VERSION__', $env:VERSION)
           Set-Content -NoNewline -Encoding utf8 (Join-Path $out 'install.ps1') $installer
-          Copy-Item -LiteralPath 'install.bat' -Destination $out
+          $installerBat = (Get-Content -Raw 'install.bat').Replace('__VERSION__', $env:VERSION)
+          Set-Content -NoNewline -Encoding utf8 (Join-Path $out 'install.bat') $installerBat
+          if (Select-String -Path (Join-Path $out 'install.ps1'), (Join-Path $out 'install.bat') -Pattern 'api\.github\.com') { throw 'Windows installers must not call the rate-limited GitHub API.' }
+          if ((Get-Content -Raw (Join-Path $out 'install.bat')) -match '__VERSION__') { throw 'Windows release bootstrap was not version-pinned.' }
       - name: Package Linux x64 Node Agent
         if: matrix.platform == 'linux-x64'
         env:
