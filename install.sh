@@ -3,14 +3,12 @@ set -euo pipefail
 VERSION='__VERSION__'
 [[ "$VERSION" != "__VERSION__" ]] || { echo "Download install.sh from a PhotoMesh release." >&2; exit 1; }
 REPO='LingBrian/PhotoMesh'
+BASE="https://github.com/$REPO/releases/download/v$VERSION"
 ASSET="PhotoMesh-$VERSION-node-agent-linux-x64.tar.gz"
-API="https://api.github.com/repos/$REPO/releases/tags/v$VERSION"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-ASSET_URL="$(curl -fsSL "$API" | python3 -c 'import json,sys; a=json.load(sys.stdin)["assets"]; n=sys.argv[1]; print(next(x["browser_download_url"] for x in a if x["name"]==n))' "$ASSET")"
-SUM_URL="$(curl -fsSL "$API" | python3 -c 'import json,sys; a=json.load(sys.stdin)["assets"]; print(next(x["browser_download_url"] for x in a if x["name"]=="SHA256SUMS.txt"))')"
-curl -fL "$ASSET_URL" -o "$WORK/$ASSET"
-curl -fL "$SUM_URL" -o "$WORK/SHA256SUMS.txt"
+curl -fL "$BASE/$ASSET" -o "$WORK/$ASSET"
+curl -fL "$BASE/SHA256SUMS.txt" -o "$WORK/SHA256SUMS.txt"
 LINE="$(grep -E "[[:space:]]$ASSET$" "$WORK/SHA256SUMS.txt" | head -n 1)"
 [[ -n "$LINE" ]] || { echo "No checksum entry for $ASSET." >&2; exit 1; }
 EXPECTED="$(printf '%s' "$LINE" | awk '{print $1}')"
