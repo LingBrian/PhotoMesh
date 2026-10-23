@@ -118,17 +118,14 @@ export class SyncService {
         !request.cursors.every(isCursor) || !Array.isArray(request.events) || request.events.length > SYNC_BATCH_LIMIT) {
       throw new SyncProtocolConflictError('invalid sync batch');
     }
-    this.repository.setRemoteLibraries(remotePeerId, request.grantedLibraryIds);
-    this.repository.acknowledgeCursors(remotePeerId, request.cursors);
+    const incomingEvents = await this.validateEvents(request.grantedLibraryIds, request.events);
     const results: SyncExchangeResponse['results'] = [];
-    for (const rawEvent of request.events) {
-      const event = parseEventEnvelope(rawEvent);
-      if (!request.grantedLibraryIds.includes(event.libraryId)) throw new SyncAuthorizationError();
-      const author = this.pairing.listPeers().find((peer) => peer.peerId === event.authorPeerId && peer.trustState === 'trusted');
-      if (!author || !(await verifyEvent(event, author.publicKey))) throw new SyncProtocolConflictError('event signature or author identity is invalid');
+    for (const event of incomingEvents) {
       const result = this.repository.ingest(remotePeerId, event);
       results.push({ eventId: event.eventId, status: result.status });
     }
+    this.repository.setRemoteLibraries(remotePeerId, request.grantedLibraryIds);
+    this.repository.acknowledgeCursors(remotePeerId, request.cursors);
     const grantedLibraryIds = this.repository.listGrantedLibraries(remotePeerId);
     const libraries = [...new Set([...grantedLibraryIds, ...request.grantedLibraryIds])];
     const events = this.repository.eventsMissingForPeer(remotePeerId, request.cursors, SYNC_BATCH_LIMIT);
@@ -160,16 +157,13 @@ export class SyncService {
           !response.cursors.every(isCursor) || !Array.isArray(response.events) || response.events.length > SYNC_BATCH_LIMIT) {
         throw new SyncProtocolConflictError('invalid sync response');
       }
-      this.repository.setRemoteLibraries(peerId, response.grantedLibraryIds);
-      this.repository.acknowledgeCursors(peerId, response.cursors);
-      for (const rawEvent of response.events) {
-        const event = parseEventEnvelope(rawEvent);
-        if (!response.grantedLibraryIds.includes(event.libraryId)) throw new SyncAuthorizationError();
-        const author = this.pairing.listPeers().find((peer) => peer.peerId === event.authorPeerId && peer.trustState === 'trusted');
-        if (!author || !(await verifyEvent(event, author.publicKey))) throw new SyncProtocolConflictError('event signature or author identity is invalid');
+      const incomingEvents = await this.validateEvents(response.grantedLibraryIds, response.events);
+      for (const event of incomingEvents) {
         this.repository.ingest(peerId, event);
         received += 1;
       }
+      this.repository.setRemoteLibraries(peerId, response.grantedLibraryIds);
+      this.repository.acknowledgeCursors(peerId, response.cursors);
       sent += events.length;
       const moreIncoming = response.events.length === SYNC_BATCH_LIMIT;
       const moreOutgoing = this.repository.eventsMissingForPeer(
@@ -178,6 +172,20 @@ export class SyncService {
       if (!moreIncoming && !moreOutgoing) return { rounds: rounds + 1, received, sent };
     }
     throw new SyncProtocolConflictError('sync did not converge within the round limit');
+  }
+
+  private async validateEvents(grantedLibraryIds: readonly string[], rawEvents: readonly unknown[]): Promise<EventEnvelope[]> {
+    const events: EventEnvelope[] = [];
+    for (const rawEvent of rawEvents) {
+      const event = parseEventEnvelope(rawEvent);
+      if (!grantedLibraryIds.includes(event.libraryId)) throw new SyncAuthorizationError();
+      const author = this.pairing.listPeers().find((peer) => peer.peerId === event.authorPeerId && peer.trustState === 'trusted');
+      if (!author || !(await verifyEvent(event, author.publicKey))) {
+        throw new SyncProtocolConflictError('event signature or author identity is invalid');
+      }
+      events.push(event);
+    }
+    return events;
   }
 
   private remoteLibraryIds(peerId: string): string[] {

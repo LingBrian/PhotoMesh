@@ -151,6 +151,28 @@ describe('P2P signed event synchronization', () => {
       .toEqual({ count: 1 });
   });
 
+  it('does not persist remote grants or acknowledgements from a batch with an invalid signature', async () => {
+    const sender = await createNode();
+    const receiver = await createNode();
+    await trustEachOther(sender, receiver);
+    await indexAsset(receiver, 'receiver-outbox-asset');
+    const firstValidEvent = await indexAsset(sender, 'valid-request-before-invalid');
+    const signed = await sender.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.metadata.updated',
+      payload: { assetId: 'valid-request-before-invalid', fields: { caption: 'must not apply' } } });
+    const changed = { ...signed, payload: { ...(signed.payload as Record<string, string | number>), fields: { caption: 'tampered' } } };
+
+    await expect(receiver.sync.handleExchange(sender.identity.peerId, {
+      hello: sender.sync.hello(), grantedLibraryIds: ['family', 'untrusted-extra'],
+      cursors: [{ libraryId: 'family', authorPeerId: receiver.identity.peerId, sequence: 1 }], events: [firstValidEvent, changed]
+    })).rejects.toThrow('event signature or author identity is invalid');
+
+    expect(receiver.syncRepository.getRemoteLibraries(sender.identity.peerId)).toEqual(['family']);
+    expect(receiver.syncRepository.getAcknowledgedCursors(sender.identity.peerId)).toEqual([]);
+    expect(receiver.database.prepare('SELECT count(*) AS count FROM sync_outbox WHERE peer_id = ?').get(sender.identity.peerId))
+      .toEqual({ count: 1 });
+    expect(receiver.syncRepository.getProjection('family', 'valid-request-before-invalid')).toBeUndefined();
+  });
+
   it('rejects a payload changed after signing before it reaches the projection', async () => {
     const host = await createNode();
     const receiver = await createNode();
@@ -258,6 +280,30 @@ describe('P2P signed event synchronization', () => {
     expect(result.received).toBe(1);
     expect(a.syncRepository.getProjection('family', 'from-b')?.lastEventId).toBe(eventB.eventId);
     expect(b.syncRepository.getProjection('family', 'from-a')?.lastEventId).toBe(eventA.eventId);
+  });
+
+  it('does not persist grants or acknowledgements from a response with an invalid signature', async () => {
+    const a = await createNode();
+    const b = await createNode();
+    await trustEachOther(a, b);
+    await indexAsset(a, 'client-outbox-asset');
+    await indexAsset(b, 'valid-response-before-invalid');
+    await b.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.metadata.updated',
+      payload: { assetId: 'valid-response-before-invalid', fields: { caption: 'must not apply' } } });
+    const malformedResponseTransport = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) => {
+      const response = await b.sync.handleExchange(a.identity.peerId, request);
+      expect(response.events).toHaveLength(2);
+      const changed = { ...response.events[1]!, payload: { ...(response.events[1]!.payload as Record<string, string | number>), fields: { caption: 'tampered' } } };
+      return { ...response, grantedLibraryIds: ['family', 'untrusted-extra'], events: [response.events[0]!, changed] };
+    } };
+
+    await expect(a.sync.syncWithPeer(b.identity.peerId, malformedResponseTransport, 1))
+      .rejects.toThrow('event signature or author identity is invalid');
+    expect(a.syncRepository.getRemoteLibraries(b.identity.peerId)).toEqual(['family']);
+    expect(a.syncRepository.getAcknowledgedCursors(b.identity.peerId)).toEqual([]);
+    expect(a.database.prepare('SELECT count(*) AS count FROM sync_outbox WHERE peer_id = ?').get(b.identity.peerId))
+      .toEqual({ count: 1 });
+    expect(a.syncRepository.getProjection('family', 'valid-response-before-invalid')).toBeUndefined();
   });
 
   it('retries a persisted event after the peer commits it but the acknowledgement is lost', async () => {
