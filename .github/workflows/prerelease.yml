@@ -351,7 +351,7 @@ jobs:
           cp "release-assets/review/sbom.cyclonedx.json" "$published/sbom.cyclonedx.json"
           while IFS= read -r -d '' file; do
             hash="$(sha256sum "$file" | cut -d ' ' -f1)"
-            printf '%s  %s\\n' "$hash" "${file##*/}"
+            printf '%s  %s\n' "$hash" "${file##*/}"
           done < <(find "$published" -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z) > "$published/SHA256SUMS.txt"
           {
             cat "$published/CHANGELOG.md"
