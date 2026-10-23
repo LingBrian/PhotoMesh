@@ -34,7 +34,7 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
    ```
    首次运行按提示设置管理员令牌；留空会生成一次性令牌并显示，请安全保存。
 4. **可选来源目录。** 启动器可填写一个外部照片目录供只读扫描；留空则不扫描。不要把 PhotoMesh 数据目录放在外部来源目录内。
-5. **确认服务启动。** Agent 在前台运行，关闭窗口或按 Ctrl+C 会停止。服务默认只监听本机 `127.0.0.1:8443)。在另一终端检查：Windows 运行 `Invoke-RestMethod http://127.0.0.1:8443/v1/health`；Linux 运行 `curl http://127.0.0.1:8443/v1/health`。
+5. **确认服务启动。** Agent 在前台运行，关闭窗口或按 Ctrl+C 会停止。服务默认只监听本机 `127.0.0.1:8443`。在另一终端检查：Windows 运行 `Invoke-RestMethod http://127.0.0.1:8443/v1/health`；Linux 运行 `curl http://127.0.0.1:8443/v1/health`。
 6. Windows 数据目录默认为 `%LOCALAPPDATA%\PhotoMesh\data`；Linux 默认是 `~/.local/share/photomesh`。重启后需输入相同管理员令牌。Linux 节点身份密钥依赖 Secret Service；未配置时，安全配对/P2P 会关闭。
 7. 当前节点包仅支持 x64/amd64；没有 ARM64 NAS 包。先用合成照片验证，预览版不要作为唯一原图副本。
 ### Linux Docker 镜像（可选）
