@@ -280,6 +280,31 @@ describe('P2P signed event synchronization', () => {
       .get(b.identity.peerId, event.eventId)).toBeUndefined();
   });
 
+  it('retries an offered event until a durable acknowledgement cursor is returned', async () => {
+    const a = await createNode();
+    const b = await createNode();
+    await trustEachOther(a, b);
+    const event = await indexAsset(a, 'stale-ack-asset');
+    let calls = 0;
+    const transport = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) => {
+      calls += 1;
+      const response = await b.sync.handleExchange(a.identity.peerId, request);
+      return calls === 1 ? { ...response, cursors: [] } : response;
+    } };
+
+    const result = await a.sync.syncWithPeer(b.identity.peerId, transport);
+
+    expect(calls).toBe(2);
+    expect(result.rounds).toBe(2);
+    expect(result.sent).toBe(2);
+    expect(b.syncRepository.getProjection('family', 'stale-ack-asset')?.lastEventId).toBe(event.eventId);
+    expect(a.syncRepository.getAcknowledgedCursors(b.identity.peerId)).toEqual([
+      { libraryId: 'family', authorPeerId: a.identity.peerId, sequence: 1 }
+    ]);
+    expect(a.database.prepare('SELECT 1 FROM sync_outbox WHERE peer_id = ? AND event_id = ?')
+      .get(b.identity.peerId, event.eventId)).toBeUndefined();
+  });
+
   it('rejects a peer that reports a different negotiated protocol than its hello', async () => {
     const a = await createNode();
     const b = await createNode();

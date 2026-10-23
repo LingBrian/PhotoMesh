@@ -168,7 +168,9 @@ export class SyncService {
       }
       sent += events.length;
       const moreIncoming = response.events.length === SYNC_BATCH_LIMIT;
-      const moreOutgoing = events.length === SYNC_BATCH_LIMIT;
+      const moreOutgoing = this.repository.eventsMissingForPeer(
+        peerId, this.repository.getAcknowledgedCursors(peerId), SYNC_BATCH_LIMIT
+      ).length > 0;
       if (!moreIncoming && !moreOutgoing) return { rounds: rounds + 1, received, sent };
     }
     throw new SyncProtocolConflictError('sync did not converge within the round limit');
