@@ -11,7 +11,7 @@ export PHOTOMESH_API_BIND_ADDRESS="${PHOTOMESH_API_BIND_ADDRESS:-127.0.0.1}"
 if [[ -z "${PHOTOMESH_ADMIN_TOKEN:-}" ]]; then
   read -r -s -p "Admin token (blank to generate): " PHOTOMESH_ADMIN_TOKEN; echo
   if [[ -z "$PHOTOMESH_ADMIN_TOKEN" ]]; then
-    PHOTOMESH_ADMIN_TOKEN="$(openssl rand -base64 32)"
+    PHOTOMESH_ADMIN_TOKEN="$("$NODE" -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64"))')"
     printf 'Generated admin token (save it in your password manager):\n%s\n' "$PHOTOMESH_ADMIN_TOKEN"
   fi
 fi
