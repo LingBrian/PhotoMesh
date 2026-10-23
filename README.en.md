@@ -21,13 +21,13 @@ PhotoMesh is a self-hosted, decentralized photo library. Each node keeps its own
 
 On Windows, install Node.js 22.12+ and pnpm 11. Keep Agent data separate from photo directories, and explicitly allow only the external roots to scan:
 
-\`\`\`powershell
-$env:PHOTOMESH_DATA_DIR = 'D:\\PhotoMesh\\agent-data'
-$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\\\Photos","pathStyle":"win32"}]'
+```powershell
+$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
+$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\Photos","pathStyle":"win32"}]'
 pnpm install --frozen-lockfile
 pnpm --filter @photomesh/node-agent build
 pnpm --filter @photomesh/node-agent start
-\`\`\`
+```
 
 The Agent reads external photo roots without modifying them; its database and uploaded files use the separate data directory. The service binds to a local address by default. Do not expose the HTTP API to a LAN or the public Internet without TLS and authentication. See the [deployment and prerelease guide](docs/预发布发布流程.md) and [Docker deployment guide](docs/modules/deploy/docker/README.md) for configuration, two-node exercises, and NAS limits.
 
@@ -41,16 +41,16 @@ See the [LAN secure pairing guide](docs/operations/LAN安全配对.md). Android 
 
 ## Local development
 
-Requires Node.js 22.12+ and pnpm 11. Install Flutter separately when working on Android; Flutter dependencies use \`pub\`.
+Requires Node.js 22.12+ and pnpm 11. Install Flutter separately when working on Android; Flutter dependencies use `pub`.
 
-\`\`\`powershell
+```powershell
 pnpm install --frozen-lockfile
 pnpm --filter @photomesh/web dev
-\`\`\`
+```
 
 Common checks and builds:
 
-\`\`\`powershell
+```powershell
 pnpm lint
 pnpm typecheck
 pnpm test
@@ -60,7 +60,7 @@ pnpm build
 pnpm test:sync-compose
 pnpm test:mobile
 pnpm build:mobile
-\`\`\`
+```
 
 Flutter commands require the Flutter SDK and Android toolchain. Start with the [documentation index](docs/AI文档总览.md) for architecture, APIs, development rules, tests, release acceptance, and module guides. Deployment and operations are covered in the [deployment guide](docs/预发布发布流程.md).
 
