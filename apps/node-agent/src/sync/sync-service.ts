@@ -115,7 +115,9 @@ export class SyncService {
     if (request.hello.nodeId !== remotePeerId) throw new SyncProtocolConflictError('hello identity does not match authenticated peer');
     const negotiation = negotiateProtocol(this.hello(), request.hello);
     if (!isStringArray(request.grantedLibraryIds, 256) || !Array.isArray(request.cursors) || request.cursors.length > 4096 ||
-        !Array.isArray(request.events) || request.events.length > SYNC_BATCH_LIMIT) throw new SyncProtocolConflictError('invalid sync batch');
+        !request.cursors.every(isCursor) || !Array.isArray(request.events) || request.events.length > SYNC_BATCH_LIMIT) {
+      throw new SyncProtocolConflictError('invalid sync batch');
+    }
     this.repository.setRemoteLibraries(remotePeerId, request.grantedLibraryIds);
     this.repository.acknowledgeCursors(remotePeerId, request.cursors);
     const results: SyncExchangeResponse['results'] = [];

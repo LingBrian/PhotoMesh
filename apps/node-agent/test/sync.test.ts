@@ -136,6 +136,21 @@ describe('P2P signed event synchronization', () => {
     expect(a.database.prepare('SELECT count(*) AS count FROM sync_outbox WHERE peer_id = ?').get(b.identity.peerId)).toEqual({ count: 0 });
   });
 
+  it('rejects malformed cursors before acknowledging incoming requests', async () => {
+    const sender = await createNode();
+    const receiver = await createNode();
+    await trustEachOther(sender, receiver);
+    await indexAsset(receiver, 'request-cursor-asset');
+
+    await expect(receiver.sync.handleExchange(sender.identity.peerId, {
+      hello: sender.sync.hello(), grantedLibraryIds: ['family'],
+      cursors: [{ libraryId: 'family', authorPeerId: receiver.identity.peerId, sequence: -1 }], events: []
+    })).rejects.toThrow('invalid sync batch');
+    expect(receiver.syncRepository.getAcknowledgedCursors(sender.identity.peerId)).toEqual([]);
+    expect(receiver.database.prepare('SELECT count(*) AS count FROM sync_outbox WHERE peer_id = ?').get(sender.identity.peerId))
+      .toEqual({ count: 1 });
+  });
+
   it('rejects a payload changed after signing before it reaches the projection', async () => {
     const host = await createNode();
     const receiver = await createNode();
