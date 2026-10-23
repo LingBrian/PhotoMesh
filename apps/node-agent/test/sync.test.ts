@@ -245,6 +245,41 @@ describe('P2P signed event synchronization', () => {
     expect(b.syncRepository.getProjection('family', 'from-a')?.lastEventId).toBe(eventA.eventId);
   });
 
+  it('retries a persisted event after the peer commits it but the acknowledgement is lost', async () => {
+    const a = await createNode();
+    const b = await createNode();
+    await trustEachOther(a, b);
+    const event = await indexAsset(a, 'ack-lost-asset');
+
+    const lostAckTransport = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) => {
+      await b.sync.handleExchange(a.identity.peerId, request);
+      throw new Error('ack lost after peer committed event');
+    } };
+    await expect(a.sync.syncWithPeer(b.identity.peerId, lostAckTransport)).rejects.toThrow('ack lost after peer committed event');
+    expect(a.syncRepository.getAcknowledgedCursors(b.identity.peerId)).toEqual([]);
+    expect(b.syncRepository.getProjection('family', 'ack-lost-asset')?.lastEventId).toBe(event.eventId);
+
+    const resentEventIds: string[] = [];
+    const retryStatuses: string[] = [];
+    const retryTransport = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) => {
+      resentEventIds.push(...request.events.map((item) => item.eventId));
+      const response = await b.sync.handleExchange(a.identity.peerId, request);
+      retryStatuses.push(...response.results.map((result) => result.status));
+      return response;
+    } };
+    const result = await a.sync.syncWithPeer(b.identity.peerId, retryTransport);
+
+    expect(result.sent).toBe(1);
+    expect(resentEventIds).toEqual([event.eventId]);
+    expect(retryStatuses).toEqual(['duplicate']);
+    expect(b.syncRepository.getProjection('family', 'ack-lost-asset')?.lastEventId).toBe(event.eventId);
+    expect(a.syncRepository.getAcknowledgedCursors(b.identity.peerId)).toEqual([
+      { libraryId: 'family', authorPeerId: a.identity.peerId, sequence: 1 }
+    ]);
+    expect(a.database.prepare('SELECT 1 FROM sync_outbox WHERE peer_id = ? AND event_id = ?')
+      .get(b.identity.peerId, event.eventId)).toBeUndefined();
+  });
+
   it('rejects a peer that reports a different negotiated protocol than its hello', async () => {
     const a = await createNode();
     const b = await createNode();
