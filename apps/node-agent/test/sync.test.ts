@@ -282,6 +282,22 @@ describe('P2P signed event synchronization', () => {
     expect(b.syncRepository.getProjection('family', 'from-a')?.lastEventId).toBe(eventA.eventId);
   });
 
+  it('synchronizes first-exchange events when remote grant caches are empty', async () => {
+    const a = await createNode();
+    const b = await createNode();
+    await trustEachOther(a, b);
+    a.database.prepare('DELETE FROM sync_remote_library_grants').run();
+    b.database.prepare('DELETE FROM sync_remote_library_grants').run();
+    const eventA = await indexAsset(a, 'first-exchange-a');
+    const eventB = await indexAsset(b, 'first-exchange-b');
+    const transport = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) =>
+      b.sync.handleExchange(a.identity.peerId, request) };
+
+    await expect(a.sync.syncWithPeer(b.identity.peerId, transport)).resolves.toMatchObject({ rounds: 1, sent: 1, received: 1 });
+    expect(b.syncRepository.getProjection('family', 'first-exchange-a')?.lastEventId).toBe(eventA.eventId);
+    expect(a.syncRepository.getProjection('family', 'first-exchange-b')?.lastEventId).toBe(eventB.eventId);
+  });
+
   it('does not persist grants or acknowledgements from a response with an invalid signature', async () => {
     const a = await createNode();
     const b = await createNode();

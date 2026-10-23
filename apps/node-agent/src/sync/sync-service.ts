@@ -119,12 +119,12 @@ export class SyncService {
       throw new SyncProtocolConflictError('invalid sync batch');
     }
     const incomingEvents = await this.validateEvents(request.grantedLibraryIds, request.events);
+    this.repository.setRemoteLibraries(remotePeerId, request.grantedLibraryIds);
     const results: SyncExchangeResponse['results'] = [];
     for (const event of incomingEvents) {
       const result = this.repository.ingest(remotePeerId, event);
       results.push({ eventId: event.eventId, status: result.status });
     }
-    this.repository.setRemoteLibraries(remotePeerId, request.grantedLibraryIds);
     this.repository.acknowledgeCursors(remotePeerId, request.cursors);
     const grantedLibraryIds = this.repository.listGrantedLibraries(remotePeerId);
     const libraries = [...new Set([...grantedLibraryIds, ...request.grantedLibraryIds])];
@@ -158,11 +158,11 @@ export class SyncService {
         throw new SyncProtocolConflictError('invalid sync response');
       }
       const incomingEvents = await this.validateEvents(response.grantedLibraryIds, response.events);
+      this.repository.setRemoteLibraries(peerId, response.grantedLibraryIds);
       for (const event of incomingEvents) {
         this.repository.ingest(peerId, event);
         received += 1;
       }
-      this.repository.setRemoteLibraries(peerId, response.grantedLibraryIds);
       this.repository.acknowledgeCursors(peerId, response.cursors);
       sent += events.length;
       const moreIncoming = response.events.length === SYNC_BATCH_LIMIT;
