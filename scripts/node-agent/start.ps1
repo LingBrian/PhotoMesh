@@ -11,7 +11,7 @@ $env:PHOTOMESH_API_BIND_ADDRESS = '127.0.0.1'
 $token = Read-Host 'Admin token (leave blank to generate a new one)'
 if ([string]::IsNullOrWhiteSpace($token)) {
   $bytes = New-Object byte[] 32
-  [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+  $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); $rng.GetBytes($bytes); $rng.Dispose()
   $token = [Convert]::ToBase64String($bytes)
   Write-Host 'Generated admin token (save it in your password manager):' -ForegroundColor Yellow
   Write-Host $token
