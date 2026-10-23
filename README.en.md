@@ -24,7 +24,7 @@ PhotoMesh is a self-hosted, decentralized photo library. Each node keeps its own
 Use an empty test photo directory for the first run. PhotoMesh is a preview; do not make it the only copy of important photos.
 
 1. **Install Git and Node.js.** Install Git from [Git for Windows](https://git-scm.com/download/win) and Node.js 22.12 or a newer 22.x release from the [Node.js download page](https://nodejs.org/en/download). Reopen PowerShell, then verify with `git --version` and `node --version`.
-2. **Install pnpm.** If Corepack is available, run `corepack enable` and `corepack prepare pnpm@11.0.0 --activate`. Check `pnpm --version`. The repository's root `package.json` `packageManager` field is authoritative if its pinned version differs.
+2. **Install pnpm.** If Corepack is available, run `corepack enable` and `corepack prepare pnpm@11.25.0 --activate`. Check `pnpm --version`. The repository's root `package.json` `packageManager` field is authoritative if its pinned version differs.
 3. **Download the source.** On the [PhotoMesh GitHub repository](https://github.com/LingBrian/PhotoMesh), choose the green **Code → Download ZIP** button and extract to a path such as `D:\PhotoMesh\PhotoMesh`. Or clone with Git:
 
 ```powershell
@@ -66,7 +66,7 @@ When it returns a healthy response, add a few disposable test photos to `sample-
 
 ### Connect a client device
 
-Download the latest Windows Pre-release installer from [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), and download that release's `SHA256SUMS`. Verify it in PowerShell with `Get-FileHash .\PhotoMesh-version-windows-x64.exe -Algorithm SHA256` before installing. The current installer is unsigned; continue only on a test computer if Windows displays a security warning. If no release asset is available, use the source download and local Web development steps above.
+Download the latest Windows Pre-release installer from [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), and download that release's `SHA256SUMS`. Verify it in PowerShell with `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` before installing. The current installer is unsigned; continue only on a test computer if Windows displays a security warning. If no release asset is available, use the source download and local Web development steps above.
 
 1. **Open the client.** Start the Agent on its node computer, then launch PhotoMesh from the Start menu. Or, from the repository root, run `pnpm --filter @photomesh/web dev` in another PowerShell and open the local URL printed in the terminal.
 2. **Enter the node URL and token.** Open **Settings → Node settings**. On the same computer, enter `http://127.0.0.1:8443`. For a node on another computer, use its private LAN IP (for example `http://192.168.1.20:8443`), and expose the HTTP API across devices only behind a trusted TLS reverse proxy. Enter the node's `PHOTOMESH_ADMIN_TOKEN`, click **Save and connect**, and confirm the status is online and the library list loads. Give this token only to trusted administrator devices.
@@ -75,26 +75,6 @@ Download the latest Windows Pre-release installer from [GitHub Releases](https:/
 5. **Verify and revoke.** Confirm the trusted peer state in the pairing settings. After testing, revoke the peer and verify it can no longer read the gallery index. Revocation cannot remotely erase data already cached by that peer. Android uploads currently use the administrator token; do not give it to untrusted devices. See the [Android client guide](docs/modules/apps/mobile/README.md).
 
 Verify on one computer before attempting access over a network. Do not expose the `8443` management API to the public Internet or an untrusted LAN. P2P pairing protects the node-to-node channel; it does not provide TLS for the management HTTP API.
-
-On Windows, install Node.js 22.12+ and pnpm 11. Keep Agent data separate from photo directories, and explicitly allow only the external roots to scan:
-
-```powershell
-$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
-$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\Photos","pathStyle":"win32"}]'
-pnpm install --frozen-lockfile
-pnpm --filter @photomesh/node-agent build
-pnpm --filter @photomesh/node-agent start
-```
-
-The Agent reads external photo roots without modifying them; its database and uploaded files use the separate data directory. The service binds to a local address by default. Do not expose the HTTP API to a LAN or the public Internet without TLS and authentication. See the [deployment and prerelease guide](docs/预发布发布流程.md) and [Docker deployment guide](docs/modules/deploy/docker/README.md) for configuration, two-node exercises, and NAS limits.
-
-## Connect a client device
-
-1. Create a short-lived pairing invitation on a running node.
-2. Scan its QR code from the client. If mDNS is unavailable, enter the node's private IP manually.
-3. Verify the peer key identity, have the node administrator approve it, and grant only the required read-only library access.
-
-See the [LAN secure pairing guide](docs/operations/LAN安全配对.md). Android permissions, network policies, upload queues, and background limits are covered in the [Android client guide](docs/modules/apps/mobile/README.md).
 
 ## Local development
 
