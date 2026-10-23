@@ -66,15 +66,15 @@ Invoke-RestMethod http://127.0.0.1:8443/v1/health
 
 ### 终端连接步骤
 
-当前客户端通过设置页连接节点 API；首次验证建议在同一台 Windows 电脑打开 Web 客户端，避免先开放 LAN 端口：
+先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Pre-release 的 Windows 安装包；下载同一版本的 `SHA256SUMS`，在 PowerShell 用 `Get-FileHash .\PhotoMesh-版本号-windows-x64.exe -Algorithm SHA256` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
 
-1. 节点运行时，在仓库根目录另开 PowerShell 执行 `pnpm --filter @photomesh/web dev`，按终端提示打开本地开发地址。
-2. 打开 **设置 → 节点设置**，节点地址填写 `http://127.0.0.1:8443`，管理员令牌填写启动节点时设置的 `PHOTOMESH_ADMIN_TOKEN`，保存后返回时间线确认图库列表可读取。
-3. 在 **设置 → 配对** 点击创建邀请，向另一台 PhotoMesh 节点传递短期二维码/邀请数据。邀请约 2 分钟失效且只能使用一次；通过可信渠道当面扫描或传递，不要贴到公开聊天或 Issue。
-4. 若客户端与节点在不同设备，先确保双方位于受信任的私有网络，并按 [LAN 安全配对教程](docs/operations/LAN安全配对.md) 为节点显式配置私有地址和防火墙。二维码中的身份密钥用于验证节点；mDNS/IP 只负责发现地址。
-5. 管理员在主机本地批准待配对设备，并仅授权需要的图库。撤销后用该设备重新请求索引，应得到拒绝响应。当前 Android 端的上传凭据仍使用管理员令牌，不适合发给不受信任设备；详见 [Android 客户端说明](docs/modules/apps/mobile/README.md)。
+1. **打开客户端。** 在节点电脑启动 Agent；再从开始菜单打开 PhotoMesh，或在仓库根目录另开 PowerShell 运行 `pnpm --filter @photomesh/web dev`，并打开终端打印的本地地址。
+2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把节点运行时的 `PHOTOMESH_ADMIN_TOKEN` 填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。
+3. **创建邀请。** 在 **设置 → 配对** 点击 **创建邀请**。页面会显示二维码和一段 JSON 邀请文本，有效期约 2 分钟，只能使用一次。客户端目前没有摄像头扫码器：在接入节点的另一端打开其客户端设置，把邀请 JSON 复制粘贴到“扫描邀请”文本框，再点击加入。
+4. **批准对端。** 邀请发起端运行节点的本机 API 需要管理员批准新身份。当前界面可创建/加入邀请和查看/撤销可信节点，尚无批准按钮；在该节点电脑本机 PowerShell 读取待批准列表：`Invoke-RestMethod http://127.0.0.1:8443/v1/pairing/peers -Headers @{ Authorization = "Bearer $env:PHOTOMESH_ADMIN_TOKEN" }`。核对 `pending` 中的 Peer ID 后，按 [LAN 配对指南](docs/operations/LAN安全配对.md) 调用批准接口，只授予确实需要的图库只读权限。
+5. **验证和撤销。** 两端在配对页确认可信节点状态。完成验证后，撤销设备并确认它不再能读取图库索引；撤销不会远程删除对端此前缓存的数据。Android 上传目前使用管理员令牌，不能把它交给不受信任设备；详见 [Android 客户端说明](docs/modules/apps/mobile/README.md)。
 
-不要把 `8443` 管理 API 映射到公网或不可信 LAN。需要跨设备访问 UI 时，应先部署带 TLS 和认证的可信反向代理；局域网 P2P 配对本身不为 HTTP API 提供 TLS。
+先在同一台电脑验证连接，再考虑跨设备网络。不要把 `8443` 管理 API 映射到公网或不可信 LAN。P2P 配对只保护节点间通道，不为管理 HTTP API 提供 TLS。
 
 Windows 上准备 Node.js 22.12+ 和 pnpm 11，将 Agent 数据目录与照片目录分开，并只授权需要扫描的外部根目录：
 
