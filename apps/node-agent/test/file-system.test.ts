@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -61,7 +61,7 @@ describe('managed upload filesystem', () => {
     await store.writeExclusive('staging/assemble-source.tmp', new TextEncoder().encode('assemble'));
 
     const outcomes = await Promise.allSettled([
-      store.writeExclusive('staging/redirect/created.bin', new TextEncoder().encode('outside')),
+      store.writeExclusive('staging/redirect/created/nested.bin', new TextEncoder().encode('outside')),
       store.flush('staging/redirect/flush.bin'),
       store.publishNoReplace('staging/publish.tmp', 'staging/redirect/published.bin'),
       store.assembleAndHash(['staging/assemble-source.tmp'], 'staging/redirect/assembled.bin'),
@@ -76,7 +76,8 @@ describe('managed upload filesystem', () => {
     expect(await readFile(join(outside, 'flush.bin'), 'utf8')).toBe('protected');
     expect(await readFile(join(outside, 'remove.bin'), 'utf8')).toBe('protected');
     expect(await readFile(join(outside, 'subtree/secret.bin'), 'utf8')).toBe('protected');
-    await expect(readFile(join(outside, 'created.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(outside, 'created'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(outside, 'created/nested.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(join(outside, 'published.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(join(outside, 'assembled.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
