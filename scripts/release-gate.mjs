@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { delimiter, dirname, join, relative, resolve } from 'node:path';
+import { delimiter, join, relative, resolve } from 'node:path';
 import process from 'node:process';
+import { performanceReportPasses } from './release-gate-validation.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const reportDir = resolve(process.env.PHOTOMESH_RELEASE_DIR ?? join(root, 'artifacts', 'release-candidates'));
@@ -76,11 +77,11 @@ function packagesFromLock(lock) {
     if (lines[index] === 'packages:') { inPackages = true; continue; }
     if (inPackages && lines[index] === 'snapshots:') break;
     if (!inPackages) continue;
-    const keyMatch = lines[index].match(/^  (?:'([^']+)'|"([^"]+)"|([^:]+)):\s*$/);
+    const keyMatch = lines[index].match(/^ {2}(?:'([^']+)'|"([^"]+)"|([^:]+)):\s*$/);
     if (!keyMatch) continue;
     const packageKey = (keyMatch[1] ?? keyMatch[2] ?? keyMatch[3]).replace(/^\//, '');
     let integrity;
-    for (let cursor = index + 1; cursor < Math.min(index + 7, lines.length) && /^    /.test(lines[cursor]); cursor++) {
+    for (let cursor = index + 1; cursor < Math.min(index + 7, lines.length) && /^ {4}/.test(lines[cursor]); cursor++) {
       integrity ??= lines[cursor].match(/integrity:\s*sha512-([A-Za-z0-9+/=]+)/)?.[1];
       const inline = lines[cursor].match(/integrity:\s*sha512-([A-Za-z0-9+/=]+)/)?.[1];
       if (inline) integrity = inline;
@@ -212,7 +213,7 @@ const perfPath = resolve(process.env.PHOTOMESH_PERF_REPORT ?? join(root, 'artifa
 try {
   if (packageOnly) throw new Error('package-only 模式没有运行 100k 查询基准');
   const perf = JSON.parse(await readFile(perfPath, 'utf8'));
-  checks.push({ name: '100k-query-api-p95', status: perf.dataset?.assets === 100_000 && perf.dataset?.queries === 1_000 && perf.queryApi?.p95Ms < 1_000 ? 'pass' : 'fail', evidence: perf });
+  checks.push({ name: '100k-query-api-p95', status: performanceReportPasses(perf) ? 'pass' : 'fail', evidence: perf });
 } catch (error) {
   checks.push({ name: '100k-query-api-p95', status: packageOnly ? 'blocked' : 'fail', reason: `Playwright 性能报告缺失/无效: ${error.message}` });
 }
@@ -226,12 +227,12 @@ const evidenceArtifact = join(outputDir, 'release-evidence.json');
 try {
   const evidence = JSON.parse(await readFile(evidencePath, 'utf8'));
   await writeFile(evidenceArtifact, `${JSON.stringify(evidence, null, 2)}\n`);
-} catch {}
+} catch { /* optional evidence artifact is omitted when source evidence is unavailable */ }
 const perfArtifact = join(outputDir, 'performance-gallery-100k.json');
 try {
   const perf = JSON.parse(await readFile(perfPath, 'utf8'));
   await writeFile(perfArtifact, `${JSON.stringify(perf, null, 2)}\n`);
-} catch {}
+} catch { /* optional performance artifact is omitted when source evidence is unavailable */ }
 
 const candidateSources = [
   '.github/workflows/release-candidate.yml', 'docs/release-evidence.example.json', 'docs/发布候选门禁.md',
@@ -285,29 +286,26 @@ await writeFile(join(outputDir, 'release-report.json'), `${JSON.stringify(summar
 await writeFile(fileList, [...new Set([...tracked, ...candidateSources, ...generatedPaths])].join('\n') + '\n');
 const archiveFormat = process.platform === 'win32' ? 'zip' : 'tar.gz';
 const candidateArchivePath = join(outputDir, `${candidateId}.${archiveFormat}`);
-let archive;
-if (process.platform === 'win32') {
-  archive = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'archive-release.ps1'), root, fileList, candidateArchivePath], { encoding: 'utf8', windowsHide: true });
-} else {
-  archive = spawnSync('tar', ['-czf', candidateArchivePath, '-C', root, '-T', fileList], { encoding: 'utf8', windowsHide: true });
+function createCandidateArchive() {
+  return process.platform === 'win32'
+    ? spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'archive-release.ps1'), root, fileList, candidateArchivePath], { encoding: 'utf8', windowsHide: true })
+    : spawnSync('tar', ['-czf', candidateArchivePath, '-C', root, '-T', fileList], { encoding: 'utf8', windowsHide: true });
 }
+const archive = createCandidateArchive();
 checks.push(archive.status !== 0
   ? { name: 'candidate-archive', status: 'fail', reason: archive.stderr || archive.error?.message || 'tar failed' }
   : { name: 'candidate-archive', status: 'pass', evidence: { path: candidateArchivePath } });
 summary.checks = checks;
 summary.verdict = checks.some((check) => check.status === 'fail' || check.status === 'blocked') ? 'blocked' : 'ready-for-human-review';
 await writeFile(join(outputDir, 'release-report.json'), `${JSON.stringify(summary, null, 2)}\n`);
-if (archive.status === 0) {
-  if (process.platform === 'win32') archive = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'archive-release.ps1'), root, fileList, candidateArchivePath], { encoding: 'utf8', windowsHide: true });
-  else archive = spawnSync('tar', ['-czf', candidateArchivePath, '-C', root, '-T', fileList], { encoding: 'utf8', windowsHide: true });
-}
+if (archive.status === 0) createCandidateArchive();
 const manifestFiles = ['CHANGELOG.md', 'sbom.cyclonedx.json', 'release-report.json', 'release-evidence.json', 'performance-gallery-100k.json', `${candidateId}.${archiveFormat}`];
 const manifest = [];
 for (const name of manifestFiles) {
   try {
     const bytes = await readFile(join(outputDir, name));
     manifest.push({ path: name, sizeBytes: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex') });
-  } catch {}
+  } catch { /* missing optional artifact is omitted from the manifest */ }
 }
 await writeFile(join(outputDir, 'SHA256SUMS.json'), `${JSON.stringify({ algorithm: 'SHA-256', files: manifest }, null, 2)}\n`);
 process.stdout.write(`\n${summary.verdict}: ${outputDir}\n`);
