@@ -19,6 +19,47 @@ PhotoMesh is a self-hosted, decentralized photo library. Each node keeps its own
 
 ## Node deployment
 
+### Preferred: download the prebuilt Node Agent (Linux x86_64)
+
+The release workflow provides a compiled Docker image archive named `PhotoMesh-<version>-node-agent-linux-amd64.docker.tar`. On a Linux x86_64 NAS, this avoids downloading source, installing Node.js, or compiling. There is no ARM64 NAS image or standalone native Windows Node Agent installer yet.
+
+1. Install and start Docker Engine on the Linux x86_64 host. Verify `docker version` and `docker info` succeed.
+2. From [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), download `node-agent-linux-amd64.docker.tar` and `SHA256SUMS.txt` from the same Pre-release. Make sure the versions match.
+3. Calculate the archive SHA-256 and confirm that value appears in the checksum manifest. Stop if it does not match:
+   
+   ```sh
+   sha256sum PhotoMesh-*-node-agent-linux-amd64.docker.tar
+   grep '<SHA256-from-previous-command>' SHA256SUMS.txt
+   ```
+
+4. Load the prebuilt image and confirm its tag:
+   
+   ```sh
+   docker load -i PhotoMesh-<version>-node-agent-linux-amd64.docker.tar
+   docker image ls photomesh/node-agent
+   ```
+
+5. Create a dedicated Docker volume and start the node on loopback. This command does not mount a photo directory or expose the API to the LAN:
+   
+   ```sh
+   docker volume create photomesh-node-data
+   export PHOTOMESH_ADMIN_TOKEN="$(openssl rand -base64 32)"
+   docker run -d --name photomesh-node --restart unless-stopped --network host \
+     -e PORT=8443 -e PHOTOMESH_DATA_DIR=/data \
+     -e PHOTOMESH_API_BIND_ADDRESS=127.0.0.1 \
+     -e PHOTOMESH_ADMIN_TOKEN \
+     -v photomesh-node-data:/data \
+     photomesh/node-agent:<version>
+   ```
+
+6. On that Linux host, run `curl http://127.0.0.1:8443/v1/health`. Read startup output with `docker logs photomesh-node`; stop it with `docker stop photomesh-node`. Reuse the same named volume after restart. Never remove a volume that contains real data.
+
+This is a Linux x86_64 preview build. Linux node identity keys require an available Secret Service; without one, pairing/P2P is disabled and this is not a complete NAS node deployment. Do not expose the host's full D-Bus session to an untrusted container. The image has not passed ARM64, NAS production, or secure-key-service integration acceptance. Assess photo-root mounts, LAN API access, backup/recovery, and production operation separately before use with real photos.
+
+### Native Windows run (development/testing path)
+
+There is no standalone Windows Node Agent installer yet, so native Windows use currently requires source and Node.js. Use the steps below only for local preview/testing. For a published prebuilt artifact, use the Linux x86_64 image above.
+
 ### Start from download: first Windows deployment
 
 Use an empty test photo directory for the first run. PhotoMesh is a preview; do not make it the only copy of important photos.
