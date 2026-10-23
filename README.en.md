@@ -2,89 +2,79 @@
 
 [![CI](https://github.com/LingBrian/PhotoMesh/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/LingBrian/PhotoMesh/actions/workflows/ci.yml)
 [![Pre-release](https://img.shields.io/github/v/release/LingBrian/PhotoMesh?include_prereleases&label=pre-release)](https://github.com/LingBrian/PhotoMesh/releases)
-[![License: Apache-2.0](https://img.shields.io/github/license/LingBrian/PhotoMesh)](LICENSE)
+[![Apache-2.0](https://img.shields.io/github/license/LingBrian/PhotoMesh)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/LingBrian/PhotoMesh?style=flat)](https://github.com/LingBrian/PhotoMesh/stargazers)
 
-PhotoMesh is a self-hosted, decentralized photo library for multiple platforms. Trusted nodes keep their own originals and synchronize only authorized metadata and events. Uploads and downloads verify the complete SHA-256 digest. The project targets Windows, Android, Linux/NAS, and the Web without requiring a central account service.
+PhotoMesh is a self-hosted, decentralized photo library. Each node keeps its own originals and synchronizes only authorized metadata and events; original-file access is checked by the node. The project is in preview. Validate deployments with synthetic data first, and do not entrust an unvalidated instance with the only copy of irreplaceable photos.
 
-> This is an early preview. Try it with synthetic test data first; do not rely on an unvalidated deployment for the only copy of irreplaceable photos. Check the GitHub Actions report for candidate gate results. A Stable release requires a separate maintainer approval.
+## Technology stack
 
-## Features and safety boundaries
+| Layer | Technology |
+| --- | --- |
+| Monorepo | pnpm Workspace, Turborepo, TypeScript strict |
+| Node service | Node.js LTS, TypeScript, SQLite |
+| Web / Windows desktop | Vue 3, TypeScript, Tauri 2 |
+| Android | Flutter / Dart, managed by Flutter Pub and repository scripts, outside npm dependencies |
+| Quality and contracts | Vitest, Playwright, Flutter test, Docker Compose, OpenAPI / JSON Schema |
 
-- The Node Agent provides SQLite metadata, resumable chunk uploads, read-only external directory scanning, and LAN pairing/sync foundations.
-- The Android client provides photo permissions, an upload queue, network policies, and SHA-256 verification. Android schedules background work and does not guarantee real-time execution.
-- Vue Web and Tauri desktop provide a gallery UI. The server checks ACLs on every data access.
-- Originals are never overwritten, re-encoded, or automatically deleted in place. Sync is not backup; source photos on NAS are read-only by default.
-- Previews, tests, and derived data use separate locations. APIs deny unauthorized access by default.
+## Node deployment
 
-## Tutorial: run a two-node local exercise
+### One-click node install (Windows x64 / Linux x64)
 
-Requires Node.js 22.12+, pnpm 11, and Docker Compose v2. This exercise uses synthetic data and never reads personal photos:
+For normal use, install the prebuilt node package; you do not need to download source or compile on the target device. From [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), download the installer script from the latest Pre-release:
+
+1. **Windows x64:** Download `install.bat` into a new folder and double-click it. It finds the latest prerelease, downloads the matching `install.ps1`, Node Agent ZIP, and `SHA256SUMS.txt`, verifies the SHA-256, then installs the package with its bundled Node.js runtime.
+2. **Linux x64:** Download `install.sh` from the same prerelease and run `chmod +x install.sh && ./install.sh`. It downloads the matching node package and checksum manifest, verifies the hash, extracts, and starts it.
+3. **First run:** The script prompts for an administrator token. Leave it blank to generate a one-time token; save the displayed value in a password manager. Optionally enter an external photo directory to scan read-only; leave blank to skip. The API listens on local `127.0.0.1:8443` by default. Verify locally with `curl http://127.0.0.1:8443/v1/health`; on Windows use `Invoke-RestMethod http://127.0.0.1:8443/v1/health`.
+4. The node runs in the foreground; closing its window or pressing Ctrl+C stops it. Windows data is stored under `%LOCALAPPDATA%\PhotoMesh\data`; Linux uses `~/.local/share/photomesh` by default. Save the token securely and enter the same token again after restarting.
+5. Linux node identity keys require Secret Service. Without it, the local API can start but secure pairing/P2P is unavailable. Do not expose the host's full D-Bus session to an untrusted container.
+6. Current release packages are x64/amd64 only; there is no ARM64 NAS package. Validate with synthetic photos first and do not use a preview build as the only copy of originals.
+
+### Optional Linux Docker image
+
+The release also provides `PhotoMesh-<version>-node-agent-linux-amd64.docker.tar`. Load it with `docker load -i <image-archive>` and run it with a dedicated data volume. See the [deployment and prerelease guide](docs/预发布发布流程.md) for commands, rollback, and network boundaries.
+
+### Connect a client device
+
+Download the latest Windows x64 desktop installer (`PhotoMesh-<version>-windows-x64-unsigned.exe`) from [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), and download that release's `SHA256SUMS.txt`. Verify it in PowerShell with `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` before installing. The current installer is unsigned; continue only on a test computer if Windows displays a security warning. If no release asset is available, use the source download and local Web development steps above.
+
+1. **Open the client.** Start the Agent on its node computer, then launch PhotoMesh from the Start menu. Or, from the repository root, run `pnpm --filter @photomesh/web dev` in another PowerShell and open the local URL printed in the terminal.
+2. **Enter the node URL and token.** Open **Settings → Node settings**. On the same computer, enter `http://127.0.0.1:8443`. For a node on another computer, use its private LAN IP (for example `http://192.168.1.20:8443`), and expose the HTTP API across devices only behind a trusted TLS reverse proxy. Enter the node's `PHOTOMESH_ADMIN_TOKEN`, click **Save and connect**, and confirm the status is online and the library list loads. Give this token only to trusted administrator devices.
+3. **Create an invitation.** Under **Settings → Pairing**, click **Create invite**. The page shows a QR code and a JSON invite. It expires in about two minutes and can be used once. The client does not currently include a camera QR scanner: on the other node's client, copy the JSON invite into the “Scan invite” text box and click Join.
+4. **Approve the peer.** The host node's local API requires an administrator to approve the new identity. The UI can create/join invitations and list/revoke trusted peers, but does not yet have an approval button. On the host computer, read pending peers in local PowerShell: `Invoke-RestMethod http://127.0.0.1:8443/v1/pairing/peers -Headers @{ Authorization = "Bearer $env:PHOTOMESH_ADMIN_TOKEN" }`. Check the Peer ID under `pending`, then use the approval endpoint in the [LAN pairing guide](docs/operations/LAN安全配对.md) to grant only the required read-only library access.
+5. **Verify and revoke.** Confirm the trusted peer state in the pairing settings. After testing, revoke the peer and verify it can no longer read the gallery index. Revocation cannot remotely erase data already cached by that peer. Android uploads currently use the administrator token; do not give it to untrusted devices. See the [Android client guide](docs/modules/apps/mobile/README.md).
+
+Verify on one computer before attempting access over a network. Do not expose the `8443` management API to the public Internet or an untrusted LAN. P2P pairing protects the node-to-node channel; it does not provide TLS for the management HTTP API.
+
+## Local development
+
+Requires Node.js 22.12+ and pnpm 11. Install Flutter separately when working on Android; Flutter dependencies use `pub`.
 
 ```powershell
 pnpm install --frozen-lockfile
-pnpm test:sync-compose
-```
-
-The script starts isolated Windows-simulated and NAS-simulated nodes and checks pairing, library grants, event sync, offline recovery, and restart behavior. It preserves dedicated Docker named volumes. See the [two-node Compose guide](docs/modules/deploy/compose/README.md) for limits and simulator-only reset instructions.
-
-## Tutorial: run the Node Agent with a read-only photo root
-
-In Windows PowerShell, choose a separate data directory and explicitly allow one photo root:
-
-```powershell
-$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
-$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\Photos","pathStyle":"win32"}]'
-pnpm --filter @photomesh/node-agent build
-pnpm --filter @photomesh/node-agent start
-```
-
-The scanner reads `D:\Photos`; its index and tasks are stored in `D:\PhotoMesh\agent-data`. Read the [Node Agent configuration and API guide](docs/modules/apps/node-agent/README.md) and [LAN pairing tutorial](docs/operations/LAN安全配对.md) before deployment. Do not expose an API without configured TLS and authentication to a LAN or the public Internet.
-
-## Tutorial: start the Web UI and build Android
-
-Start the Web development server from the repository root:
-
-```powershell
 pnpm --filter @photomesh/web dev
 ```
 
-The mobile client uses Flutter `pub`, outside the pnpm workspace. Install Flutter and the Android toolchain, then run tests and build an APK:
+Common checks and builds:
 
 ```powershell
-pnpm test:mobile
-pnpm build:mobile
-```
-
-See the [Android client guide](docs/modules/apps/mobile/README.md) for permissions, Wi-Fi/mobile policies, resumable uploads, and background behavior. Android controls background scheduling; emulator builds do not replace the real-device acceptance checklist.
-
-## Development and validation
-
-```powershell
-pnpm install --frozen-lockfile
 pnpm lint
 pnpm typecheck
 pnpm test
 pnpm contracts:check
-pnpm build
 pnpm test:e2e
+pnpm build
+pnpm test:sync-compose
+pnpm test:mobile
+pnpm build:mobile
 ```
 
-Use `pnpm test:sync-compose` for the two-node Docker exercise. The `Release candidate gate` workflow generates an acceptance report; `Build and publish prerelease` runs the full gate and builds products from `main`. Reports include performance, SHA-256, migration recovery, ACL, SBOM, changelog, and failure details. Missing evidence or failed checks mark a candidate as blocked. Flutter tests require a standalone SDK; GitHub Actions installs the toolchain for CI.
-
-## Tutorial: build and publish a prerelease
-
-Run **Build and publish prerelease** in GitHub Actions with a version such as `0.x.y-rc.n`, `0.x.y-beta.n`, or `0.x.y-alpha.n`. You can also trigger it from `main` with GitHub CLI:
-
-```powershell
-gh workflow run prerelease.yml --ref main -f version=0.1.0-rc.1
-```
-
-The workflow runs the full acceptance gate before building the Web bundle, Linux x86_64 NAS Docker image, Android APK, and Windows installers. It creates no prerelease if the gate or any platform build fails. See the [prerelease process](docs/预发布发布流程.md). Stable releases require separate human approval.
-
-## Documentation
-
-Start with the [AI documentation index](docs/AI文档总览.md). Product requirements, architecture, ADRs, release acceptance, operations, and pairing docs live under `docs/`. See the [deployment and prerelease guide](docs/预发布发布流程.md) for local setup, the two-node Docker exercise, Windows Node Agent, and prerelease installation.
+Flutter commands require the Flutter SDK and Android toolchain. Start with the [documentation index](docs/AI文档总览.md) for architecture, APIs, development rules, tests, release acceptance, and module guides. Deployment and operations are covered in the [deployment guide](docs/预发布发布流程.md).
 
 ## License
 
-PhotoMesh is licensed under the [Apache License 2.0](LICENSE). Third-party components, build artifacts, and models retain their own license terms.
+PhotoMesh is licensed under the [Apache License 2.0](LICENSE).
+
+## Star history
+
+[![PhotoMesh GitHub Star History](https://api.star-history.com/chart?repos=LingBrian/PhotoMesh&type=date&legend=top-left)](https://www.star-history.com/#LingBrian/PhotoMesh&Date)

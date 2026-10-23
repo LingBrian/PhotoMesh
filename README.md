@@ -2,89 +2,79 @@
 
 [![CI](https://github.com/LingBrian/PhotoMesh/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/LingBrian/PhotoMesh/actions/workflows/ci.yml)
 [![Pre-release](https://img.shields.io/github/v/release/LingBrian/PhotoMesh?include_prereleases&label=pre-release)](https://github.com/LingBrian/PhotoMesh/releases)
-[![License: Apache-2.0](https://img.shields.io/github/license/LingBrian/PhotoMesh)](LICENSE)
+[![Apache-2.0](https://img.shields.io/github/license/LingBrian/PhotoMesh)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/LingBrian/PhotoMesh?style=flat)](https://github.com/LingBrian/PhotoMesh/stargazers)
 
-PhotoMesh 是一款自托管、去中心化的跨平台相册。可信节点各自保存原图，只同步获授权的元数据和事件；原图上传或下载必须完成 SHA-256 校验。项目面向 Windows、Android、Linux/NAS 和 Web，首版不依赖中心账号服务。
+PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立保存原图，只同步获授权的元数据和事件；访问原图需通过节点授权。项目仍处于预览阶段，请先使用合成数据验证部署，不要将唯一原图副本交给未经验证的实例。
 
-> 当前是早期预览项目。请先用合成测试数据体验，不要把唯一副本或不可替代的原图交给未经验证的部署。发布候选是否通过门禁，以 GitHub Actions 报告为准；Stable 发布仍需维护者单独审批。
+## 技术栈
 
-## 功能与安全边界
+| 层 | 技术 |
+| --- | --- |
+| Monorepo | pnpm Workspace、Turborepo、TypeScript strict |
+| 节点服务 | Node.js LTS、TypeScript、SQLite |
+| Web / Windows 桌面 | Vue 3、TypeScript、Tauri 2 |
+| Android | Flutter / Dart；由 Flutter Pub 管理，通过仓库脚本编排，不加入 npm 依赖 |
+| 质量与契约 | Vitest、Playwright、Flutter test、Docker Compose、OpenAPI / JSON Schema |
 
-- Node Agent 提供 SQLite 元数据、分块续传、只读外部目录扫描和局域网配对/同步基础能力。
-- Android 客户端提供照片授权、上传队列、网络策略与 SHA-256 校验；Android 后台执行受系统调度，不能保证实时运行。
-- Vue Web / Tauri 桌面端提供图库浏览界面。每次数据访问由服务端 ACL 控制。
-- 原图不可就地覆盖、重编码或自动删除。同步不是备份；NAS 上的源照片默认只读。
-- 预览、测试和派生内容使用独立位置；服务/API 默认拒绝未授权访问。
+## 节点部署教程
 
-## 教程：本地双节点演练
+### 一键安装节点（Windows x64 / Linux x64）
 
-需要 Node.js 22.12+、pnpm 11 和 Docker Compose v2。演练使用虚构数据，不会访问个人照片：
+普通使用者应下载预构建节点包，无需下载源码或在目标设备编译。到 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Pre-release 的平台安装脚本：
+
+1. **Windows x64：** 下载 `install.bat` 到一个新文件夹，双击运行。脚本会定位最新预发布，下载匹配的 `install.ps1`、Node Agent ZIP 和 `SHA256SUMS.txt`，校验 SHA-256 后安装内含 Node.js runtime 的节点包。
+2. **Linux x64：** 下载同一预发布里的 `install.sh`，执行 `chmod +x install.sh && ./install.sh`。脚本下载匹配版本的节点包和校验清单，验 hash 后解压并启动。
+3. **首次运行：** 脚本会提示管理员令牌。留空会生成一次性令牌并显示；请保存到密码管理器。可选输入一个要只读扫描的照片目录；留空则先不扫描照片。服务默认只监听本机 `127.0.0.1:8443)，在本机验证健康接口：`curl http://127.0.0.1:8443/v1/health`。Windows 用 `Invoke-RestMethod http://127.0.0.1:8443/v1/health`。
+4. 节点在前台运行，关闭窗口或按 Ctrl+C 会停止。Windows 数据目录为 `%LOCALAPPDATA%\PhotoMesh\data`；Linux 默认是 `~/.local/share/photomesh`。保存管理员令牌，重启后需重新输入相同令牌。
+5. Linux 节点身份密钥依赖 Secret Service。无可用 Secret Service 时，节点仍可启动本机 API，但安全配对/P2P 会关闭；不要把宿主机完整 D-Bus 会话暴露给不可信容器。
+6. 当前发布包仅为 x64/amd64；没有 ARM64 NAS 包。先用合成照片验证，预览版不要作为唯一原图副本。
+
+### Linux Docker 镜像（可选）
+
+发布包也提供 `PhotoMesh-<版本>-node-agent-linux-amd64.docker.tar`。下载后运行 `docker load -i <镜像归档>`，然后用专用数据卷启动。详细命令、回滚与网络边界见[部署与预发布教程](docs/预发布发布流程.md)。
+
+### 终端连接步骤
+
+先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Windows x64 桌面安装包（`PhotoMesh-<版本>-windows-x64-unsigned.exe`）；下载同一版本的 `SHA256SUMS.txt`，在 PowerShell 用 `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
+
+1. **打开客户端。** 在节点电脑启动 Agent；再从开始菜单打开 PhotoMesh，或在仓库根目录另开 PowerShell 运行 `pnpm --filter @photomesh/web dev`，并打开终端打印的本地地址。
+2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把节点运行时的 `PHOTOMESH_ADMIN_TOKEN` 填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。
+3. **创建邀请。** 在 **设置 → 配对** 点击 **创建邀请**。页面会显示二维码和一段 JSON 邀请文本，有效期约 2 分钟，只能使用一次。客户端目前没有摄像头扫码器：在接入节点的另一端打开其客户端设置，把邀请 JSON 复制粘贴到“扫描邀请”文本框，再点击加入。
+4. **批准对端。** 邀请发起端运行节点的本机 API 需要管理员批准新身份。当前界面可创建/加入邀请和查看/撤销可信节点，尚无批准按钮；在该节点电脑本机 PowerShell 读取待批准列表：`Invoke-RestMethod http://127.0.0.1:8443/v1/pairing/peers -Headers @{ Authorization = "Bearer $env:PHOTOMESH_ADMIN_TOKEN" }`。核对 `pending` 中的 Peer ID 后，按 [LAN 配对指南](docs/operations/LAN安全配对.md) 调用批准接口，只授予确实需要的图库只读权限。
+5. **验证和撤销。** 两端在配对页确认可信节点状态。完成验证后，撤销设备并确认它不再能读取图库索引；撤销不会远程删除对端此前缓存的数据。Android 上传目前使用管理员令牌，不能把它交给不受信任设备；详见 [Android 客户端说明](docs/modules/apps/mobile/README.md)。
+
+先在同一台电脑验证连接，再考虑跨设备网络。不要把 `8443` 管理 API 映射到公网或不可信 LAN。P2P 配对只保护节点间通道，不为管理 HTTP API 提供 TLS。
+
+## 本地开发
+
+需要 Node.js 22.12+、pnpm 11；Flutter SDK 单独安装，Dart/Flutter 依赖由 `pub` 管理。
 
 ```powershell
 pnpm install --frozen-lockfile
-pnpm test:sync-compose
-```
-
-脚本启动彼此独立的 Windows 模拟节点与 NAS 模拟节点，验证配对、授权图库、事件同步、断线恢复和节点重启。演练会保留专用 Docker named volumes；Compose 限制和仅重置模拟数据的方法见[双节点 Compose 指南](docs/modules/deploy/compose/README.md)。
-
-## 教程：运行 Node Agent 并只读扫描目录
-
-在 Windows PowerShell 中指定独立的数据目录与获授权的照片根目录，然后启动 agent：
-
-```powershell
-$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
-$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\Photos","pathStyle":"win32"}]'
-pnpm --filter @photomesh/node-agent build
-pnpm --filter @photomesh/node-agent start
-```
-
-扫描器只读访问 `D:\Photos`，索引和任务写入 `D:\PhotoMesh\agent-data`。首次部署前请阅读 [Node Agent 配置与 API 说明](docs/modules/apps/node-agent/README.md) 和[局域网安全配对教程](docs/operations/LAN安全配对.md)。不要将未配置 TLS/认证的 API 暴露到局域网或公网。
-
-## 教程：启动 Web 与构建 Android
-
-在仓库根目录启动 Web 开发服务器：
-
-```powershell
 pnpm --filter @photomesh/web dev
 ```
 
-移动端使用 Flutter `pub`，不加入 pnpm workspace。安装 Flutter SDK 和 Android 工具链后，可运行测试并构建 APK：
+常用验证与构建：
 
 ```powershell
-pnpm test:mobile
-pnpm build:mobile
-```
-
-客户端权限、Wi-Fi/移动网络策略、续传和后台行为见 [Android 客户端说明](docs/modules/apps/mobile/README.md)。后台任务时机由 Android 决定；真机验收清单不能由模拟器构建替代。
-
-## 开发与验证
-
-```powershell
-pnpm install --frozen-lockfile
 pnpm lint
 pnpm typecheck
 pnpm test
 pnpm contracts:check
-pnpm build
 pnpm test:e2e
+pnpm build
+pnpm test:sync-compose
+pnpm test:mobile
+pnpm build:mobile
 ```
 
-双节点 Docker 演练使用 `pnpm test:sync-compose`；GitHub Actions 的 `Release candidate gate` 工作流可生成验收报告，`Build and publish prerelease` 工作流只从 `main` 运行完整门禁并构建预发布产品。报告包含性能、SHA-256、迁移恢复、ACL、SBOM、Changelog 和失败定位；若验收证据缺失或检查失败，候选状态会标记为 blocked。Flutter 测试需单独安装 SDK，GitHub Actions 会安装对应工具链。
-
-## 教程：构建并发布预发布版本
-
-在 GitHub Actions 运行 **Build and publish prerelease**，输入 `0.x.y-rc.n`、`0.x.y-beta.n` 或 `0.x.y-alpha.n`。也可用 GitHub CLI 从 `main` 触发：
-
-```powershell
-gh workflow run prerelease.yml --ref main -f version=0.1.0-rc.1
-```
-
-该流程先运行完整门禁，再构建 Web、Linux x86_64 NAS Docker 镜像、Android APK 和 Windows 安装包。门禁或任一平台构建失败时不会创建预发布。详见[预发布发布流程](docs/预发布发布流程.md)；Stable 需要独立人工审批。
-
-## 文档
-
-从 [AI 文档总览](docs/AI文档总览.md) 开始。产品需求、架构、ADR、发布验收、运行和安全配对文档均归档在 `docs/`。部署方式、双节点 Docker 演练、Windows Node Agent 和预发布安装步骤见[部署与预发布教程](docs/预发布发布流程.md)。
+Flutter 命令需要先安装 Flutter SDK 与 Android 工具链。架构、API、开发规范、测试/发布验收和各模块说明从[文档总览](docs/AI文档总览.md)进入；预发布和节点运维见[部署教程](docs/预发布发布流程.md)。
 
 ## 许可证
 
-PhotoMesh 使用 [Apache License 2.0](LICENSE)。第三方组件、构建产物和模型需各自遵守其许可证。
+PhotoMesh 使用 [Apache License 2.0](LICENSE)。
+
+## Star 趋势
+
+[![PhotoMesh GitHub Star History](https://api.star-history.com/chart?repos=LingBrian/PhotoMesh&type=date&legend=top-left)](https://www.star-history.com/#LingBrian/PhotoMesh&Date)
