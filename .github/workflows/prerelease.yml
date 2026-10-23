@@ -327,31 +327,44 @@ jobs:
         with:
           name: photomesh-${{ needs.validate.outputs.version }}-node-windows-x64
           path: release-assets/products/node-windows-x64
-      - name: Verify gate verdict and create checksums
+      - name: Curate product assets and checksums
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
           test "$(jq -r .verdict "release-assets/review/release-report.json")" = "ready-for-human-review"
-          {
-            cat "release-assets/review/CHANGELOG.md"
-            echo
-            echo "## Windows installer signature"
-            echo
-            echo "The Windows NSIS installer is unsigned because this project does not yet have a trusted code-signing certificate. Windows may show an unknown-publisher or SmartScreen warning. Verify the download against SHA256SUMS.txt before installing, and use a test device."
-            echo
-            echo "The Android APK uses a one-time CI signing identity that changes per candidate; uninstall an earlier preview before installing a newer one."
-            echo
-            echo "Verify downloaded files against SHA256SUMS.txt and the GitHub build provenance attestation."
-          } > release-assets/RELEASE_NOTES.md
+          published="release-assets/published"
+          mkdir -p "$published"
+          files=(
+            "release-assets/products/android/PhotoMesh-$VERSION-android-arm64.apk"
+            "release-assets/products/web-nas/PhotoMesh-$VERSION-web.tar.gz"
+            "release-assets/products/web-nas/PhotoMesh-$VERSION-node-agent-linux-amd64.docker.tar"
+            "release-assets/products/windows/PhotoMesh-$VERSION-windows-x64-unsigned.exe"
+            "release-assets/products/node-linux-x64/PhotoMesh-$VERSION-node-agent-linux-x64.tar.gz"
+            "release-assets/products/node-windows-x64/PhotoMesh-$VERSION-node-agent-windows-x64.zip"
+          )
+          for file in "${files[@]}"; do
+            test -s "$file"
+            cp "$file" "$published/"
+          done
+          cp "release-assets/review/CHANGELOG.md" "$published/CHANGELOG.md"
+          cp "release-assets/review/sbom.cyclonedx.json" "$published/sbom.cyclonedx.json"
           while IFS= read -r -d '' file; do
             hash="$(sha256sum "$file" | cut -d ' ' -f1)"
-            printf '%s  %s\n' "$hash" "${file##*/}"
-          done < <(find release-assets -type f ! -name SHA256SUMS.txt -print0 | sort -z) > release-assets/SHA256SUMS.txt
+            printf '%s  %s\\n' "$hash" "${file##*/}"
+          done < <(find "$published" -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z) > "$published/SHA256SUMS.txt"
+          {
+            cat "$published/CHANGELOG.md"
+            echo
+            echo "## Release notes"
+            echo
+            echo "Windows desktop installer is unsigned. Verify downloaded files against SHA256SUMS.txt."
+            echo "Android preview signing identity changes for each candidate; uninstall the previous preview before upgrading."
+          } > "release-assets/RELEASE_NOTES.md"
       - name: Attest release assets
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: release-assets/**/*
+          subject-path: release-assets/published/*
       - name: Create prerelease
         env:
           VERSION: ${{ needs.validate.outputs.version }}
@@ -359,6 +372,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mapfile -d '' assets < <(find release-assets -type f -print0 | sort -z)
+          mapfile -d '' assets < <(find release-assets/published -maxdepth 1 -type f -print0 | sort -z)
           gh release create "v$VERSION" "${assets[@]}" --target main --prerelease \
             --title "PhotoMesh $VERSION" --notes-file release-assets/RELEASE_NOTES.md
