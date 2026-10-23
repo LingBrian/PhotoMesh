@@ -102,6 +102,10 @@ test('virtual timeline pages through 100k records and search stays server pagina
   }
   const sortedSamples = [...performanceSamplesMs].sort((a, b) => a - b);
   const percentile = (p: number): number => sortedSamples[Math.ceil(p * sortedSamples.length) - 1] ?? 0;
+  const detectedCpuCount = process.availableParallelism?.();
+  const cpuCount = typeof detectedCpuCount === 'number' && Number.isSafeInteger(detectedCpuCount) && detectedCpuCount > 0
+    ? detectedCpuCount
+    : Math.max(1, os.cpus().length);
   const report = {
     schemaVersion: 1,
     dataset: { assets: total, queries: performanceSamplesMs.length, pageSize: 50, terms: queryTerms },
@@ -112,12 +116,14 @@ test('virtual timeline pages through 100k records and search stays server pagina
     },
     environment: {
       platform: process.platform, os: `${os.type()} ${os.release()}`, arch: process.arch, node: process.version,
-      cpuModel: os.cpus()[0]?.model ?? 'unknown', cpuCount: process.availableParallelism?.() ?? null,
+      cpuModel: os.cpus()[0]?.model ?? 'unknown', cpuCount,
       totalRamMiB: Math.round(os.totalmem() / 1024 / 1024), peakRssMiB: Math.round(process.memoryUsage().rss / 1024 / 1024)
     },
     thresholdMs: 1_000,
     passed: percentile(0.95) < 1_000
   };
+  expect(report.environment.cpuCount, 'performance evidence must record a usable CPU count').toEqual(expect.any(Number));
+  expect(report.environment.cpuCount).toBeGreaterThan(0);
   const output = process.env.PHOTOMESH_PERF_REPORT ?? 'artifacts/performance/gallery-100k.json';
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
