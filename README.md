@@ -21,13 +21,13 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 
 Windows 上准备 Node.js 22.12+ 和 pnpm 11，将 Agent 数据目录与照片目录分开，并只授权需要扫描的外部根目录：
 
-\`\`\`powershell
-$env:PHOTOMESH_DATA_DIR = 'D:\\PhotoMesh\\agent-data'
-$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\\\Photos","pathStyle":"win32"}]'
+```powershell
+$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
+$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\Photos","pathStyle":"win32"}]'
 pnpm install --frozen-lockfile
 pnpm --filter @photomesh/node-agent build
 pnpm --filter @photomesh/node-agent start
-\`\`\`
+```
 
 Agent 对外部照片目录只读，数据库与上传文件写入独立数据目录。服务默认监听本机地址；不要把未配置 TLS/认证的 HTTP API 暴露到 LAN 或公网。Docker 双节点演练、NAS 限制和完整配置见[部署与预发布教程](docs/预发布发布流程.md)及 [Docker 部署说明](docs/modules/deploy/docker/README.md)。
 
@@ -41,16 +41,16 @@ Agent 对外部照片目录只读，数据库与上传文件写入独立数据�
 
 ## 本地开发
 
-需要 Node.js 22.12+、pnpm 11；Flutter SDK 单独安装，Dart/Flutter 依赖由 \`pub\` 管理。
+需要 Node.js 22.12+、pnpm 11；Flutter SDK 单独安装，Dart/Flutter 依赖由 `pub` 管理。
 
-\`\`\`powershell
+```powershell
 pnpm install --frozen-lockfile
 pnpm --filter @photomesh/web dev
-\`\`\`
+```
 
 常用验证与构建：
 
-\`\`\`powershell
+```powershell
 pnpm lint
 pnpm typecheck
 pnpm test
@@ -60,7 +60,7 @@ pnpm build
 pnpm test:sync-compose
 pnpm test:mobile
 pnpm build:mobile
-\`\`\`
+```
 
 Flutter 命令需要先安装 Flutter SDK 与 Android 工具链。架构、API、开发规范、测试/发布验收和各模块说明从[文档总览](docs/AI文档总览.md)进入；预发布和节点运维见[部署教程](docs/预发布发布流程.md)。
 
