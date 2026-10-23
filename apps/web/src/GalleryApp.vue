@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import './gallery.css';
+import { createPairingApprovalDecision, reconcilePendingLibrarySelections, type PendingPeer } from './pairing-approval';
 
 type Library = { libraryId: string; title: string };
 type Asset = {
@@ -26,6 +27,9 @@ const search = ref('');
 const section = ref<'timeline' | 'recycle' | 'settings'>('timeline');
 const tombstones = ref<Tombstone[]>([]);
 const peers = ref<Array<{ peerId: string; label: string; trustState: string }>>([]);
+const pendingPeers = ref<PendingPeer[]>([]);
+const selectedLibraryIds = ref<Record<string, string[]>>({});
+const busyApprovalPeers = ref<string[]>([]);
 const invitation = ref<{ qrDataUrl: string; invite: unknown } | null>(null);
 const scannedInvite = ref('');
 const theme = ref<'light' | 'dark'>(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
@@ -168,8 +172,35 @@ async function loadRecycleBin(): Promise<void> {
   catch (cause) { error.value = errorText(cause); }
 }
 async function loadPeerList(): Promise<void> {
-  try { peers.value = (await request<{ peers: typeof peers.value }>('/v1/pairing/peers')).peers; }
-  catch { peers.value = []; }
+  try {
+    const result = await request<{ peers: typeof peers.value; pending?: PendingPeer[] }>('/v1/pairing/peers');
+    const pending = result.pending ?? [];
+    peers.value = result.peers;
+    pendingPeers.value = pending;
+    const available = new Set(libraries.value.map((library) => library.libraryId));
+    selectedLibraryIds.value = reconcilePendingLibrarySelections(
+      pending.map((peer) => peer.peerId), selectedLibraryIds.value, available
+    );
+  } catch (cause) {
+    error.value = errorText(cause);
+  }
+}
+async function decidePendingPeer(peer: PendingPeer, approved: boolean): Promise<void> {
+  if (busyApprovalPeers.value.includes(peer.peerId)) return;
+  busyApprovalPeers.value = [...busyApprovalPeers.value, peer.peerId];
+  error.value = '';
+  try {
+    await request(`/v1/pairing/peers/${encodeURIComponent(peer.peerId)}/approval`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(createPairingApprovalDecision(approved, selectedLibraryIds.value[peer.peerId] ?? []))
+    });
+    await loadPeerList();
+  } catch (cause) {
+    error.value = errorText(cause);
+  } finally {
+    busyApprovalPeers.value = busyApprovalPeers.value.filter((peerId) => peerId !== peer.peerId);
+  }
 }
 async function createInvitation(): Promise<void> {
   try {
@@ -571,6 +602,72 @@ async function idbClear(store: string): Promise<void> {
             >
               {{ t('gallery.joinNode') }}
             </button>
+            <div class="pending-approval-heading">
+              <h3>{{ t('gallery.pendingApprovals') }}</h3>
+              <button
+                class="text-button"
+                @click="loadPeerList"
+              >
+                {{ t('gallery.refreshApprovals') }}
+              </button>
+            </div>
+            <p class="muted approval-security-note">
+              {{ t('gallery.approvalSecurityNote') }}
+            </p>
+            <div
+              v-if="!pendingPeers.length"
+              class="muted"
+            >
+              {{ t('gallery.noPendingApprovals') }}
+            </div>
+            <article
+              v-for="pending in pendingPeers"
+              :key="pending.peerId"
+              class="pending-peer-row"
+            >
+              <div class="pending-peer-details">
+                <strong>{{ pending.proposedLabel }}</strong>
+                <small>{{ t('gallery.peerIdLabel') }} <code>{{ pending.peerId }}</code></small>
+                <small>{{ t('gallery.peerPublicKey') }} <code>{{ pending.publicKey }}</code></small>
+                <small>{{ t('gallery.requestedAt') }} {{ formatDate(pending.requestedAt) }}</small>
+              </div>
+              <fieldset class="approval-grants">
+                <legend>{{ t('gallery.grantLibraries') }}</legend>
+                <label
+                  v-for="library in libraries"
+                  :key="library.libraryId"
+                >
+                  <input
+                    v-model="selectedLibraryIds[pending.peerId]"
+                    type="checkbox"
+                    :value="library.libraryId"
+                  >
+                  <span>{{ library.title }}</span>
+                </label>
+                <p
+                  v-if="!libraries.length"
+                  class="muted"
+                >
+                  {{ t('gallery.noLibrariesAvailable') }}
+                </p>
+              </fieldset>
+              <div class="pending-peer-actions">
+                <button
+                  class="secondary-button"
+                  :disabled="busyApprovalPeers.includes(pending.peerId)"
+                  @click="decidePendingPeer(pending, false)"
+                >
+                  {{ t('gallery.declineDevice') }}
+                </button>
+                <button
+                  class="primary-button small-primary"
+                  :disabled="busyApprovalPeers.includes(pending.peerId)"
+                  @click="decidePendingPeer(pending, true)"
+                >
+                  {{ t('gallery.approveDevice') }}
+                </button>
+              </div>
+            </article>
             <h3>{{ t('gallery.trustedNodes') }}</h3><div
               v-if="!peers.length"
               class="muted"
