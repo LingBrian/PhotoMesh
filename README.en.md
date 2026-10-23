@@ -19,6 +19,63 @@ PhotoMesh is a self-hosted, decentralized photo library. Each node keeps its own
 
 ## Node deployment
 
+### Start from download: first Windows deployment
+
+Use an empty test photo directory for the first run. PhotoMesh is a preview; do not make it the only copy of important photos.
+
+1. **Install Git and Node.js.** Install Git from [Git for Windows](https://git-scm.com/download/win) and Node.js 22.12 or a newer 22.x release from the [Node.js download page](https://nodejs.org/en/download). Reopen PowerShell, then verify with `git --version` and `node --version`.
+2. **Install pnpm.** If Corepack is available, run `corepack enable` and `corepack prepare pnpm@11.0.0 --activate`. Check `pnpm --version`. The repository's root `package.json` `packageManager` field is authoritative if its pinned version differs.
+3. **Download the source.** On the [PhotoMesh GitHub repository](https://github.com/LingBrian/PhotoMesh), choose the green **Code → Download ZIP** button and extract to a path such as `D:\PhotoMesh\PhotoMesh`. Or clone with Git:
+
+```powershell
+git clone https://github.com/LingBrian/PhotoMesh.git D:\PhotoMesh\PhotoMesh
+Set-Location D:\PhotoMesh\PhotoMesh
+```
+
+4. **Create separate data and test-photo directories.** The data directory holds SQLite, managed uploads, and runtime state. External photo roots are scanned read-only. Start with an empty test directory; never authorize an entire disk:
+
+```powershell
+New-Item -ItemType Directory -Force D:\PhotoMesh\agent-data | Out-Null
+New-Item -ItemType Directory -Force D:\PhotoMesh\sample-photos | Out-Null
+$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
+$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"demo-photos","libraryId":"demo","path":"D:\\PhotoMesh\\sample-photos","pathStyle":"win32"}]'
+$env:PHOTOMESH_ADMIN_TOKEN = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+```
+
+5. **Install dependencies and build the node.** Run these commands from the repository root. The first install downloads dependencies:
+
+```powershell
+Set-Location D:\PhotoMesh\PhotoMesh
+pnpm install --frozen-lockfile
+pnpm --filter @photomesh/node-agent build
+```
+
+6. **Start the node.** Keep this PowerShell window open. The API binds to local loopback `127.0.0.1:8443` by default:
+
+```powershell
+pnpm --filter @photomesh/node-agent start
+```
+
+7. **Verify the service and scan.** Open another PowerShell window on the same computer and run the health request. The node window should show its bind address and scan initialization:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8443/v1/health
+```
+
+When it returns a healthy response, add a few disposable test photos to `sample-photos` and confirm scanning only indexes them. Stop with `Ctrl+C`. Environment variables set with `$env:` must be set again in each new window. Never commit tokens or keys, or include them in screenshots or logs.
+
+### Connect a client device
+
+The client connects to the node API from its settings. For the first check, use the Web client on the same Windows computer so you do not need to expose a LAN port:
+
+1. While the node is running, open another PowerShell at the repository root and run `pnpm --filter @photomesh/web dev`. Open the local development URL printed in the terminal.
+2. Open **Settings → Node settings**. Enter `http://127.0.0.1:8443` as the node URL and the `PHOTOMESH_ADMIN_TOKEN` used by the node, save, then return to the timeline and confirm the library list loads.
+3. Under **Settings → Pairing**, create an invitation and pass its short-lived QR/invite data to another PhotoMesh node. It expires in about two minutes and can only be used once. Share it in person or through a trusted channel; never post it publicly.
+4. For devices on separate computers, first place both nodes on a trusted private network and follow the [LAN secure pairing guide](docs/operations/LAN安全配对.md) to configure explicit private addresses and firewall rules. The QR identity key verifies the peer; mDNS/IP only helps discover its address.
+5. The host administrator must approve the pending peer and grant only the required library. After revocation, verify that the device can no longer read the index. The Android upload credential currently uses the administrator token and must not be given to untrusted devices; see the [Android client guide](docs/modules/apps/mobile/README.md).
+
+Do not expose the `8443` management API to the public Internet or an untrusted LAN. Cross-device UI access needs a trusted reverse proxy with TLS and authentication. LAN pairing does not provide TLS for the HTTP API.
+
 On Windows, install Node.js 22.12+ and pnpm 11. Keep Agent data separate from photo directories, and explicitly allow only the external roots to scan:
 
 ```powershell
