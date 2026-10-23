@@ -19,6 +19,47 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 
 ## 节点部署教程
 
+### 首选：下载预构建 Node Agent（Linux x86_64）
+
+发布工作流会提供已编译镜像 `PhotoMesh-<版本>-node-agent-linux-amd64.docker.tar`。这是 Linux x86_64 的 Docker 镜像归档，不需要在 NAS 上下载源码、安装 Node.js 或编译。ARM64 NAS 暂无对应镜像；Windows 原生 Node Agent 也暂无独立安装包。
+
+1. 在 Linux x86_64 主机安装并启动 Docker Engine。检查 `docker version` 和 `docker info` 能正常返回。
+2. 到 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载同一 Pre-release 中的 `node-agent-linux-amd64.docker.tar` 和 `SHA256SUMS.txt`。确认版本号一致。
+3. 计算归档 SHA-256，并确认该值出现在清单中；不匹配就停止，不要导入：
+   
+   ```sh
+   sha256sum PhotoMesh-*-node-agent-linux-amd64.docker.tar
+   grep '<上一步输出的SHA256>' SHA256SUMS.txt
+   ```
+
+4. 导入已构建镜像并确认镜像标签：
+   
+   ```sh
+   docker load -i PhotoMesh-<版本>-node-agent-linux-amd64.docker.tar
+   docker image ls photomesh/node-agent
+   ```
+
+5. 创建一个仅供 PhotoMesh 使用的 Docker volume，再用本地回环方式启动。下面命令不会挂载你的照片目录，也不会让 API 监听 LAN：
+   
+   ```sh
+   docker volume create photomesh-node-data
+   export PHOTOMESH_ADMIN_TOKEN="$(openssl rand -base64 32)"
+   docker run -d --name photomesh-node --restart unless-stopped --network host \
+     -e PORT=8443 -e PHOTOMESH_DATA_DIR=/data \
+     -e PHOTOMESH_API_BIND_ADDRESS=127.0.0.1 \
+     -e PHOTOMESH_ADMIN_TOKEN \
+     -v photomesh-node-data:/data \
+     photomesh/node-agent:<版本>
+   ```
+
+6. 在这台 Linux 主机上运行 `curl http://127.0.0.1:8443/v1/health`。查看启动信息用 `docker logs photomesh-node`；停止服务用 `docker stop photomesh-node`。服务重启后继续使用同一 named volume，切勿删除含有正式数据的 volume。
+
+该镜像当前为 Linux x86_64 预览构建。Linux 节点身份密钥需要可用的 Secret Service；没有可用密钥服务时，配对/P2P 会关闭，不能视为完整 NAS 节点部署。不要把宿主机完整 D-Bus 会话暴露给不可信容器。此镜像尚未通过 ARM64、NAS 生产环境和密钥服务集成验收。真实照片目录挂载、LAN API、备份恢复及生产运行前，请先完成专门部署评估。
+
+### Windows 原生运行（开发/测试路径）
+
+目前没有独立 Windows Node Agent 安装包，因此 Windows 原生运行需要源码和 Node.js。下面步骤只适合本机预览与测试；如果目标是发布中的构建产物，优先用上面的 Linux x86_64 镜像。
+
 ### 从下载开始：Windows 首次部署
 
 以下步骤先用空的测试照片目录验证。PhotoMesh 仍是预览版，请勿让它成为重要照片的唯一副本。
