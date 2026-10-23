@@ -3,7 +3,7 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { delimiter, join, relative, resolve } from 'node:path';
 import process from 'node:process';
-import { performanceReportPasses } from './release-gate-validation.mjs';
+import { performanceReportPasses, reconnectDurationWithinLimit, reconnectEvidencePasses } from './release-gate-validation.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const reportDir = resolve(process.env.PHOTOMESH_RELEASE_DIR ?? join(root, 'artifacts', 'release-candidates'));
@@ -123,10 +123,9 @@ async function validateEvidence() {
       evidence.fileSync?.offlineReconnect?.sha256Mismatches === 0 && evidence.fileSync?.offlineReconnect?.durationSeconds > 0) {
       checksEvidence.push({ name: '100k-initial-incremental-file-sync', status: 'pass', evidence: evidence.fileSync });
     } else checksEvidence.push({ name: '100k-initial-incremental-file-sync', status: 'blocked', reason: '需要 100,000 文件首次/增量同步实测及零 SHA-256 差异证据' });
-    const reconnectSeconds = evidence.p2p?.reconnectSeconds;
-    const measuredReconnect = Date.parse(evidence.p2p?.firstEventAckAt) - Date.parse(evidence.p2p?.networkRestoredAt);
+    const reconnectPasses = reconnectEvidencePasses(evidence.p2p);
     if (!checks.some((check) => check.name === 'p2p-recovery-under-60s' && check.status === 'pass')) {
-      checksEvidence.push(reconnectSeconds >= 0 && reconnectSeconds <= 60 && Number.isFinite(measuredReconnect) && Math.abs(measuredReconnect / 1000 - reconnectSeconds) <= 1
+      checksEvidence.push(reconnectPasses
         ? { name: 'p2p-recovery-under-60s', status: 'pass', evidence: evidence.p2p }
         : { name: 'p2p-recovery-under-60s', status: 'blocked', reason: '需要端点恢复可达到首个事件 ACK 的实测时间，≤60 秒' });
     }
@@ -199,7 +198,7 @@ if (packageOnly) {
       };
       acceptance.p2p = recovery;
       await writeFile(evidencePath, `${JSON.stringify(acceptance, null, 2)}\n`);
-      checks.push(recovery?.reconnectMs >= 0 && recovery?.reconnectMs <= 60_000
+      checks.push(reconnectDurationWithinLimit(recovery?.reconnectMs)
         ? { name: 'p2p-recovery-under-60s', status: 'pass', evidence: { ...recovery, source: 'two-node Docker Compose reconnect and event convergence' } }
         : { name: 'p2p-recovery-under-60s', status: 'fail', reason: 'Docker smoke did not report a valid <=60s recovery measurement' });
     } catch (error) {
