@@ -7,6 +7,7 @@ import { SystemSecretStore, type SecretStore } from '../src/auth/key-store.js';
 import { PairingRejectedError, PairingService } from '../src/auth/pairing-service.js';
 import { PairingApprovalQueue } from '../src/auth/pairing-approval-queue.js';
 import { LanPairingNode } from '../src/auth/lan-node.js';
+import type { SyncService } from '../src/sync/sync-service.js';
 
 const lanNodes: LanPairingNode[] = [];
 const databases: Database.Database[] = [];
@@ -30,12 +31,15 @@ class MemorySecretStore implements SecretStore {
   set(name: string, value: string): void { this.values.set(name, value); }
 }
 
-async function createNode(approve: (peer: { peerId: string; publicKey: string; proposedLabel: string }) => Promise<{ approved: boolean; label?: string; libraryIds?: string[] }> = async () => ({ approved: true })) {
+async function createNode(
+  approve: (peer: { peerId: string; publicKey: string; proposedLabel: string }) => Promise<{ approved: boolean; label?: string; libraryIds?: string[] }> = async () => ({ approved: true }),
+  syncService?: SyncService
+) {
   const repository = await createRepository();
   const secretStore = new MemorySecretStore();
   const identity = await loadOrCreateLocalIdentity(repository, secretStore, '2026-10-21T00:00:00.000Z');
   const pairing = new PairingService(repository, identity.peerId, approve, Date.now);
-  const node = await LanPairingNode.start({ identity, pairing, listenAddresses: ['127.0.0.1'], listenPort: 0 });
+  const node = await LanPairingNode.start({ identity, pairing, listenAddresses: ['127.0.0.1'], listenPort: 0, ...(syncService ? { syncService } : {}) });
   lanNodes.push(node);
   return { repository, secretStore, identity, pairing, node };
 }
@@ -93,6 +97,33 @@ describe('local node identity and LAN pairing', () => {
 
     await expect(joining.node.pairWithInvite(invite, 'Laptop')).rejects.toBeInstanceOf(PairingRejectedError);
     expect(hostApproval).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares an in-flight sync task when pairing and other triggers target the same peer', async () => {
+    let releaseSync!: () => void;
+    const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
+    const createSyncStub = () => ({
+      syncWithPeer: vi.fn(async () => {
+        await syncGate;
+        return { rounds: 1, received: 0, sent: 0 };
+      })
+    }) as unknown as SyncService;
+    const hostSync = createSyncStub();
+    const joiningSync = createSyncStub();
+    const host = await createNode(async () => ({ approved: true, libraryIds: ['library-a'] }), hostSync);
+    const joining = await createNode(undefined, joiningSync);
+
+    await joining.node.pairWithInvite(host.node.createInvite(), 'Syncing device');
+    const hostSyncTask = host.node.syncWithPeer(joining.identity.peerId);
+    const joiningSyncTask = joining.node.syncWithPeer(host.identity.peerId);
+
+    try {
+      expect(hostSync.syncWithPeer).toHaveBeenCalledTimes(1);
+      expect(joiningSync.syncWithPeer).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseSync();
+      await Promise.all([hostSyncTask, joiningSyncTask]);
+    }
   });
 
   it('denies library index reads before a grant, permits scoped reads, and rejects access after revocation', async () => {

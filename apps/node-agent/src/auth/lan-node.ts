@@ -70,7 +70,7 @@ export class LanPairingNode implements SyncTransport {
           inviteId: message.inviteId, secret: message.secret, proposedLabel: message.label,
           authenticatedRemote: { peerId: authenticatedPeerId, publicKey: publicKeyBytes }
         });
-        if (options.syncService) void options.syncService.syncWithPeer(authenticatedPeerId, lan).catch(() => undefined);
+        if (options.syncService) void lan.syncWithPeer(authenticatedPeerId).catch(() => undefined);
         await writeFrame(stream, { ok: true, peerId: result.peerId, grantedLibraryIds: result.grantedLibraryIds });
       } catch {
         await writeFrame(stream, { ok: false, error: 'pairing_rejected' }).catch(() => undefined);
@@ -146,7 +146,7 @@ export class LanPairingNode implements SyncTransport {
           throw new PairingRejectedError('host identity could not be verified');
         }
         this.pairing.trustScannedHost(invite.hostPeerId, publicKeyToProtobuf(authenticatedHost.publicKey), 'Paired PhotoMesh node');
-        if (this.syncService) void this.syncService.syncWithPeer(invite.hostPeerId, this).catch(() => undefined);
+        if (this.syncService) void this.syncWithPeer(invite.hostPeerId).catch(() => undefined);
         return { hostPeerId: invite.hostPeerId };
       } catch (error) { lastError = error; }
     }
