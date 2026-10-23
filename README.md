@@ -24,7 +24,7 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 以下步骤先用空的测试照片目录验证。PhotoMesh 仍是预览版，请勿让它成为重要照片的唯一副本。
 
 1. **安装 Git 和 Node.js。** 从 [Git for Windows](https://git-scm.com/download/win) 安装 Git；从 [Node.js 下载页](https://nodejs.org/en/download) 安装 Node.js 22.12 或更新的 22.x。安装后重新打开 PowerShell，运行 `git --version` 和 `node --version` 确认可用。
-2. **安装 pnpm。** Node.js 自带 Corepack 时执行 `corepack enable`，然后执行 `corepack prepare pnpm@11.0.0 --activate`。运行 `pnpm --version`；仓库声明的包管理器版本优先，若版本不匹配就按根目录 `package.json` 的 `packageManager` 字段安装对应版本。
+2. **安装 pnpm。** Node.js 自带 Corepack 时执行 `corepack enable`，然后执行 `corepack prepare pnpm@11.25.0 --activate`。运行 `pnpm --version`；仓库声明的包管理器版本优先，若版本不匹配就按根目录 `package.json` 的 `packageManager` 字段安装对应版本。
 3. **下载源码。** 初学者可在 [PhotoMesh GitHub 仓库](https://github.com/LingBrian/PhotoMesh) 点击绿色 **Code → Download ZIP**，解压到例如 `D:\PhotoMesh\PhotoMesh`。也可用 Git：
 
 ```powershell
@@ -66,7 +66,7 @@ Invoke-RestMethod http://127.0.0.1:8443/v1/health
 
 ### 终端连接步骤
 
-先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Pre-release 的 Windows 安装包；下载同一版本的 `SHA256SUMS`，在 PowerShell 用 `Get-FileHash .\PhotoMesh-版本号-windows-x64.exe -Algorithm SHA256` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
+先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Pre-release 的 Windows 安装包；下载同一版本的 `SHA256SUMS`，在 PowerShell 用 `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
 
 1. **打开客户端。** 在节点电脑启动 Agent；再从开始菜单打开 PhotoMesh，或在仓库根目录另开 PowerShell 运行 `pnpm --filter @photomesh/web dev`，并打开终端打印的本地地址。
 2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把节点运行时的 `PHOTOMESH_ADMIN_TOKEN` 填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。
@@ -75,26 +75,6 @@ Invoke-RestMethod http://127.0.0.1:8443/v1/health
 5. **验证和撤销。** 两端在配对页确认可信节点状态。完成验证后，撤销设备并确认它不再能读取图库索引；撤销不会远程删除对端此前缓存的数据。Android 上传目前使用管理员令牌，不能把它交给不受信任设备；详见 [Android 客户端说明](docs/modules/apps/mobile/README.md)。
 
 先在同一台电脑验证连接，再考虑跨设备网络。不要把 `8443` 管理 API 映射到公网或不可信 LAN。P2P 配对只保护节点间通道，不为管理 HTTP API 提供 TLS。
-
-Windows 上准备 Node.js 22.12+ 和 pnpm 11，将 Agent 数据目录与照片目录分开，并只授权需要扫描的外部根目录：
-
-```powershell
-$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
-$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"family-photos","libraryId":"family","path":"D:\\Photos","pathStyle":"win32"}]'
-pnpm install --frozen-lockfile
-pnpm --filter @photomesh/node-agent build
-pnpm --filter @photomesh/node-agent start
-```
-
-Agent 对外部照片目录只读，数据库与上传文件写入独立数据目录。服务默认监听本机地址；不要把未配置 TLS/认证的 HTTP API 暴露到 LAN 或公网。Docker 双节点演练、NAS 限制和完整配置见[部署与预发布教程](docs/预发布发布流程.md)及 [Docker 部署说明](docs/modules/deploy/docker/README.md)。
-
-## 终端连接教程
-
-1. 在已运行的节点创建短期配对邀请。
-2. 客户端扫描邀请二维码；若 mDNS 不可用，可手动填写节点的私有 IP。
-3. 核对对端密钥身份后由节点管理员批准，再按图库授予最小只读权限。
-
-详见 [LAN 安全配对教程](docs/operations/LAN安全配对.md)。Android 首次授权、网络策略、任务队列和后台限制见 [Android 客户端教程](docs/modules/apps/mobile/README.md)。
 
 ## 本地开发
 
