@@ -19,6 +19,63 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 
 ## 节点部署教程
 
+### 从下载开始：Windows 首次部署
+
+以下步骤先用空的测试照片目录验证。PhotoMesh 仍是预览版，请勿让它成为重要照片的唯一副本。
+
+1. **安装 Git 和 Node.js。** 从 [Git for Windows](https://git-scm.com/download/win) 安装 Git；从 [Node.js 下载页](https://nodejs.org/en/download) 安装 Node.js 22.12 或更新的 22.x。安装后重新打开 PowerShell，运行 `git --version` 和 `node --version` 确认可用。
+2. **安装 pnpm。** Node.js 自带 Corepack 时执行 `corepack enable`，然后执行 `corepack prepare pnpm@11.0.0 --activate`。运行 `pnpm --version`；仓库声明的包管理器版本优先，若版本不匹配就按根目录 `package.json` 的 `packageManager` 字段安装对应版本。
+3. **下载源码。** 初学者可在 [PhotoMesh GitHub 仓库](https://github.com/LingBrian/PhotoMesh) 点击绿色 **Code → Download ZIP**，解压到例如 `D:\PhotoMesh\PhotoMesh`。也可用 Git：
+
+```powershell
+git clone https://github.com/LingBrian/PhotoMesh.git D:\PhotoMesh\PhotoMesh
+Set-Location D:\PhotoMesh\PhotoMesh
+```
+
+4. **准备独立的数据目录和测试图库。** 数据目录放数据库、上传文件和运行状态；外部原图目录仅用于只读扫描。先创建空测试目录，绝不要把整块磁盘设为扫描根目录：
+
+```powershell
+New-Item -ItemType Directory -Force D:\PhotoMesh\agent-data | Out-Null
+New-Item -ItemType Directory -Force D:\PhotoMesh\sample-photos | Out-Null
+$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
+$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"demo-photos","libraryId":"demo","path":"D:\\PhotoMesh\\sample-photos","pathStyle":"win32"}]'
+$env:PHOTOMESH_ADMIN_TOKEN = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+```
+
+5. **安装依赖并构建节点。** 在仓库根目录运行。首次安装需要联网下载依赖，完成后再启动：
+
+```powershell
+Set-Location D:\PhotoMesh\PhotoMesh
+pnpm install --frozen-lockfile
+pnpm --filter @photomesh/node-agent build
+```
+
+6. **启动节点。** 在当前 PowerShell 窗口运行；保持窗口打开。默认 API 仅监听本机 `127.0.0.1:8443`：
+
+```powershell
+pnpm --filter @photomesh/node-agent start
+```
+
+7. **确认服务和扫描结果。** 另开一个 PowerShell 窗口，在同一机器请求健康检查；服务启动窗口应显示监听地址和扫描初始化状态：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8443/v1/health
+```
+
+看到健康响应后再添加少量可丢弃的测试图片到 `sample-photos`，确认扫描仅建立索引，不会修改源文件。按 `Ctrl+C` 正常停止。每次新开窗口都要重新设置 `$env:` 变量；密钥和令牌不要提交到 Git、截图或日志。
+
+### 终端连接步骤
+
+当前客户端通过设置页连接节点 API；首次验证建议在同一台 Windows 电脑打开 Web 客户端，避免先开放 LAN 端口：
+
+1. 节点运行时，在仓库根目录另开 PowerShell 执行 `pnpm --filter @photomesh/web dev`，按终端提示打开本地开发地址。
+2. 打开 **设置 → 节点设置**，节点地址填写 `http://127.0.0.1:8443`，管理员令牌填写启动节点时设置的 `PHOTOMESH_ADMIN_TOKEN`，保存后返回时间线确认图库列表可读取。
+3. 在 **设置 → 配对** 点击创建邀请，向另一台 PhotoMesh 节点传递短期二维码/邀请数据。邀请约 2 分钟失效且只能使用一次；通过可信渠道当面扫描或传递，不要贴到公开聊天或 Issue。
+4. 若客户端与节点在不同设备，先确保双方位于受信任的私有网络，并按 [LAN 安全配对教程](docs/operations/LAN安全配对.md) 为节点显式配置私有地址和防火墙。二维码中的身份密钥用于验证节点；mDNS/IP 只负责发现地址。
+5. 管理员在主机本地批准待配对设备，并仅授权需要的图库。撤销后用该设备重新请求索引，应得到拒绝响应。当前 Android 端的上传凭据仍使用管理员令牌，不适合发给不受信任设备；详见 [Android 客户端说明](docs/modules/apps/mobile/README.md)。
+
+不要把 `8443` 管理 API 映射到公网或不可信 LAN。需要跨设备访问 UI 时，应先部署带 TLS 和认证的可信反向代理；局域网 P2P 配对本身不为 HTTP API 提供 TLS。
+
 Windows 上准备 Node.js 22.12+ 和 pnpm 11，将 Agent 数据目录与照片目录分开，并只授权需要扫描的外部根目录：
 
 ```powershell
