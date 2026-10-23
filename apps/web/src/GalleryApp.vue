@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import './gallery.css';
+import { isInsecureApiEndpointError, normalizeApiBase } from './transport-security';
 
 type Library = { libraryId: string; title: string };
 type Asset = {
@@ -59,7 +60,7 @@ const visibleEnd = computed(() => Math.min(filteredAssets.value.length, visibleS
 const visibleAssets = computed(() => filteredAssets.value.slice(visibleStart.value, visibleEnd.value));
 const topSpacer = computed(() => visibleStart.value * rowHeight);
 const bottomSpacer = computed(() => Math.max(0, (filteredAssets.value.length - visibleEnd.value) * rowHeight));
-const apiBase = computed(() => endpoint.value.trim().replace(/\/+$/, ''));
+const apiBase = computed(() => normalizeApiBase(endpoint.value));
 
 function headers() { return { authorization: `Bearer ${token.value.trim()}` }; }
 async function request<T>(path: string, init: NonNullable<Parameters<typeof fetch>[1]> = {}): Promise<T> {
@@ -207,7 +208,10 @@ async function saveTagAndAlbum(): Promise<void> {
   }
   tagInput.value = ''; selectedAsset.value = null;
 }
-function errorText(cause: unknown): string { return cause instanceof Error ? cause.message : t('gallery.unknownError'); }
+function errorText(cause: unknown): string {
+  if (isInsecureApiEndpointError(cause)) return t('gallery.secureConnectionRequired');
+  return cause instanceof Error ? cause.message : t('gallery.unknownError');
+}
 function formatDate(value: string | null): string { return value ? new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : t('gallery.unknownDate'); }
 function formatSize(bytes: number): string { return new Intl.NumberFormat(locale.value, { style: 'unit', unit: 'byte', unitDisplay: 'narrow', notation: bytes > 1_000_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(bytes); }
 function changeSection(value: typeof section.value): void { section.value = value; if (value === 'recycle') void loadRecycleBin(); }
@@ -354,6 +358,13 @@ async function idbClear(store: string): Promise<void> {
               {{ busy ? t('gallery.connecting') : t('gallery.connect') }}<span aria-hidden="true">→</span>
             </button>
           </form>
+          <div
+            v-if="error"
+            class="notice error-notice"
+            role="alert"
+          >
+            {{ error }}
+          </div>
           <p class="privacy-note">⌑ {{ t('gallery.credentialNote') }}</p>
         </div>
         <template v-else-if="section === 'timeline'">
