@@ -19,95 +19,24 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 
 ## 节点部署教程
 
-### 首选：下载预构建 Node Agent（Linux x86_64）
+### 一键安装节点（Windows x64 / Linux x64）
 
-发布工作流会提供已编译镜像 `PhotoMesh-<版本>-node-agent-linux-amd64.docker.tar`。这是 Linux x86_64 的 Docker 镜像归档，不需要在 NAS 上下载源码、安装 Node.js 或编译。ARM64 NAS 暂无对应镜像；Windows 原生 Node Agent 也暂无独立安装包。
+普通使用者应下载预构建节点包，无需下载源码或在目标设备编译。到 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Pre-release 的平台安装脚本：
 
-1. 在 Linux x86_64 主机安装并启动 Docker Engine。检查 `docker version` 和 `docker info` 能正常返回。
-2. 到 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载同一 Pre-release 中的 `node-agent-linux-amd64.docker.tar` 和 `SHA256SUMS.txt`。确认版本号一致。
-3. 计算归档 SHA-256，并确认该值出现在清单中；不匹配就停止，不要导入：
-   
-   ```sh
-   sha256sum PhotoMesh-*-node-agent-linux-amd64.docker.tar
-   grep '<上一步输出的SHA256>' SHA256SUMS.txt
-   ```
+1. **Windows x64：** 下载 `install.bat` 到一个新文件夹，双击运行。脚本会定位最新预发布，下载匹配的 `install.ps1`、Node Agent ZIP 和 `SHA256SUMS.txt`，校验 SHA-256 后安装内含 Node.js runtime 的节点包。
+2. **Linux x64：** 下载同一预发布里的 `install.sh`，执行 `chmod +x install.sh && ./install.sh`。脚本下载匹配版本的节点包和校验清单，验 hash 后解压并启动。
+3. **首次运行：** 脚本会提示管理员令牌。留空会生成一次性令牌并显示；请保存到密码管理器。可选输入一个要只读扫描的照片目录；留空则先不扫描照片。服务默认只监听本机 `127.0.0.1:8443)，在本机验证健康接口：`curl http://127.0.0.1:8443/v1/health`。Windows 用 `Invoke-RestMethod http://127.0.0.1:8443/v1/health`。
+4. 节点在前台运行，关闭窗口或按 Ctrl+C 会停止。Windows 数据目录为 `%LOCALAPPDATA%\PhotoMesh\data`；Linux 默认是 `~/.local/share/photomesh`。保存管理员令牌，重启后需重新输入相同令牌。
+5. Linux 节点身份密钥依赖 Secret Service。无可用 Secret Service 时，节点仍可启动本机 API，但安全配对/P2P 会关闭；不要把宿主机完整 D-Bus 会话暴露给不可信容器。
+6. 当前发布包仅为 x64/amd64；没有 ARM64 NAS 包。先用合成照片验证，预览版不要作为唯一原图副本。
 
-4. 导入已构建镜像并确认镜像标签：
-   
-   ```sh
-   docker load -i PhotoMesh-<版本>-node-agent-linux-amd64.docker.tar
-   docker image ls photomesh/node-agent
-   ```
+### Linux Docker 镜像（可选）
 
-5. 创建一个仅供 PhotoMesh 使用的 Docker volume，再用本地回环方式启动。下面命令不会挂载你的照片目录，也不会让 API 监听 LAN：
-   
-   ```sh
-   docker volume create photomesh-node-data
-   export PHOTOMESH_ADMIN_TOKEN="$(openssl rand -base64 32)"
-   docker run -d --name photomesh-node --restart unless-stopped --network host \
-     -e PORT=8443 -e PHOTOMESH_DATA_DIR=/data \
-     -e PHOTOMESH_API_BIND_ADDRESS=127.0.0.1 \
-     -e PHOTOMESH_ADMIN_TOKEN \
-     -v photomesh-node-data:/data \
-     photomesh/node-agent:<版本>
-   ```
-
-6. 在这台 Linux 主机上运行 `curl http://127.0.0.1:8443/v1/health`。查看启动信息用 `docker logs photomesh-node`；停止服务用 `docker stop photomesh-node`。服务重启后继续使用同一 named volume，切勿删除含有正式数据的 volume。
-
-该镜像当前为 Linux x86_64 预览构建。Linux 节点身份密钥需要可用的 Secret Service；没有可用密钥服务时，配对/P2P 会关闭，不能视为完整 NAS 节点部署。不要把宿主机完整 D-Bus 会话暴露给不可信容器。此镜像尚未通过 ARM64、NAS 生产环境和密钥服务集成验收。真实照片目录挂载、LAN API、备份恢复及生产运行前，请先完成专门部署评估。
-
-### Windows 原生运行（开发/测试路径）
-
-目前没有独立 Windows Node Agent 安装包，因此 Windows 原生运行需要源码和 Node.js。下面步骤只适合本机预览与测试；如果目标是发布中的构建产物，优先用上面的 Linux x86_64 镜像。
-
-### 从下载开始：Windows 首次部署
-
-以下步骤先用空的测试照片目录验证。PhotoMesh 仍是预览版，请勿让它成为重要照片的唯一副本。
-
-1. **安装 Git 和 Node.js。** 从 [Git for Windows](https://git-scm.com/download/win) 安装 Git；从 [Node.js 下载页](https://nodejs.org/en/download) 安装 Node.js 22.12 或更新的 22.x。安装后重新打开 PowerShell，运行 `git --version` 和 `node --version` 确认可用。
-2. **安装 pnpm。** Node.js 自带 Corepack 时执行 `corepack enable`，然后执行 `corepack prepare pnpm@11.25.0 --activate`。运行 `pnpm --version`；仓库声明的包管理器版本优先，若版本不匹配就按根目录 `package.json` 的 `packageManager` 字段安装对应版本。
-3. **下载源码。** 初学者可在 [PhotoMesh GitHub 仓库](https://github.com/LingBrian/PhotoMesh) 点击绿色 **Code → Download ZIP**，解压到例如 `D:\PhotoMesh\PhotoMesh`。也可用 Git：
-
-```powershell
-git clone https://github.com/LingBrian/PhotoMesh.git D:\PhotoMesh\PhotoMesh
-Set-Location D:\PhotoMesh\PhotoMesh
-```
-
-4. **准备独立的数据目录和测试图库。** 数据目录放数据库、上传文件和运行状态；外部原图目录仅用于只读扫描。先创建空测试目录，绝不要把整块磁盘设为扫描根目录：
-
-```powershell
-New-Item -ItemType Directory -Force D:\PhotoMesh\agent-data | Out-Null
-New-Item -ItemType Directory -Force D:\PhotoMesh\sample-photos | Out-Null
-$env:PHOTOMESH_DATA_DIR = 'D:\PhotoMesh\agent-data'
-$env:PHOTOMESH_EXTERNAL_ROOTS = '[{"rootId":"demo-photos","libraryId":"demo","path":"D:\\PhotoMesh\\sample-photos","pathStyle":"win32"}]'
-$env:PHOTOMESH_ADMIN_TOKEN = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-```
-
-5. **安装依赖并构建节点。** 在仓库根目录运行。首次安装需要联网下载依赖，完成后再启动：
-
-```powershell
-Set-Location D:\PhotoMesh\PhotoMesh
-pnpm install --frozen-lockfile
-pnpm --filter @photomesh/node-agent build
-```
-
-6. **启动节点。** 在当前 PowerShell 窗口运行；保持窗口打开。默认 API 仅监听本机 `127.0.0.1:8443`：
-
-```powershell
-pnpm --filter @photomesh/node-agent start
-```
-
-7. **确认服务和扫描结果。** 另开一个 PowerShell 窗口，在同一机器请求健康检查；服务启动窗口应显示监听地址和扫描初始化状态：
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8443/v1/health
-```
-
-看到健康响应后再添加少量可丢弃的测试图片到 `sample-photos`，确认扫描仅建立索引，不会修改源文件。按 `Ctrl+C` 正常停止。每次新开窗口都要重新设置 `$env:` 变量；密钥和令牌不要提交到 Git、截图或日志。
+发布包也提供 `PhotoMesh-<版本>-node-agent-linux-amd64.docker.tar`。下载后运行 `docker load -i <镜像归档>`，然后用专用数据卷启动。详细命令、回滚与网络边界见[部署与预发布教程](docs/预发布发布流程.md)。
 
 ### 终端连接步骤
 
-先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Pre-release 的 Windows 安装包；下载同一版本的 `SHA256SUMS`，在 PowerShell 用 `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
+先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Windows x64 桌面安装包（`PhotoMesh-<版本>-windows-x64-unsigned.exe`）；下载同一版本的 `SHA256SUMS.txt`，在 PowerShell 用 `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
 
 1. **打开客户端。** 在节点电脑启动 Agent；再从开始菜单打开 PhotoMesh，或在仓库根目录另开 PowerShell 运行 `pnpm --filter @photomesh/web dev`，并打开终端打印的本地地址。
 2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把节点运行时的 `PHOTOMESH_ADMIN_TOKEN` 填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。
