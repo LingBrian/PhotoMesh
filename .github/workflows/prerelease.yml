@@ -170,7 +170,7 @@ jobs:
           retention-days: 30
 
   build-windows:
-    name: Build signed Windows desktop installers
+    name: Build Windows desktop installers
     needs: [validate, gate]
     runs-on: windows-latest
     timeout-minutes: 180
@@ -198,46 +198,22 @@ jobs:
           $installers = Get-ChildItem -LiteralPath $bundleRoot -File -Recurse | Where-Object { $_.Extension -in @('.msi', '.exe') }
           if (-not $installers) { throw 'No Windows installer was produced.' }
           $installers | ForEach-Object { Write-Output "Unsigned installer ready: $($_.FullName) ($($_.Length) bytes)." }
-      - name: Sign and verify Windows installers
+      - name: Package unsigned Windows installer
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $bundleRoot = 'apps/desktop/src-tauri/target/release/bundle'
-          $installers = Get-ChildItem -LiteralPath $bundleRoot -File -Recurse | Where-Object { $_.Extension -in @('.msi', '.exe') }
-          if (-not $installers) { throw 'No Windows installer is available to sign.' }
+          $bundleRoot = 'apps/desktop/src-tauri/target/release/bundle/nsis'
+          $installers = @(Get-ChildItem -LiteralPath $bundleRoot -Filter '*.exe' -File -ErrorAction Stop)
+          if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($installers.Count)." }
           $out = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Write-Output 'Creating an ephemeral Windows signing certificate.'
-          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=PhotoMesh CI prerelease' -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10)
-          $password = [guid]::NewGuid().ToString('N')
-          Write-Output "::add-mask::$password"
-          $securePassword = ConvertTo-SecureString -String $password -Force -AsPlainText
-          $pfx = Join-Path $env:RUNNER_TEMP 'photomesh-windows-rc.pfx'
-          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $securePassword | Out-Null
-          $publicCert = Join-Path $out "PhotoMesh-$env:VERSION-windows-signing-certificate.cer"
-          Export-Certificate -Cert $cert -FilePath $publicCert | Out-Null
-          Import-Certificate -FilePath $publicCert -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
-          $kits = [Environment]::GetFolderPath('ProgramFilesX86')
-          $sdkBinRoot = Join-Path $kits 'Windows Kits\10\bin'
-          Write-Output "Looking for x64 signtool.exe in SDK version folders under $sdkBinRoot."
-          $signtoolPath = Get-ChildItem -LiteralPath $sdkBinRoot -Directory -ErrorAction Stop |
-            Sort-Object Name -Descending |
-            ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
-            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-            Select-Object -First 1
-          if (-not $signtoolPath) { throw 'Windows SDK x64 signtool.exe was not found in version folders.' }
-          Write-Output "Using signtool.exe at $signtoolPath."
-          foreach ($installer in $installers) {
-            Write-Output "Signing $($installer.Name)."
-            & $signtoolPath sign /fd SHA256 /f $pfx /p $password $installer.FullName
-            if ($LASTEXITCODE -ne 0) { throw "Signing failed for $($installer.Name)." }
-            Write-Output "Verifying signature for $($installer.Name)."
-            & $signtoolPath verify /pa /v $installer.FullName
-            if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $($installer.Name)." }
-            Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $out "PhotoMesh-$env:VERSION-windows-x64$($installer.Extension)")
-          }
+          $destination = Join-Path $out "PhotoMesh-$env:VERSION-windows-x64-unsigned.exe"
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $destination
+          $hash = Get-FileHash -LiteralPath $destination -Algorithm SHA256
+          Write-Output "Unsigned Windows NSIS installer ready: $destination ($((Get-Item -LiteralPath $destination).Length) bytes)."
+          Write-Output "SHA-256: $($hash.Hash)"
       - uses: actions/upload-artifact@v4
         with:
           name: photomesh-${{ needs.validate.outputs.version }}-windows
@@ -279,9 +255,11 @@ jobs:
           {
             cat "release-assets/review/CHANGELOG.md"
             echo
-            echo "## Preview signing"
+            echo "## Windows installer signature"
             echo
-            echo "Android and Windows installers use one-time CI signing identities. They are cryptographically signed but are not signed by a trusted commercial publisher. The Android signing identity changes per candidate; uninstall an earlier preview before installing a newer one."
+            echo "The Windows NSIS installer is unsigned because this project does not yet have a trusted code-signing certificate. Windows may show an unknown-publisher or SmartScreen warning. Verify the download against SHA256SUMS.txt before installing, and use a test device."
+            echo
+            echo "The Android APK uses a one-time CI signing identity that changes per candidate; uninstall an earlier preview before installing a newer one."
             echo
             echo "Verify downloaded files against SHA256SUMS.txt and the GitHub build provenance attestation."
           } > release-assets/RELEASE_NOTES.md
