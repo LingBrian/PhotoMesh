@@ -280,6 +280,39 @@ describe('P2P signed event synchronization', () => {
       .get(b.identity.peerId, event.eventId)).toBeUndefined();
   });
 
+  it('rejects malformed response cursors before acknowledging durable outbox events', async () => {
+    const a = await createNode();
+    const b = await createNode();
+    await trustEachOther(a, b);
+    await indexAsset(a, 'malformed-cursor-asset');
+
+    const malformedResponseTransport = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) => {
+      const response = await b.sync.handleExchange(a.identity.peerId, request);
+      return { ...response, cursors: [{ libraryId: 'family', authorPeerId: a.identity.peerId, sequence: -1 }] };
+    } };
+
+    await expect(a.sync.syncWithPeer(b.identity.peerId, malformedResponseTransport, 1)).rejects.toThrow('invalid sync response');
+    expect(a.syncRepository.getAcknowledgedCursors(b.identity.peerId)).toEqual([]);
+    expect(a.database.prepare('SELECT count(*) AS count FROM sync_outbox WHERE peer_id = ?').get(b.identity.peerId)).toEqual({ count: 1 });
+    expect(b.syncRepository.getProjection('family', 'malformed-cursor-asset')).toBeDefined();
+  });
+
+  it('rejects oversized response cursor arrays before acknowledging durable outbox events', async () => {
+    const a = await createNode();
+    const b = await createNode();
+    await trustEachOther(a, b);
+    await indexAsset(a, 'oversized-cursor-asset');
+    const cursor = { libraryId: 'family', authorPeerId: a.identity.peerId, sequence: 1 };
+    const oversizedResponseTransport = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) => {
+      const response = await b.sync.handleExchange(a.identity.peerId, request);
+      return { ...response, cursors: Array.from({ length: 4097 }, () => cursor) };
+    } };
+
+    await expect(a.sync.syncWithPeer(b.identity.peerId, oversizedResponseTransport, 1)).rejects.toThrow('invalid sync response');
+    expect(a.syncRepository.getAcknowledgedCursors(b.identity.peerId)).toEqual([]);
+    expect(a.database.prepare('SELECT count(*) AS count FROM sync_outbox WHERE peer_id = ?').get(b.identity.peerId)).toEqual({ count: 1 });
+  });
+
   it('retries an offered event until a durable acknowledgement cursor is returned', async () => {
     const a = await createNode();
     const b = await createNode();

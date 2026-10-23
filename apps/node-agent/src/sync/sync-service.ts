@@ -154,8 +154,10 @@ export class SyncService {
       if (response.agreedProtocol !== negotiation.protocol || response.schemaVersion !== negotiation.schemaVersion) {
         throw new SyncProtocolConflictError('peer returned an inconsistent protocol negotiation');
       }
-      if (!isStringArray(response.grantedLibraryIds, 256) || !Array.isArray(response.cursors) || !Array.isArray(response.events) ||
-          response.events.length > SYNC_BATCH_LIMIT) throw new SyncProtocolConflictError('invalid sync response');
+      if (!isStringArray(response.grantedLibraryIds, 256) || !Array.isArray(response.cursors) || response.cursors.length > 4096 ||
+          !response.cursors.every(isCursor) || !Array.isArray(response.events) || response.events.length > SYNC_BATCH_LIMIT) {
+        throw new SyncProtocolConflictError('invalid sync response');
+      }
       this.repository.setRemoteLibraries(peerId, response.grantedLibraryIds);
       this.repository.acknowledgeCursors(peerId, response.cursors);
       for (const rawEvent of response.events) {
