@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -43,6 +43,42 @@ describe('managed upload filesystem', () => {
     expect(await store.publishNoReplace('staging/other/assembled.tmp', 'objects/session/original.blob')).toBe('exists');
     const root = roots.at(-1)!;
     expect(await readFile(join(root, 'objects/session/original.blob'), 'utf8')).toBe('part-bytes');
+  });
+
+  it('rejects managed operations whose parent junction escapes the storage root', async () => {
+    const store = await createStore();
+    const root = roots.at(-1)!;
+    const outside = await mkdtemp(join(tmpdir(), `photomesh-managed-test-${process.pid}-outside-`));
+    roots.push(outside);
+    await mkdir(join(root, 'staging'), { recursive: true });
+    await mkdir(join(outside, 'subtree'));
+    await symlink(outside, join(root, 'staging/redirect'), 'junction');
+    await writeFile(join(outside, 'secret.bin'), 'protected');
+    await writeFile(join(outside, 'flush.bin'), 'protected');
+    await writeFile(join(outside, 'remove.bin'), 'protected');
+    await writeFile(join(outside, 'subtree/secret.bin'), 'protected');
+    await store.writeExclusive('staging/publish.tmp', new TextEncoder().encode('publish'));
+    await store.writeExclusive('staging/assemble-source.tmp', new TextEncoder().encode('assemble'));
+
+    const outcomes = await Promise.allSettled([
+      store.writeExclusive('staging/redirect/created.bin', new TextEncoder().encode('outside')),
+      store.flush('staging/redirect/flush.bin'),
+      store.publishNoReplace('staging/publish.tmp', 'staging/redirect/published.bin'),
+      store.assembleAndHash(['staging/assemble-source.tmp'], 'staging/redirect/assembled.bin'),
+      store.hashFile('staging/redirect/secret.bin'),
+      store.openReadStream('staging/redirect/secret.bin'),
+      store.exists('staging/redirect/secret.bin'),
+      store.remove('staging/redirect/remove.bin'),
+      store.removeTree('staging/redirect/subtree')
+    ]);
+
+    expect(outcomes.map(({ status }) => status)).toEqual(Array.from({ length: 9 }, () => 'rejected'));
+    expect(await readFile(join(outside, 'flush.bin'), 'utf8')).toBe('protected');
+    expect(await readFile(join(outside, 'remove.bin'), 'utf8')).toBe('protected');
+    expect(await readFile(join(outside, 'subtree/secret.bin'), 'utf8')).toBe('protected');
+    await expect(readFile(join(outside, 'created.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(outside, 'published.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(outside, 'assembled.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('rejects traversal and absolute storage references', async () => {
