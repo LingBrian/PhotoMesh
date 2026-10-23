@@ -279,18 +279,41 @@ export class ExternalScanService {
       }
     }));
     const authorizedRoots = allCanonicalRoots.filter((item): item is { item: AuthorizedExternalRoot; real: string } => item !== undefined);
-    const visitFile = async (displayPath: string): Promise<void> => {
+    const isAuthorizedPath = (target: string): boolean => authorizedRoots.some(({ item, real }) =>
+      isWithin(pathOps(item.pathStyle), real, target, item.caseSensitive ?? item.pathStyle !== 'win32'));
+    const sameCanonicalPath = (left: string, right: string): boolean =>
+      isWithin(ops, left, right, caseSensitive) && isWithin(ops, right, left, caseSensitive);
+    const visitFile = async (displayPath: string, authorizedTarget?: string): Promise<void> => {
       let before: ExternalStat;
       try {
-        before = await this.options.fileSystem.stat(displayPath);
-        if (before.kind !== 'file') return;
+        const readPath = authorizedTarget ?? await this.options.fileSystem.realpath(displayPath);
+        if (!isAuthorizedPath(readPath)) {
+          result.issues.push({ code: 'symlink_escape' });
+          result.offline += this.setKnownAvailabilityWithin(previous, displayPath, 'offline', ops, caseSensitive);
+          result.complete = false;
+          return;
+        }
+        before = await this.options.fileSystem.stat(readPath);
+        if (before.kind !== 'file') {
+          result.issues.push({ code: 'unstable_file' });
+          result.complete = false;
+          return;
+        }
         const hash = createHash('sha256');
         let byteSize = 0;
-        for await (const chunk of this.options.fileSystem.readChunks(displayPath)) {
+        for await (const chunk of this.options.fileSystem.readChunks(readPath)) {
           hash.update(chunk);
           byteSize += chunk.byteLength;
         }
-        const after = await this.options.fileSystem.stat(displayPath);
+        const after = await this.options.fileSystem.stat(readPath);
+        const currentTarget = await this.options.fileSystem.realpath(displayPath);
+        if (!sameCanonicalPath(currentTarget, readPath)) {
+          const currentTargetAuthorized = isAuthorizedPath(currentTarget);
+          result.issues.push({ code: currentTargetAuthorized ? 'unstable_file' : 'symlink_escape' });
+          if (!currentTargetAuthorized) result.offline += this.setKnownAvailabilityWithin(previous, displayPath, 'offline', ops, caseSensitive);
+          result.complete = false;
+          return;
+        }
         if (before.identity !== after.identity || before.size !== after.size || before.modifiedAt !== after.modifiedAt || byteSize !== after.size) {
           result.issues.push({ code: 'unstable_file' });
           result.complete = false;
@@ -322,11 +345,18 @@ export class ExternalScanService {
       }
     };
 
-    const visitDirectory = async (displayPath: string, ancestors: ReadonlySet<string>): Promise<void> => {
-      result.directories.push(displayPath);
+    const visitDirectory = async (displayPath: string, ancestors: ReadonlySet<string>, authorizedPath?: string): Promise<void> => {
       let names: string[];
       try {
-        names = await this.options.fileSystem.readdir(displayPath);
+        const readPath = authorizedPath ?? await this.options.fileSystem.realpath(displayPath);
+        if (!isAuthorizedPath(readPath)) {
+          result.issues.push({ code: 'symlink_escape' });
+          result.offline += this.setKnownAvailabilityWithin(previous, displayPath, 'offline', ops, caseSensitive);
+          result.complete = false;
+          return;
+        }
+        result.directories.push(readPath);
+        names = await this.options.fileSystem.readdir(readPath);
       } catch (error) {
         result.issues.push({ code: isPermissionError(error) ? 'permission_denied' : 'io_error' });
         result.complete = false;
@@ -394,7 +424,7 @@ export class ExternalScanService {
             }
             continue;
           }
-          const authorized = authorizedRoots.some(({ item, real }) => isWithin(pathOps(item.pathStyle), real, target, item.caseSensitive ?? item.pathStyle !== 'win32'));
+          const authorized = isAuthorizedPath(target);
           if (!authorized) {
             result.issues.push({ code: 'symlink_escape' });
             result.offline += this.setKnownAvailabilityWithin(previous, candidate, 'offline', ops, caseSensitive);
@@ -427,8 +457,8 @@ export class ExternalScanService {
               result.complete = false;
               continue;
             }
-            await visitDirectory(candidate, new Set([...ancestors, target]));
-          } else if (targetStat.kind === 'file') await visitFile(candidate);
+            await visitDirectory(candidate, new Set([...ancestors, target]), target);
+          } else if (targetStat.kind === 'file') await visitFile(candidate, target);
         } else if (stat.kind === 'directory') {
           const target = await this.options.fileSystem.realpath(candidate).catch(() => candidate);
           if (ancestors.has(target)) {
@@ -442,7 +472,7 @@ export class ExternalScanService {
       }
     };
 
-    await visitDirectory(displayRoot, new Set([canonicalRoot]));
+    await visitDirectory(displayRoot, new Set([canonicalRoot]), canonicalRoot);
     if (result.complete) {
       for (const location of previous) {
         if (isWithin(ops, displayRoot, location.originalPath, caseSensitive) && !seen.has(location.originalPath) && location.availability !== 'missing') {

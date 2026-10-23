@@ -232,6 +232,62 @@ describe('external read-only directory scanning', () => {
     ]));
   });
 
+  it('does not index an unauthorized target if an approved symlink is retargeted after authorization', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addDirectory('/approved'); fs.addDirectory('/private');
+    fs.addFile('/approved/linked.jpg', 'approved-content'); fs.addFile('/private/secret.jpg', 'secret-content');
+    fs.addSymlink('/photos/approved-link.jpg', '/approved/linked.jpg');
+    const originalStat = fs.stat.bind(fs);
+    let retargeted = false;
+    fs.stat = async (path: string) => {
+      const value = await originalStat(path);
+      if (path === '/approved/linked.jpg' && !retargeted) {
+        fs.addSymlink('/photos/approved-link.jpg', '/private/secret.jpg');
+        retargeted = true;
+      }
+      return value;
+    };
+    const repository = new FakeRepository();
+    const service = new ExternalScanService({ nodeId: 'node-1', roots: [root(), { ...root('/approved'), rootId: 'approved' }],
+      fileSystem: fs, repository });
+
+    const results = await service.scanAll();
+
+    expect(results[0]?.issues.map(({ code }) => code)).toContain('symlink_escape');
+    expect([...repository.rows.values()].map(({ record }) => record.originalPath)).toEqual(['/approved/linked.jpg']);
+  });
+
+  it('does not enumerate a symlink directory after it is retargeted outside the allowlist', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addDirectory('/approved'); fs.addDirectory('/private');
+    fs.addFile('/approved/linked.jpg', 'approved-content'); fs.addFile('/private/secret.jpg', 'secret-content');
+    fs.addSymlink('/photos/approved-alias', '/approved');
+    const originalStat = fs.stat.bind(fs);
+    let retargeted = false;
+    fs.stat = async (path: string) => {
+      const value = await originalStat(path);
+      if (path === '/approved' && !retargeted) {
+        fs.addSymlink('/photos/approved-alias', '/private');
+        retargeted = true;
+      }
+      return value;
+    };
+    const originalReaddir = fs.readdir.bind(fs);
+    const listedPaths: string[] = [];
+    fs.readdir = async (path: string) => {
+      listedPaths.push(await fs.realpath(path));
+      return originalReaddir(path);
+    };
+    const repository = new FakeRepository();
+    const service = new ExternalScanService({ nodeId: 'node-1', roots: [root(), { ...root('/approved'), rootId: 'approved' }],
+      fileSystem: fs, repository });
+
+    await service.scanAll();
+
+    expect(listedPaths).not.toContain('/private');
+    expect([...repository.rows.values()].map(({ record }) => record.originalPath)).not.toContain('/photos/approved-alias/secret.jpg');
+  });
+
   it('marks a path missing when it vanishes between listing and stat', async () => {
     const fs = new VirtualExternalFileSystem(); fs.addDirectory('/photos'); fs.addFile('/photos/a.jpg', 'a');
     const { service, repository } = setup(root(), fs);
