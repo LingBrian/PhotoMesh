@@ -19,24 +19,31 @@ PhotoMesh is a self-hosted, decentralized photo library. Each node keeps its own
 
 ## Node deployment
 
-### One-click node install (Windows x64 / Linux x64)
+### Use prebuilt node packages (Windows x64 / Linux x64)
 
-For normal use, install the prebuilt node package; you do not need to download source or compile on the target device. From [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), download the installer script from the latest Pre-release:
+Download the built node package; you do not need to install Node.js or compile source on the target computer. Choose the package and `SHA256SUMS.txt` from the same version on [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases).
 
-1. **Windows x64:** Download `install.bat` into a new folder and double-click it. It finds the latest prerelease, downloads the matching `install.ps1`, Node Agent ZIP, and `SHA256SUMS.txt`, verifies the SHA-256, then installs the package with its bundled Node.js runtime.
-2. **Linux x64:** Download `install.sh` from the same prerelease and run `chmod +x install.sh && ./install.sh`. It downloads the matching node package and checksum manifest, verifies the hash, extracts, and starts it.
-3. **First run:** The script prompts for an administrator token. Leave it blank to generate a one-time token; save the displayed value in a password manager. Optionally enter an external photo directory to scan read-only; leave blank to skip. The API listens on local `127.0.0.1:8443` by default. Verify locally with `curl http://127.0.0.1:8443/v1/health`; on Windows use `Invoke-RestMethod http://127.0.0.1:8443/v1/health`.
-4. The node runs in the foreground; closing its window or pressing Ctrl+C stops it. Windows data is stored under `%LOCALAPPDATA%\PhotoMesh\data`; Linux uses `~/.local/share/photomesh` by default. Save the token securely and enter the same token again after restarting.
-5. Linux node identity keys require Secret Service. Without it, the local API can start but secure pairing/P2P is unavailable. Do not expose the host's full D-Bus session to an untrusted container.
-6. Current release packages are x64/amd64 only; there is no ARM64 NAS package. Validate with synthetic photos first and do not use a preview build as the only copy of originals.
-
+1. **Download and verify.** Windows: `PhotoMesh-<version>-node-agent-windows-x64.zip`. Linux: `PhotoMesh-<version>-node-agent-linux-x64.tar.gz`. Verify the archive against its matching SHA-256 entry before extracting.
+2. **Windows extraction and start.** In File Explorer, right-click the ZIP and select **Extract All**. Open the extracted folder and run `start.bat`. On first run, the launcher prompts for an administrator token. Leave it blank to generate a one-time token, then save the displayed token in a password manager.
+3. **Linux extraction and start.** If the archive is in the current directory, run:
+   ```sh
+   mkdir -p "$HOME/.local/opt/photomesh/node-agent/<version>"
+   tar -xzf PhotoMesh-<version>-node-agent-linux-x64.tar.gz -C "$HOME/.local/opt/photomesh/node-agent/<version>"
+   cd "$HOME/.local/opt/photomesh/node-agent/<version>"
+   ./start.sh
+   ```
+   Set an administrator token when prompted; leaving it blank generates a one-time token. Save it securely.
+4. **Optional external source.** The launcher can accept an external photo directory for read-only scanning. Leave it blank to skip scanning. Do not place PhotoMesh data inside an external source directory.
+5. **Confirm the service.** The Agent runs in the foreground; close its window or press Ctrl+C to stop it. The API listens on local `127.0.0.1:8443` by default. From another terminal, check Windows with `Invoke-RestMethod http://127.0.0.1:8443/v1/health` or Linux with `curl http://127.0.0.1:8443/v1/health`.
+6. Windows data defaults to `%LOCALAPPDATA%\PhotoMesh\data`; Linux defaults to `~/.local/share/photomesh`. Enter the same administrator token after restart. Linux node identity keys require Secret Service; secure pairing/P2P is disabled when it is unavailable.
+7. Node packages currently support x64/amd64 only; there is no ARM64 NAS package. Validate with synthetic photos first and do not use a preview build as the only copy of originals.
 ### Optional Linux Docker image
 
 The release also provides `PhotoMesh-<version>-node-agent-linux-amd64.docker.tar`. Load it with `docker load -i <image-archive>` and run it with a dedicated data volume. See the [deployment and prerelease guide](docs/预发布发布流程.md) for commands, rollback, and network boundaries.
 
 ### Connect a client device
 
-Download the latest Windows x64 desktop installer (`PhotoMesh-<version>-windows-x64-unsigned.exe`) from [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), and download that release's `SHA256SUMS.txt`. Verify it in PowerShell with `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` before installing. The current installer is unsigned; continue only on a test computer if Windows displays a security warning. If no release asset is available, use the source download and local Web development steps above.
+Download the latest Windows x64 desktop installer (`PhotoMesh-<version>-windows-x64-unsigned.exe`) from [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), and download that release's `SHA256SUMS.txt`. Verify it in PowerShell with `$asset = Get-ChildItem . -Filter '*windows-x64-unsigned.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS.txt -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` before installing. The current installer is unsigned; continue only on a test computer if Windows displays a security warning. If no release asset is available, use the source download and local Web development steps above.
 
 1. **Open the client.** Start the Agent on its node computer, then launch PhotoMesh from the Start menu. Or, from the repository root, run `pnpm --filter @photomesh/web dev` in another PowerShell and open the local URL printed in the terminal.
 2. **Enter the node URL and token.** Open **Settings → Node settings**. On the same computer, enter `http://127.0.0.1:8443`. For a node on another computer, use its private LAN IP (for example `http://192.168.1.20:8443`), and expose the HTTP API across devices only behind a trusted TLS reverse proxy. Enter the node's `PHOTOMESH_ADMIN_TOKEN`, click **Save and connect**, and confirm the status is online and the library list loads. Give this token only to trusted administrator devices.
