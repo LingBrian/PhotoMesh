@@ -310,7 +310,8 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
       UploadJobState.needsPermission => 'needsPermission',
       UploadJobState.failed => 'failed',
     };
-    return '${_s(key)}${job.errorCode == null ? '' : ' · ${job.errorCode}'}';
+    final errorText = localizedUploadError(Localizations.localeOf(context).languageCode, job.errorCode);
+    return '${_s(key)}${errorText.isEmpty ? '' : ' · $errorText'}';
   }
 
   @override

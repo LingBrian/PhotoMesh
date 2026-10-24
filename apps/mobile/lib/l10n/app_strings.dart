@@ -8,6 +8,8 @@ const appStrings = <String, Map<String, String>>{
     'manualOnly': '仅手动', 'queue': '本机上传任务', 'uploadNow': '现在上传队列', 'retry': '重试',
     'queued': '等待中', 'uploading': '传输中', 'paused': '已暂停，可续传', 'completed': '已完成（SHA-256 已核对）',
     'needsPermission': '需要相册权限', 'failed': '失败', 'empty': '暂无上传任务',
+    'permissionRevoked': '照片访问权限已撤销。任务已保留；重新授权后可继续。',
+    'sourceUnavailable': '无法访问媒体源；请检查权限或该项目是否仍存在。',
     'backgroundNotice': 'Android 会按电量、待机和网络条件调度后台任务。系统可能延迟、停止或在重启后重新安排任务；自动扫描与上传不保证实时。打开应用或点“现在上传队列”可立即尝试。',
     'httpNotice': '出于令牌安全，正式构建只连接 HTTPS 节点。HTTP 仅在调试构建中用于本机或 Android 模拟器宿主。',
     'authNotice': '当前 Node Agent 上传 API 只接受管理员令牌，尚无按设备/图库授权的上传凭据。请勿把令牌存入共享设备；多设备正式部署前需完成服务端权限接口。',
@@ -27,6 +29,8 @@ const appStrings = <String, Map<String, String>>{
     'manualOnly': 'Manual only', 'queue': 'Local upload queue', 'uploadNow': 'Upload queue now', 'retry': 'Retry',
     'queued': 'Queued', 'uploading': 'Uploading', 'paused': 'Paused; can resume', 'completed': 'Complete (SHA-256 verified)',
     'needsPermission': 'Photo permission needed', 'failed': 'Failed', 'empty': 'No upload jobs',
+    'permissionRevoked': 'Photo access was revoked. The job is kept and can resume after access is restored.',
+    'sourceUnavailable': 'The media source is unavailable. Check photo access or whether the item still exists.',
     'backgroundNotice': 'Android schedules background work according to battery, idle, and network conditions. It may delay or stop tasks and reschedule them after restart. Automatic scan and upload are not real-time guarantees. Open the app or tap “Upload queue now” to try immediately.',
     'httpNotice': 'For token safety, release builds connect only to HTTPS nodes. HTTP is allowed only in debug builds for localhost or the Android emulator host.',
     'authNotice': 'The current Node Agent upload API accepts only an administrator token; scoped per-device/library upload credentials are not available yet. Do not store this token on a shared device. Complete server-side authorization before deploying this for multiple devices.',
@@ -40,3 +44,14 @@ const appStrings = <String, Map<String, String>>{
 };
 
 String appString(String languageCode, String key) => appStrings[languageCode]?[key] ?? appStrings['en']![key] ?? key;
+
+String localizedUploadError(String languageCode, String? errorCode) {
+  if (errorCode == null || errorCode.isEmpty) return '';
+  final key = switch (errorCode) {
+    'PERMISSION_REVOKED' => 'permissionRevoked',
+    'SOURCE_UNAVAILABLE' => 'sourceUnavailable',
+    'SOURCE_CHANGED' => 'sourceChanged',
+    _ => null,
+  };
+  return key == null ? errorCode : appString(languageCode, key);
+}
