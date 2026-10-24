@@ -15,6 +15,11 @@ import 'upload_job.dart';
 import 'upload_queue.dart';
 import 'upload_service.dart';
 
+String combineManualSelectionStatus({required String? queueStatus, required String selectionSummary}) {
+  if (queueStatus == null || queueStatus == selectionSummary) return selectionSummary;
+  return '$queueStatus\n$selectionSummary';
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const PhotoMeshApp());
@@ -264,6 +269,12 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
     if (mounted) setState(() => _status = message);
     await _refreshQueue();
     await _processQueue(manual: true);
+    if (mounted && result.skipped > 0) {
+      setState(() => _status = combineManualSelectionStatus(
+            queueStatus: _status,
+            selectionSummary: message,
+          ));
+    }
   }
 
   Future<void> _processQueue({bool manual = false}) async {

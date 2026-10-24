@@ -73,6 +73,35 @@ describe('MediaVersionService', () => {
     }
   });
 
+  it('coalesces same-key retries when preflight holds the last queue slot', async () => {
+    const harness = await createHarness({ maxPendingVersions: 1, maxConcurrentPreflights: 1 });
+    let releaseInspect!: () => void;
+    const inspectGate = new Promise<void>((resolve) => { releaseInspect = resolve; });
+    vi.mocked(harness.transformer.inspect).mockImplementation(async () => {
+      await inspectGate;
+      return { format: 'jpeg', width: 2, height: 3, pages: 1 };
+    });
+
+    const input = request('capacity-retry-key-0123');
+    const first = harness.service.createVersion('library', 'asset', input, 'local-admin');
+    try {
+      await vi.waitFor(() => expect(harness.transformer.inspect).toHaveBeenCalledTimes(1));
+      const retry = harness.service.createVersion('library', 'asset', input, 'local-admin');
+      await expect(harness.service.createVersion('library', 'asset', {
+        ...input, transform: { ...transform, rotation: 180 }
+      }, 'local-admin')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+      expect(harness.openOriginal).toHaveBeenCalledTimes(1);
+      releaseInspect();
+      const [created, replayed] = await Promise.all([first, retry]);
+      expect(replayed.versionId).toBe(created.versionId);
+      await harness.service.waitForIdle();
+    } finally {
+      releaseInspect();
+      await first;
+      await harness.service.waitForIdle();
+    }
+  });
+
   it('bounds pending transforms while preserving idempotent retries', async () => {
     const harness = await createHarness({ maxPendingVersions: 1 });
     let releaseTransform: (() => void) | undefined;

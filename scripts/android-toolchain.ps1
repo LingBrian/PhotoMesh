@@ -1,3 +1,25 @@
+function Get-PhotoMeshHomeDrivePath {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$HomePath,
+    [string]$PathRoot
+  )
+
+  $root = if ($PSBoundParameters.ContainsKey('PathRoot')) { $PathRoot } else { [System.IO.Path]::GetPathRoot($HomePath) }
+  if ($root -match '^[A-Za-z]:') {
+    $homeDrive = $root.Substring(0, 2)
+  } elseif ($root -match '^\\\\[^\\/?]+\\[^\\/?]+\\?$') {
+    $homeDrive = $root.TrimEnd([char]92)
+  } else {
+    return $null
+  }
+
+  [PSCustomObject]@{
+    HomeDrive = $homeDrive
+    HomePath = $HomePath.Substring($homeDrive.Length)
+  }
+}
+
 function Get-PhotoMeshAndroidToolchain {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$RepositoryRoot)
@@ -54,10 +76,10 @@ function Get-PhotoMeshAndroidToolchain {
   $null = New-Item -ItemType Directory -Path $localHome -Force
   $env:HOME = $localHome
   $env:USERPROFILE = $localHome
-  $homeRoot = [System.IO.Path]::GetPathRoot($localHome)
-  if ($homeRoot -match '^[A-Za-z]:') {
-    $env:HOMEDRIVE = $homeRoot.Substring(0, 2)
-    $env:HOMEPATH = $localHome.Substring($env:HOMEDRIVE.Length)
+  $homeVariables = Get-PhotoMeshHomeDrivePath -HomePath $localHome
+  if ($null -ne $homeVariables) {
+    $env:HOMEDRIVE = $homeVariables.HomeDrive
+    $env:HOMEPATH = $homeVariables.HomePath
   } else {
     Remove-Item Env:HOMEDRIVE -ErrorAction SilentlyContinue
     Remove-Item Env:HOMEPATH -ErrorAction SilentlyContinue
