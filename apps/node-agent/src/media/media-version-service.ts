@@ -172,7 +172,7 @@ export class MediaVersionService {
   }
 
   private reserveAdmission(): void {
-    const pending = this.queue.length + this.active.size + this.pendingAdmissions;
+    const pending = this.repository.countStagingMediaVersions() + this.pendingAdmissions;
     if (this.pendingAdmissions >= this.maxConcurrentPreflights || pending >= this.maxPendingVersions) {
       throw new MediaVersionError('QUEUE_FULL');
     }

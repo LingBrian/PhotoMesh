@@ -584,6 +584,11 @@ export class SqliteRepository implements UploadRepository {
     return result.changes === 1;
   }
 
+  countStagingMediaVersions(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM media_versions WHERE status = 'staging'").get() as { count: number };
+    return row.count;
+  }
+
   listStagingMediaVersions(): MediaVersionRecord[] {
     const rows = this.db.prepare("SELECT * FROM media_versions WHERE status = 'staging' ORDER BY created_at, version_id")
       .all() as MediaVersionSqlRow[];

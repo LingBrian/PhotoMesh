@@ -149,6 +149,7 @@ describe('SQLite repository and migrations', () => {
       assetId: 'asset-1', sourceVersionId: null, sha256: 'a'.repeat(64), availability: 'online', mimeType: null
     });
     expect(repository.listStagingMediaVersions().map((version) => version.versionId)).toEqual(['version-1']);
+    expect(repository.countStagingMediaVersions()).toBe(1);
     expect(repository.getMediaVersionByIdempotency('library-1', 'local-admin', '0123456789abcdef')?.versionId).toBe('version-1');
     expect(repository.getMediaVersionSource('library-1', 'asset-1', 'version-1')).toBeUndefined();
     expect(repository.markMediaVersionReady('version-1', {
@@ -165,6 +166,7 @@ describe('SQLite repository and migrations', () => {
       availability: 'online', mimeType: 'image/jpeg'
     });
     expect(repository.listStagingMediaVersions()).toHaveLength(0);
+    expect(repository.countStagingMediaVersions()).toBe(0);
     expect(repository.listMediaVersions('library-1', 'asset-1')).toHaveLength(1);
     expect(() => db.prepare('UPDATE media_versions SET source_sha256 = ? WHERE version_id = ?').run('e'.repeat(64), 'version-1')).toThrow();
     expect(() => db.prepare('UPDATE media_versions SET output_sha256 = ? WHERE version_id = ?').run('e'.repeat(64), 'version-1')).toThrow();
