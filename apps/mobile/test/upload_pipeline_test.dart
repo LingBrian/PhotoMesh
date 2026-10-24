@@ -77,7 +77,7 @@ void main() {
     final result = await queueSelectedPhotos<int>([1, 2, 3, 4], (id) async {
       visited.add(id);
       if (id == 2) throw FileSystemException('permission revoked');
-      if (id == 3) throw const PlatformException(code: 'permission_revoked');
+      if (id == 3) throw PlatformException(code: 'permission_revoked');
       return id == 1 ? _job([1, 2, 3]) : null;
     });
 
