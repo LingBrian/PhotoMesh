@@ -4,5 +4,11 @@ node_modules
 **/coverage
 .git
 .turbo
+# Repo-local SDKs and emulator state are not part of the Node agent image.
+android/
+apps/mobile/.dart_tool/
+apps/mobile/build/
+apps/mobile/android/.gradle/
+apps/mobile/android/app/build/
 data
 **/data

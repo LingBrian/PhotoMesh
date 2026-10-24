@@ -31,7 +31,14 @@ function compose(args) {
   }
   const wslComposeFile = composeFile.replace(/^([A-Za-z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`).replaceAll('\\', '/');
   const distro = process.env.PHOTOMESH_DOCKER_WSL_DISTRO ?? 'Debian';
-  return execFileSync('wsl.exe', ['-d', distro, '--', 'docker', 'compose', '-p', composeProject, '-f', wslComposeFile, ...args], {
+  const composeEnvironment = [
+    'PHOTOMESH_WINDOWS_SIM_PORT',
+    'PHOTOMESH_NAS_SIM_PORT',
+    'PHOTOMESH_WINDOWS_SIM_IP',
+    'PHOTOMESH_NAS_SIM_IP',
+    'PHOTOMESH_SYNC_SUBNET'
+  ].flatMap((name) => process.env[name] === undefined ? [] : [`${name}=${process.env[name]}`]);
+  return execFileSync('wsl.exe', ['-d', distro, '--', 'env', ...composeEnvironment, 'docker', 'compose', '-p', composeProject, '-f', wslComposeFile, ...args], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit']
   }).trim();
 }
