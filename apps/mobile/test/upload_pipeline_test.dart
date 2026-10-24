@@ -427,7 +427,7 @@ void main() {
     expect(uploaded, bytes);
     expect(completeRequests, 1);
     expect(createRequests, 1);
-    expect(permissionChecks, 3);
+    expect(permissionChecks, 4);
     expect(resolverCalls, 2);
     service.close();
   });
