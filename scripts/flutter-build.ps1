@@ -1,10 +1,13 @@
 param([string]$Target = 'apk')
 $ErrorActionPreference = 'Stop'
-$mobileDir = Join-Path $PSScriptRoot '..\apps\mobile'
+$repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'android-toolchain.ps1')
+$toolchain = Get-PhotoMeshAndroidToolchain -RepositoryRoot $repoRoot
+$mobileDir = Join-Path $repoRoot 'apps\mobile'
 Push-Location $mobileDir
 try {
-  flutter pub get
-  flutter build $Target
+  Invoke-PhotoMeshFlutter -FlutterCommand $toolchain.FlutterCommand -Arguments @('pub', 'get')
+  Invoke-PhotoMeshFlutter -FlutterCommand $toolchain.FlutterCommand -Arguments @('build', $Target)
 } finally {
   Pop-Location
 }

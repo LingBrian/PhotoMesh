@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { link, mkdir, open, realpath, rm, stat, unlink } from 'node:fs/promises';
+import { lstat, link, mkdir, open, realpath, rm, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export type StorageFailureCode = 'ENOSPC' | 'EIO' | 'ENOENT' | 'EEXIST' | 'EPERM';
@@ -30,19 +30,13 @@ export class NodeUploadFileSystem implements UploadFileSystem {
   }
 
   async openReadStream(path: string) {
-    const candidate = this.resolveManagedPath(path);
-    const [root, actual] = await Promise.all([realpath(this.root), realpath(candidate)]);
-    const fromRoot = relative(root, actual);
-    if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
-      throw new Error('managed storage symlink escapes storage root');
-    }
-    if (!(await stat(actual)).isFile()) throw new Error('managed media is not a regular file');
+    const actual = await this.resolveExistingFile(path);
     return createReadStream(actual);
   }
 
   async writeExclusive(path: string, bytes: Uint8Array): Promise<void> {
     const absolutePath = this.resolveManagedPath(path);
-    await mkdir(dirname(absolutePath), { recursive: true });
+    await this.ensureSafeParents(path, true);
     const handle = await open(absolutePath, 'wx', 0o600);
     try {
       await handle.writeFile(bytes);
@@ -56,7 +50,8 @@ export class NodeUploadFileSystem implements UploadFileSystem {
   }
 
   async flush(path: string): Promise<void> {
-    const handle = await open(this.resolveManagedPath(path), 'r+');
+    const safePath = await this.resolveExistingFile(path);
+    const handle = await open(safePath, 'r+');
     try {
       await handle.sync();
     } finally {
@@ -65,9 +60,9 @@ export class NodeUploadFileSystem implements UploadFileSystem {
   }
 
   async publishNoReplace(temporaryPath: string, finalPath: string): Promise<'created' | 'exists'> {
-    const temporaryAbsolute = this.resolveManagedPath(temporaryPath);
+    const temporaryAbsolute = await this.resolveExistingFile(temporaryPath);
     const finalAbsolute = this.resolveManagedPath(finalPath);
-    await mkdir(dirname(finalAbsolute), { recursive: true });
+    await this.ensureSafeParents(finalPath, true);
     try {
       await link(temporaryAbsolute, finalAbsolute);
     } catch (error) {
@@ -84,14 +79,14 @@ export class NodeUploadFileSystem implements UploadFileSystem {
 
   async assembleAndHash(sourcePaths: readonly string[], destinationPath: string): Promise<FileDigest> {
     const destination = this.resolveManagedPath(destinationPath);
-    await mkdir(dirname(destination), { recursive: true });
+    await this.ensureSafeParents(destinationPath, true);
     const output = await open(destination, 'wx', 0o600);
     const hash = createHash('sha256');
     let byteLength = 0;
     let position = 0;
     try {
       for (const sourcePath of sourcePaths) {
-        const source = createReadStream(this.resolveManagedPath(sourcePath));
+        const source = await this.openReadStream(sourcePath);
         for await (const value of source) {
           const chunk = value as Buffer;
           hash.update(chunk);
@@ -117,7 +112,7 @@ export class NodeUploadFileSystem implements UploadFileSystem {
   async hashFile(path: string): Promise<FileDigest> {
     const hash = createHash('sha256');
     let byteLength = 0;
-    const stream = createReadStream(this.resolveManagedPath(path));
+    const stream = await this.openReadStream(path);
     for await (const value of stream) {
       const chunk = value as Buffer;
       byteLength += chunk.byteLength;
@@ -128,7 +123,7 @@ export class NodeUploadFileSystem implements UploadFileSystem {
 
   async exists(path: string): Promise<boolean> {
     try {
-      await stat(this.resolveManagedPath(path));
+      await this.resolveExistingFile(path);
       return true;
     } catch (error) {
       if (isCode(error, 'ENOENT')) return false;
@@ -137,11 +132,60 @@ export class NodeUploadFileSystem implements UploadFileSystem {
   }
 
   async remove(path: string): Promise<void> {
-    await rm(this.resolveManagedPath(path), { force: true });
+    const absolute = this.resolveManagedPath(path);
+    await this.ensureSafeParents(path, false);
+    const entry = await lstat(absolute).catch((error: unknown) => {
+      if (isCode(error, 'ENOENT')) return undefined;
+      throw error;
+    });
+    if (!entry) return;
+    if (entry.isSymbolicLink()) throw new Error('managed storage symlinks are not allowed');
+    await rm(absolute, { force: true });
   }
 
   async removeTree(path: string): Promise<void> {
-    await rm(this.resolveManagedPath(path), { recursive: true, force: true });
+    const absolute = this.resolveManagedPath(path);
+    await this.ensureSafeParents(path, false);
+    const entry = await lstat(absolute).catch((error: unknown) => {
+      if (isCode(error, 'ENOENT')) return undefined;
+      throw error;
+    });
+    if (!entry) return;
+    if (entry.isSymbolicLink()) throw new Error('managed storage symlinks are not allowed');
+    await rm(absolute, { recursive: true, force: true });
+  }
+
+  private async ensureSafeParents(path: string, create: boolean): Promise<void> {
+    const absolute = this.resolveManagedPath(path);
+    await mkdir(this.root, { recursive: true });
+    const rootReal = await realpath(this.root);
+    const parent = dirname(absolute);
+    const relativeParent = relative(this.root, parent);
+    const segments = relativeParent ? relativeParent.split(sep) : [];
+    let current = this.root;
+    for (const segment of segments) {
+      current = join(current, segment);
+      const entry = await lstat(current).catch(async (error: unknown) => {
+        if (!create || !isCode(error, 'ENOENT')) throw error;
+        await mkdir(current, { mode: 0o700 }).catch((mkdirError: unknown) => {
+          if (!isCode(mkdirError, 'EEXIST')) throw mkdirError;
+        });
+        return lstat(current);
+      });
+      if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error('managed storage parent must be a real directory');
+      const actual = await realpath(current);
+      assertUnderRoot(rootReal, actual);
+    }
+  }
+
+  private async resolveExistingFile(path: string): Promise<string> {
+    const absolute = this.resolveManagedPath(path);
+    await this.ensureSafeParents(path, false);
+    const entry = await lstat(absolute);
+    if (entry.isSymbolicLink() || !entry.isFile()) throw new Error('managed media is not a regular file');
+    const actual = await realpath(absolute);
+    assertUnderRoot(await realpath(this.root), actual);
+    return actual;
   }
 
   private resolveManagedPath(path: string): string {
@@ -153,6 +197,13 @@ export class NodeUploadFileSystem implements UploadFileSystem {
     const fromRoot = relative(this.root, resolved);
     if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) throw new Error('managed storage reference escapes storage root');
     return join(this.root, fromRoot);
+  }
+}
+
+function assertUnderRoot(root: string, candidate: string): void {
+  const fromRoot = relative(root, candidate);
+  if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error('managed storage symlink escapes storage root');
   }
 }
 

@@ -34,6 +34,7 @@ class UploadService {
     http.Client? client,
     UploadFileAccess fileAccess = const IoUploadFileAccess(),
     ResolveUploadSource? resolveSource,
+    Future<bool> Function()? galleryPermissionAllowed,
     Future<bool> Function()? networkAllowed,
     Duration requestTimeout = const Duration(seconds: 30),
     int chunkBytes = uploadChunkBytes,
@@ -42,6 +43,7 @@ class UploadService {
         _client = client ?? http.Client(),
         _files = fileAccess,
         _resolveSource = resolveSource,
+        _galleryPermissionAllowed = galleryPermissionAllowed,
         _networkAllowed = networkAllowed,
         _requestTimeout = requestTimeout,
         _chunkBytes = chunkBytes;
@@ -51,6 +53,7 @@ class UploadService {
   final http.Client _client;
   final UploadFileAccess _files;
   final ResolveUploadSource? _resolveSource;
+  final Future<bool> Function()? _galleryPermissionAllowed;
   final Future<bool> Function()? _networkAllowed;
   final Duration _requestTimeout;
   final int _chunkBytes;
@@ -64,7 +67,10 @@ class UploadService {
       final resolvedPath = await _resolveSource?.call(job);
       if (resolvedPath != null) current = current.copyWith(filePath: resolvedPath);
       if (resolvedPath == null && job.assetId != null && _resolveSource != null) {
-        return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: 'SOURCE_UNAVAILABLE'));
+        final permissionCheck = _galleryPermissionAllowed;
+        final permissionRevoked = permissionCheck != null && !await permissionCheck();
+        final errorCode = permissionRevoked ? 'PERMISSION_REVOKED' : 'SOURCE_UNAVAILABLE';
+        return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: errorCode));
       }
       if (await _files.length(current.filePath) != current.totalBytes) {
         return await _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SOURCE_CHANGED'));
@@ -102,7 +108,13 @@ class UploadService {
       final sessionResponse = await _client.get(_uri(node, '/v1/uploads/$sessionId'), headers: headers).timeout(_requestTimeout);
       _expectSuccess(sessionResponse, {200});
       final session = jsonDecode(sessionResponse.body) as Map<String, dynamic>;
-      if (session['state'] == 'completed') return await _completeAndConfirm(node, headers, current, sessionId);
+      if (session['state'] == 'completed') {
+        final permissionError = await _galleryPermissionError(current);
+        if (permissionError != null) {
+          return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: permissionError));
+        }
+        return await _completeAndConfirm(node, headers, current, sessionId);
+      }
       var offset = session['offset'] as int;
       if (offset < 0 || offset > current.totalBytes || (offset != current.totalBytes && offset % _chunkBytes != 0)) {
         return await _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SERVER_OFFSET_INVALID'));
@@ -113,6 +125,11 @@ class UploadService {
       while (offset < current.totalBytes) {
         if (_networkAllowed != null && !await _networkAllowed()) {
           return await _save(current.copyWith(state: UploadJobState.paused, errorCode: 'NETWORK_POLICY_BLOCKED'));
+        }
+        // An active chunk cannot be interrupted; recheck before reading the next one.
+        final permissionError = await _galleryPermissionError(current);
+        if (permissionError != null) {
+          return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: permissionError));
         }
         final end = min(offset + _chunkBytes, current.totalBytes);
         final bytes = await _readRange(current.filePath, offset, end);
@@ -133,6 +150,10 @@ class UploadService {
         current = current.copyWith(offset: offset);
         await _queue.save(current);
       }
+      final permissionError = await _galleryPermissionError(current);
+      if (permissionError != null) {
+        return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: permissionError));
+      }
       return await _completeAndConfirm(node, headers, current, sessionId);
     } on SocketException {
       return _save(current.copyWith(state: UploadJobState.paused, errorCode: 'NETWORK_UNAVAILABLE'));
@@ -146,6 +167,15 @@ class UploadService {
       final state = error.statusCode == 507 || error.statusCode >= 500 ? UploadJobState.paused : UploadJobState.failed;
       return _save(current.copyWith(state: state, errorCode: 'HTTP_${error.statusCode}'));
     }
+  }
+
+  Future<String?> _galleryPermissionError(UploadJob job) async {
+    if (job.assetId == null) return null;
+    final permissionCheck = _galleryPermissionAllowed;
+    if (permissionCheck != null) return await permissionCheck() ? null : 'PERMISSION_REVOKED';
+    final sourceResolver = _resolveSource;
+    if (sourceResolver != null && await sourceResolver(job) == null) return 'SOURCE_UNAVAILABLE';
+    return null;
   }
 
   Future<UploadJob> _completeAndConfirm(BoundNode node, Map<String, String> headers, UploadJob job, String sessionId) async {

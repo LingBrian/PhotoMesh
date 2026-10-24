@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
+import { GalleryPreviewError, loadAssetPreview, type GalleryPreviewErrorCode } from './gallery-preview.js';
+import { createMediaVersion, getMediaVersion, isTerminalVersionStatus, loadMediaVersions, loadVersionContent, normalizeCrop, type VersionCollection } from './gallery-versions.js';
 import './gallery.css';
 
 type Library = { libraryId: string; title: string };
@@ -35,11 +37,30 @@ const tags = ref<Record<string, string[]>>({});
 const albums = ref<Album[]>([]);
 const activeAlbum = ref('');
 const selectedAsset = ref<Asset | null>(null);
+const previewAsset = ref<Asset | null>(null);
+const previewUrl = ref('');
+const previewBusy = ref(false);
+const previewErrorCode = ref<GalleryPreviewErrorCode | null>(null);
+const mediaVersionsEnabled = ref(false);
+const versions = ref<VersionCollection | null>(null);
+const versionsBusy = ref(false);
+const versionError = ref('');
+const crop = ref({ x: 0, y: 0, width: 1, height: 1 });
+const sourceVersionId = ref('');
+let versionGeneration = 0;
+let versionPreviewRequestId = 0;
+const pendingIdempotencyKeys = new Map<string, string>();
+const rotation = ref<0 | 90 | 180 | 270>(0);
+const versionPreviewUrl = ref('');
+const activeVersionId = ref('');
 const tagInput = ref('');
 const thumbnailUrls = ref<Record<string, string>>({});
+let previewGeneration = 0;
+let previewAbort: AbortController | undefined;
 let imageObserver: IntersectionObserver | undefined;
 let healthTimer: ReturnType<typeof setInterval> | undefined;
 let pageGeneration = 0;
+let suppressLibraryReload = false;
 const rowHeight = 164;
 const pageSize = 100;
 
@@ -68,13 +89,19 @@ async function request<T>(path: string, init: NonNullable<Parameters<typeof fetc
   return response.status === 204 ? undefined as T : await response.json() as T;
 }
 async function connect(): Promise<void> {
+  closePreview();
+  clearThumbnailUrls();
   error.value = ''; busy.value = true; connected.value = false;
   try {
     const health = await fetch(`${apiBase.value}/v1/health`);
     if (!health.ok) throw new Error(t('gallery.connectionFailed'));
+    const healthResult = await health.json() as { capabilities?: string[] };
+    mediaVersionsEnabled.value = healthResult.capabilities?.includes('mediaVersions') ?? false;
     const result = await request<{ items: Library[] }>('/v1/libraries');
     libraries.value = result.items;
+    suppressLibraryReload = true;
     libraryId.value = libraries.value[0]?.libraryId ?? '';
+    suppressLibraryReload = false;
     connected.value = true;
     await loadPage(true);
     await loadPeerList();
@@ -84,8 +111,8 @@ async function connect(): Promise<void> {
   finally { busy.value = false; }
 }
 async function checkHealth(): Promise<void> {
-  try { connected.value = (await fetch(`${apiBase.value}/v1/health`)).ok; }
-  catch { connected.value = false; }
+  try { const response = await fetch(`${apiBase.value}/v1/health`); connected.value = response.ok; if (response.ok) mediaVersionsEnabled.value = ((await response.json()) as { capabilities?: string[] }).capabilities?.includes('mediaVersions') ?? false; }
+  catch { connected.value = false; mediaVersionsEnabled.value = false; }
 }
 async function loadPage(reset = false): Promise<void> {
   if (!connected.value || !libraryId.value || busy.value && !reset) return;
@@ -106,7 +133,11 @@ async function loadPage(reset = false): Promise<void> {
 }
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 watch(search, () => { if (searchTimer) clearTimeout(searchTimer); searchTimer = setTimeout(() => void loadPage(true), 250); });
-watch(libraryId, () => { if (connected.value) void loadPage(true); });
+watch(libraryId, () => {
+  closePreview();
+  clearThumbnailUrls();
+  if (connected.value && !suppressLibraryReload) void loadPage(true);
+}, { flush: 'sync' });
 watch(theme, (value) => { document.documentElement.dataset.theme = value; }, { immediate: true });
 function onScroll(): void {
   scrollTop.value = scrollElement.value?.scrollTop ?? 0;
@@ -125,28 +156,162 @@ function observeImages(): void {
   });
 }
 watch(visibleAssets, observeImages);
+function thumbnailCacheKey(asset: Asset): string {
+  return `${apiBase.value}:${asset.libraryId}:${asset.originNodeId}:${asset.assetId}:${asset.version}`;
+}
+function clearThumbnailUrls(): void {
+  for (const url of Object.values(thumbnailUrls.value)) URL.revokeObjectURL(url);
+  thumbnailUrls.value = {};
+}
+
 async function ensureThumbnail(assetId: string): Promise<void> {
   if (thumbnailUrls.value[assetId]) return;
   const asset = assets.value.find((item) => item.assetId === assetId);
-  if (!asset || !['online', 'cached'].includes(asset.availability)) return;
-  const cacheKey = `${apiBase.value}:${asset.originNodeId}:${asset.assetId}:${asset.version}`;
+  if (!asset) return;
   try {
-    const cached = await idbGet<Blob>('thumbnails', cacheKey);
-    const thumbnail = cached ?? await (async () => {
-      const response = await fetch(`${apiBase.value}/v1/assets/${encodeURIComponent(asset.assetId)}/original`, { headers: headers() });
-      if (!response.ok) return undefined;
-      const original = await response.blob();
-      const bitmap = await createImageBitmap(original);
-      const scale = Math.min(360 / bitmap.width, 220 / bitmap.height, 1);
-      const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-      canvas.getContext('2d')?.drawImage(bitmap, 0, 0); bitmap.close();
-      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/webp', 0.78));
-      if (blob) await idbPut('thumbnails', { key: cacheKey, value: blob });
-      return blob ?? undefined;
-    })();
-    if (thumbnail) thumbnailUrls.value[assetId] = URL.createObjectURL(thumbnail);
-  } catch { /* An unavailable thumbnail never changes source status or the original. */ }
+    const cached = await idbGet<Blob>('thumbnails', thumbnailCacheKey(asset));
+    if (cached) thumbnailUrls.value[assetId] = URL.createObjectURL(cached);
+  } catch { /* A cache miss never triggers an implicit original read. */ }
 }
+
+function clearVersionPreview(): void { versionPreviewRequestId += 1; if (versionPreviewUrl.value) URL.revokeObjectURL(versionPreviewUrl.value); versionPreviewUrl.value = ''; activeVersionId.value = ''; }
+function closePreview(): void {
+  clearVersionPreview();
+  versionGeneration += 1;
+  versions.value = null; versionsBusy.value = false; versionError.value = ''; crop.value = { x: 0, y: 0, width: 1, height: 1 }; sourceVersionId.value = ''; rotation.value = 0;
+  previewGeneration += 1;
+  previewAbort?.abort();
+  previewAbort = undefined;
+  if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
+  previewUrl.value = '';
+  previewAsset.value = null;
+  previewBusy.value = false;
+  previewErrorCode.value = null;
+}
+
+async function resizeImage(source: Blob, maxWidth: number, maxHeight: number): Promise<Blob> {
+  const bitmap = await createImageBitmap(source);
+  try {
+    const scale = Math.min(maxWidth / bitmap.width, maxHeight / bitmap.height, 1);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('canvas_unavailable');
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const output = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/webp', 0.82));
+    if (!output) throw new Error('image_encode_failed');
+    return output;
+  } finally { bitmap.close(); }
+}
+
+async function openPreview(asset: Asset): Promise<void> {
+  closePreview();
+  const generation = ++previewGeneration;
+  const controller = new AbortController();
+  previewAbort = controller;
+  previewAsset.value = asset;
+  if (mediaVersionsEnabled.value) void loadVersions();
+  previewBusy.value = true;
+  await nextTick();
+  if (generation !== previewGeneration) return;
+  document.querySelector<HTMLElement>('.preview-dialog')?.focus();
+  try {
+    const original = await loadAssetPreview({ apiBase: apiBase.value, token: token.value, asset, signal: controller.signal });
+    if (generation !== previewGeneration) return;
+    const view = await resizeImage(original, 1600, 1200);
+    if (generation !== previewGeneration) return;
+    const thumbnail = await resizeImage(view, 360, 220);
+    if (generation !== previewGeneration) return;
+    await idbPut('thumbnails', { key: thumbnailCacheKey(asset), value: thumbnail });
+    if (generation !== previewGeneration) return;
+    const oldThumbnailUrl = thumbnailUrls.value[asset.assetId];
+    if (oldThumbnailUrl) URL.revokeObjectURL(oldThumbnailUrl);
+    thumbnailUrls.value = { ...thumbnailUrls.value, [asset.assetId]: URL.createObjectURL(thumbnail) };
+    previewUrl.value = URL.createObjectURL(view);
+  } catch (cause) {
+    if (generation === previewGeneration && !controller.signal.aborted) {
+      previewErrorCode.value = cause instanceof GalleryPreviewError ? cause.code : 'unsupported-media';
+    }
+  } finally {
+    if (generation === previewGeneration) previewBusy.value = false;
+  }
+}
+
+function previewErrorMessage(code: GalleryPreviewErrorCode): string {
+  switch (code) {
+    case 'source-offline': return t('gallery.sourceOffline');
+    case 'preview-too-large': return t('gallery.previewTooLarge');
+    case 'unsupported-media': return t('gallery.previewUnsupported');
+    case 'unauthorized':
+    case 'asset-unavailable': return t('gallery.previewUnavailable');
+    case 'request-failed': return t('gallery.previewFailed');
+  }
+}
+
+async function loadVersions(): Promise<void> {
+  const asset = previewAsset.value; if (!asset || !mediaVersionsEnabled.value) return;
+  const generation = versionGeneration;
+  versionsBusy.value = true; versionError.value = '';
+  try {
+    const result = await loadMediaVersions(apiBase.value, token.value, libraryId.value, asset.assetId);
+    if (generation === versionGeneration && previewAsset.value === asset) versions.value = result;
+  } catch { if (generation === versionGeneration) versionError.value = t('gallery.versionsFailed'); }
+  finally { if (generation === versionGeneration) versionsBusy.value = false; }
+}
+function handleVersionSourceChange(): void {
+  if (sourceVersionId.value) {
+    void previewVersion(sourceVersionId.value);
+    return;
+  }
+  clearVersionPreview();
+}
+
+async function createVersion(): Promise<void> {
+  const asset = previewAsset.value; const collection = versions.value; const original = collection?.original;
+  if (!asset || !original || !mediaVersionsEnabled.value) return;
+  const generation = versionGeneration;
+  const selectedSource = sourceVersionId.value ? collection.items.find((item) => item.versionId === sourceVersionId.value && item.status.toLowerCase() === 'ready') : undefined;
+  const sourceSha256 = selectedSource?.outputSha256 ?? original.sha256;
+  if (!sourceSha256 || (sourceVersionId.value && !selectedSource)) return;
+  const coordinates = normalizeCrop(crop.value, rotation.value);
+  if (!coordinates) {
+    versionError.value = t('gallery.invalidCrop'); return;
+  }
+  const requestFingerprint = JSON.stringify([libraryId.value, asset.assetId, selectedSource?.versionId ?? null, sourceSha256, coordinates, rotation.value]);
+  const idempotencyKey = pendingIdempotencyKeys.get(requestFingerprint) ?? crypto.randomUUID();
+  pendingIdempotencyKeys.set(requestFingerprint, idempotencyKey);
+  versionsBusy.value = true; versionError.value = '';
+  try {
+    const accepted = await createMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, { sourceVersionId: selectedSource?.versionId ?? null, sourceSha256, transform: { crop: coordinates, rotation: rotation.value }, idempotencyKey });
+    let current = await getMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, accepted.versionId);
+    for (let attempt = 0; !isTerminalVersionStatus(current.status) && attempt < 120; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      if (generation !== versionGeneration || previewAsset.value !== asset) return;
+      current = await getMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, accepted.versionId);
+    }
+    if (generation !== versionGeneration || previewAsset.value !== asset) return;
+    versions.value = { ...collection, items: [current, ...collection.items.filter((item) => item.versionId !== current.versionId)] };
+    if (['ready', 'failed'].includes(current.status.toLowerCase())) pendingIdempotencyKeys.delete(requestFingerprint);
+    if (!isTerminalVersionStatus(current.status) || current.status.toLowerCase() !== 'ready') throw new Error('version-processing-failed');
+    await previewVersion(current.versionId);
+  } catch { if (generation === versionGeneration) versionError.value = t('gallery.versionCreateFailed'); }
+  finally { if (generation === versionGeneration) versionsBusy.value = false; }
+}
+async function previewVersion(versionId: string): Promise<void> {
+  const asset = previewAsset.value; if (!asset) return;
+  const generation = versionGeneration;
+  clearVersionPreview();
+  const requestId = ++versionPreviewRequestId;
+  try {
+    const blob = await loadVersionContent(apiBase.value, token.value, libraryId.value, asset.assetId, versionId);
+    if (generation !== versionGeneration || requestId !== versionPreviewRequestId || previewAsset.value !== asset) return;
+    const displayPreview = await resizeImage(blob, 1600, 1200);
+    if (generation !== versionGeneration || requestId !== versionPreviewRequestId || previewAsset.value !== asset) return;
+    activeVersionId.value = versionId; versionPreviewUrl.value = URL.createObjectURL(displayPreview);
+  } catch { if (generation === versionGeneration && requestId === versionPreviewRequestId && previewAsset.value === asset) { clearVersionPreview(); versionError.value = t('gallery.versionContentFailed'); } }
+}
+
 async function downloadOriginal(asset: Asset): Promise<void> {
   try {
     const response = await fetch(`${apiBase.value}/v1/assets/${encodeURIComponent(asset.assetId)}/original`, { headers: headers() });
@@ -157,9 +322,9 @@ async function downloadOriginal(asset: Asset): Promise<void> {
 }
 async function clearLocalCache(): Promise<void> {
   if (!window.confirm(t('gallery.clearCacheConfirm', { node: endpoint.value.trim() || t('gallery.currentNode') }))) return;
+  closePreview();
   await idbClear('thumbnails');
-  for (const url of Object.values(thumbnailUrls.value)) URL.revokeObjectURL(url);
-  thumbnailUrls.value = {};
+  clearThumbnailUrls();
   error.value = '';
 }
 async function loadRecycleBin(): Promise<void> {
@@ -214,7 +379,8 @@ function changeSection(value: typeof section.value): void { section.value = valu
 onMounted(() => { void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value; });
 onBeforeUnmount(() => {
   if (healthTimer) clearInterval(healthTimer); if (searchTimer) clearTimeout(searchTimer);
-  imageObserver?.disconnect(); for (const url of Object.values(thumbnailUrls.value)) URL.revokeObjectURL(url);
+  closePreview();
+  imageObserver?.disconnect(); clearThumbnailUrls();
 });
 
 function openDb(): Promise<IDBDatabase> {
@@ -420,19 +586,28 @@ async function idbClear(store: string): Promise<void> {
               class="asset-row"
               :data-asset-id="asset.assetId"
               tabindex="0"
-              @focus="selectedAsset = asset"
             >
               <div class="asset-preview">
-                <img
-                  v-if="thumbnailUrls[asset.assetId]"
-                  :src="thumbnailUrls[asset.assetId]"
-                  alt=""
-                ><span
-                  v-else
-                  class="preview-placeholder"
-                >{{ asset.kind === 'video' ? '▶' : '◇' }}</span><span
+                <button
+                  type="button"
+                  class="asset-preview-trigger"
+                  :aria-label="t('gallery.previewAsset', { filename: asset.filename })"
+                  :disabled="asset.kind !== 'photo' || !['online', 'cached'].includes(asset.availability)"
+                  @click="openPreview(asset)"
+                >
+                  <img
+                    v-if="thumbnailUrls[asset.assetId]"
+                    :src="thumbnailUrls[asset.assetId]"
+                    alt=""
+                  ><span
+                    v-else
+                    class="preview-placeholder"
+                    aria-hidden="true"
+                  >{{ asset.kind === 'video' ? '▶' : '◇' }}</span><span class="preview-trigger-label">{{ t('gallery.preview') }}</span>
+                </button><span
                   v-if="asset.kind === 'video'"
                   class="media-badge"
+                  aria-hidden="true"
                 >▶</span>
               </div>
               <div class="asset-info">
@@ -600,6 +775,200 @@ async function idbClear(store: string): Promise<void> {
           </div>
         </section>
       </main>
+    </div>
+    <div
+      v-if="previewAsset"
+      class="modal-backdrop preview-backdrop"
+      @click.self="closePreview"
+      @keydown.esc="closePreview"
+    >
+      <section
+        class="preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        tabindex="-1"
+        :aria-label="t('gallery.previewAsset', { filename: previewAsset.filename })"
+      >
+        <button
+          class="dialog-close"
+          :aria-label="t('gallery.close')"
+          autofocus
+          @click="closePreview"
+        >
+          ×
+        </button>
+        <h2>{{ previewAsset.filename }}</h2>
+        <div
+          class="preview-stage"
+          :aria-busy="previewBusy"
+        >
+          <p
+            v-if="previewBusy"
+            role="status"
+          >
+            {{ t('gallery.previewLoading') }}
+          </p>
+          <p
+            v-else-if="previewErrorCode"
+            class="notice error-notice"
+            role="alert"
+          >
+            {{ previewErrorMessage(previewErrorCode) }}
+          </p>
+          <img
+            v-else-if="previewUrl"
+            class="preview-image"
+            :src="previewUrl"
+            :alt="previewAsset.filename"
+          >
+        </div>
+        <section
+          class="version-editor"
+          :aria-label="t('gallery.editorTitle')"
+        >
+          <h3>{{ t('gallery.editorTitle') }}</h3>
+          <p
+            v-if="!mediaVersionsEnabled"
+            class="muted"
+          >
+            {{ t('gallery.editorUnavailable') }}
+          </p>
+          <template v-else>
+            <div
+              v-if="versionsBusy && !versions"
+              role="status"
+            >
+              {{ t('gallery.versionsLoading') }}
+            </div>
+            <div
+              v-else-if="versions?.original"
+              class="editor-controls"
+            >
+              <p class="muted">
+                {{ t('gallery.originalReadOnly') }} · {{ versions.original.filename }}
+              </p>
+              <label>
+                {{ t('gallery.versionSource') }}
+                <select
+                  v-model="sourceVersionId"
+                  @change="handleVersionSourceChange"
+                >
+                  <option value="">{{ t('gallery.originalSource') }}</option>
+                  <option
+                    v-for="item in versions.items.filter((item) => item.status.toLowerCase() === 'ready' && item.outputSha256)"
+                    :key="item.versionId"
+                    :value="item.versionId"
+                  >
+                    {{ t('gallery.derivedSource', { id: item.versionId }) }}
+                  </option>
+                </select>
+              </label>
+              <div
+                class="crop-controls"
+                role="group"
+                :aria-label="t('gallery.cropControls')"
+              >
+                <label>
+                  {{ t('gallery.cropX') }}
+                  <input
+                    v-model.number="crop.x"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                  >
+                </label>
+                <label>
+                  {{ t('gallery.cropY') }}
+                  <input
+                    v-model.number="crop.y"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                  >
+                </label>
+                <label>
+                  {{ t('gallery.cropWidth') }}
+                  <input
+                    v-model.number="crop.width"
+                    type="number"
+                    min="0.01"
+                    max="1"
+                    step="0.01"
+                  >
+                </label>
+                <label>
+                  {{ t('gallery.cropHeight') }}
+                  <input
+                    v-model.number="crop.height"
+                    type="number"
+                    min="0.01"
+                    max="1"
+                    step="0.01"
+                  >
+                </label>
+              </div>
+              <label>
+                {{ t('gallery.rotation') }}
+                <select v-model.number="rotation">
+                  <option :value="0">0°</option>
+                  <option :value="90">90°</option>
+                  <option :value="180">180°</option>
+                  <option :value="270">270°</option>
+                </select>
+              </label>
+              <button
+                class="primary-button small-primary"
+                :disabled="versionsBusy || !crop.width || !crop.height"
+                @click="createVersion"
+              >
+                {{ versionsBusy ? t('gallery.versionSaving') : t('gallery.saveVersion') }}
+              </button>
+              <p
+                v-if="versionError"
+                class="notice error-notice"
+                role="alert"
+              >
+                {{ versionError }}
+              </p>
+              <ul class="version-list">
+                <li
+                  v-for="item in versions.items"
+                  :key="item.versionId"
+                >
+                  <span>{{ item.versionId.slice(0, 8) }} · {{ item.status }} · {{ formatDate(item.createdAt) }}</span>
+                  <button
+                    v-if="item.status.toLowerCase() === 'ready'"
+                    class="secondary-button"
+                    @click="previewVersion(item.versionId)"
+                  >
+                    {{ t('gallery.previewVersion') }}
+                  </button>
+                </li>
+              </ul>
+              <div
+                v-if="activeVersionId && versionPreviewUrl"
+                class="version-output"
+              >
+                <p>{{ t('gallery.derivedPreview') }}</p>
+                <img
+                  :src="versionPreviewUrl"
+                  :alt="t('gallery.versionPreviewAlt')"
+                >
+              </div>
+            </div>
+            <button
+              v-else
+              class="secondary-button"
+              :disabled="versionsBusy"
+              @click="loadVersions"
+            >
+              {{ t('gallery.loadVersions') }}
+            </button>
+          </template>
+        </section>
+      </section>
     </div>
     <div
       v-if="selectedAsset"

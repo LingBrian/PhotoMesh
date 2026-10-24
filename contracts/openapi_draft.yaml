@@ -26,6 +26,9 @@ paths:
                   status: {type: string, enum: [ok, degraded]}
                   protocolMin: {type: integer}
                   protocolMax: {type: integer}
+                  capabilities:
+                    type: array
+                    items: {type: string}
   /v1/libraries:
     get:
       summary: 当前主体有权查看的照片库
@@ -81,6 +84,104 @@ paths:
               schema: {type: string, format: binary}
         '404': {description: Asset is absent or not authorized}
         '409': {description: Source location is offline}
+  /v1/libraries/{libraryId}/assets/{assetId}/versions:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 列出管理员当前 Node 上此资产的不可变版本
+      responses:
+        '200':
+          description: Original source metadata and immutable derived-version items
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MediaVersionPage'}
+        '403': {description: Admin authorization required}
+        '404': {description: Asset is absent or not authorized}
+        '503': {description: Media-version capability unavailable}
+    post:
+      summary: 排队创建裁剪/旋转派生版本，不修改原件
+      description: Requires the mediaVersions capability and a currently online, hash-matching source.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MediaVersionCreate'}
+      responses:
+        '202':
+          description: Operation accepted; poll the version resource until ready or failed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MediaVersionOperation'}
+        '400': {description: Invalid transform or request}
+        '403': {description: Admin authorization required}
+        '404': {description: Asset is absent or not authorized}
+        '409': {description: 'Source changed or idempotency key conflict'}
+        '413': {description: 'Input-size or pixel limit exceeded before the asynchronous operation is accepted'}
+        '415': {description: Unsupported media format}
+        '500': {description: Internal transform or database error}
+        '503': {description: 'Source or storage unavailable, or temporary media-version capacity limit reached; retry later'}
+  /v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: versionId
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      summary: Read authorized operation/version metadata and state
+      responses:
+        '200':
+          description: Version metadata
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MediaVersion'}
+        '403': {description: Admin authorization required}
+        '404': {description: Version is absent or not authorized}
+        '503': {description: Media-version capability unavailable}
+  /v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}/content:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: versionId
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      summary: Stream exact bytes of a ready derived version after reauthorization
+      responses:
+        '200':
+          description: Derived bytes; never falls back to the original
+          headers:
+            ETag: {schema: {type: string}}
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content:
+            image/jpeg: {schema: {type: string, format: binary}}
+            image/png: {schema: {type: string, format: binary}}
+            image/webp: {schema: {type: string, format: binary}}
+        '403': {description: Admin authorization required}
+        '404': {description: Version is absent or not authorized}
+        '409': {description: Version is not ready or failed}
+        '503': {description: 'Media-version capability unavailable, storage unavailable, or integrity verification failed'}
   /v1/recycle-bin:
     get:
       summary: Read visible deletion tombstones without deleting source originals
@@ -452,6 +553,78 @@ components:
           type: array
           items: {$ref: '#/components/schemas/Asset'}
         nextCursor: {type: [string, 'null']}
+    MediaCrop:
+      type: object
+      additionalProperties: false
+      required: [x, y, width, height]
+      properties:
+        x: {type: integer, minimum: 0, maximum: 1000000}
+        y: {type: integer, minimum: 0, maximum: 1000000}
+        width: {type: integer, minimum: 1, maximum: 1000000}
+        height: {type: integer, minimum: 1, maximum: 1000000}
+    MediaTransform:
+      type: object
+      additionalProperties: false
+      required: [crop, rotation]
+      properties:
+        crop: {$ref: '#/components/schemas/MediaCrop'}
+        rotation: {type: integer, enum: [0, 90, 180, 270]}
+    MediaVersionCreate:
+      type: object
+      additionalProperties: false
+      required: [sourceVersionId, sourceSha256, transform, idempotencyKey]
+      properties:
+        sourceVersionId: {type: [string, 'null'], minLength: 1, maxLength: 128}
+        sourceSha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        transform: {$ref: '#/components/schemas/MediaTransform'}
+        idempotencyKey: {type: string, minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$'}
+    MediaVersionStatus:
+      type: string
+      enum: [staging, ready, failed]
+    MediaVersionOperation:
+      type: object
+      additionalProperties: false
+      required: [operationId, versionId, status]
+      properties:
+        operationId: {type: string, format: uuid}
+        versionId: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/MediaVersionStatus'}
+    MediaVersion:
+      type: object
+      additionalProperties: false
+      required: [versionId, assetId, sourceVersionId, sourceSha256, outputSha256, mimeType, byteSize, width, height, transform, status, createdAt, errorCode]
+      properties:
+        versionId: {type: string, format: uuid}
+        assetId: {type: string}
+        sourceVersionId: {type: [string, 'null']}
+        sourceSha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        outputSha256: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+        mimeType: {type: [string, 'null'], enum: [image/jpeg, image/png, image/webp, null]}
+        byteSize: {type: [integer, 'null'], minimum: 0}
+        width: {type: [integer, 'null'], minimum: 1}
+        height: {type: [integer, 'null'], minimum: 1}
+        transform: {$ref: '#/components/schemas/MediaTransform'}
+        status: {$ref: '#/components/schemas/MediaVersionStatus'}
+        createdAt: {type: string, format: date-time}
+        errorCode: {type: [string, 'null']}
+    MediaVersionSource:
+      type: object
+      additionalProperties: false
+      required: [sourceVersionId, sha256, mimeType, byteSize, filename, availability]
+      properties:
+        sourceVersionId: {type: 'null'}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        mimeType: {type: [string, 'null'], enum: [image/jpeg, image/png, image/webp, null]}
+        byteSize: {type: integer, minimum: 0}
+        filename: {type: string}
+        availability: {type: string, enum: [online, cached, offline, missing]}
+    MediaVersionPage:
+      type: object
+      additionalProperties: false
+      required: [original, items]
+      properties:
+        original: {$ref: '#/components/schemas/MediaVersionSource'}
+        items: {type: array, items: {$ref: '#/components/schemas/MediaVersion'}}
     Tombstone:
       type: object
       required: [assetId, libraryId, eventId]

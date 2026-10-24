@@ -34,6 +34,35 @@ class DevicePhotoLibrary implements PhotoLibraryGateway {
   Future<AssetEntity?> byId(String assetId) => AssetEntity.fromId(assetId);
 }
 
+class PhotoQueueSummary {
+  const PhotoQueueSummary({required this.queued, required this.skipped});
+
+  final int queued;
+  final int skipped;
+}
+
+Future<PhotoQueueSummary> queueSelectedPhotos<T>(
+  Iterable<T> assets,
+  Future<UploadJob?> Function(T asset) queueAsset,
+) async {
+  var queued = 0;
+  var skipped = 0;
+  for (final asset in assets) {
+    try {
+      if (await queueAsset(asset) == null) {
+        skipped++;
+      } else {
+        queued++;
+      }
+    } on FileSystemException {
+      skipped++;
+    } on PlatformException {
+      skipped++;
+    }
+  }
+  return PhotoQueueSummary(queued: queued, skipped: skipped);
+}
+
 class PhotoLibraryService {
   PhotoLibraryService({required UploadQueue queue, PhotoLibraryGateway gateway = const DevicePhotoLibrary()})
       : _queue = queue,
@@ -57,6 +86,16 @@ class PhotoLibraryService {
       await _queue.markGalleryJobsNeedsPermission();
     }
     return permission;
+  }
+
+  Future<bool> currentPermissionAllowsAccess() async {
+    try {
+      return (await _gateway.currentPermission()).hasAccess;
+    } on FileSystemException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
   }
 
   Future<int> scanAndQueue({int pageSize = 80}) async {

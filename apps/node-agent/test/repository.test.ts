@@ -119,6 +119,84 @@ describe('SQLite repository and migrations', () => {
     db.close();
   });
 
+  it('migrates local media-version records with immutable output and idempotency constraints', async () => {
+    const db = new Database(':memory:');
+    const repository = new SqliteRepository(db);
+    await repository.migrate();
+    db.prepare('INSERT INTO assets (asset_id, library_id, origin_node_id, kind, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run('asset-1', 'library-1', 'node-1', 'photo', '2026-10-24T00:00:00.000Z');
+    db.prepare(`INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run('file-1', 'asset-1', 'a'.repeat(64), 5, 'original', 'objects/asset-1/original.blob', '2026-10-24T00:00:00.000Z');
+    db.prepare(`INSERT INTO file_locations (location_id, file_id, node_id, original_filename, original_path, source_kind,
+      source_node_id, path_ref, storage_class, availability, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run('location-1', 'file-1', 'node-1', 'source.jpg', null, 'upload', null,
+        'objects/asset-1/original.blob', 'managed', 'online', '2026-10-24T00:00:00.000Z');
+
+    const insert = db.prepare(`INSERT INTO media_versions (
+      version_id, asset_id, library_id, source_version_id, source_sha256, transform_json, idempotency_scope,
+      idempotency_key, request_fingerprint, status, storage_ref, output_sha256, mime_type, byte_size, width, height,
+      error_code, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const staging = [
+      'version-1', 'asset-1', 'library-1', null, 'a'.repeat(64),
+      JSON.stringify({ crop: { x: 0, y: 0, width: 1_000_000, height: 1_000_000 }, rotation: 90 }),
+      'local-admin', '0123456789abcdef', 'b'.repeat(64), 'staging', 'derived/version-1/output.jpg',
+      null, null, null, null, null, null, 'local-admin', '2026-10-24T00:00:00.000Z', '2026-10-24T00:00:00.000Z'
+    ] as const;
+    insert.run(...staging);
+    expect(repository.getMediaVersionSource('library-1', 'asset-1', null)).toMatchObject({
+      assetId: 'asset-1', sourceVersionId: null, sha256: 'a'.repeat(64), availability: 'online', mimeType: null
+    });
+    expect(repository.listStagingMediaVersions().map((version) => version.versionId)).toEqual(['version-1']);
+    expect(repository.countStagingMediaVersions()).toBe(1);
+    expect(repository.getMediaVersionByIdempotency('library-1', 'local-admin', '0123456789abcdef')?.versionId).toBe('version-1');
+    expect(repository.getMediaVersionSource('library-1', 'asset-1', 'version-1')).toBeUndefined();
+    expect(repository.markMediaVersionReady('version-1', {
+      sha256: 'f'.repeat(64), mimeType: 'image/jpeg', byteSize: 12, width: 8, height: 4
+    }, '2026-10-24T00:00:01.000Z')).toBe(true);
+    expect(repository.markMediaVersionReady('version-1', {
+      sha256: 'f'.repeat(64), mimeType: 'image/jpeg', byteSize: 12, width: 8, height: 4
+    }, '2026-10-24T00:00:02.000Z')).toBe(false);
+    expect(repository.getMediaVersion('library-1', 'asset-1', 'version-1')).toMatchObject({
+      status: 'ready', outputSha256: 'f'.repeat(64), width: 8, height: 4
+    });
+    expect(repository.getMediaVersionSource('library-1', 'asset-1', 'version-1')).toMatchObject({
+      sourceVersionId: 'version-1', sha256: 'f'.repeat(64), storageRef: 'derived/version-1/output.jpg',
+      availability: 'online', mimeType: 'image/jpeg'
+    });
+    expect(repository.listStagingMediaVersions()).toHaveLength(0);
+    expect(repository.countStagingMediaVersions()).toBe(0);
+    expect(repository.listMediaVersions('library-1', 'asset-1')).toHaveLength(1);
+    expect(() => db.prepare('UPDATE media_versions SET source_sha256 = ? WHERE version_id = ?').run('e'.repeat(64), 'version-1')).toThrow();
+    expect(() => db.prepare('UPDATE media_versions SET output_sha256 = ? WHERE version_id = ?').run('e'.repeat(64), 'version-1')).toThrow();
+    expect(() => db.prepare('DELETE FROM media_versions WHERE version_id = ?').run('version-1')).toThrow();
+    expect(() => insert.run(
+      'version-child', 'asset-1', 'library-1', 'version-1', 'e'.repeat(64), JSON.stringify({}), 'local-admin',
+      'child-key-0123456789', 'f'.repeat(64), 'staging', 'derived/version-child/output.jpg', null, null, null, null, null,
+      null, 'local-admin', 'now', 'now'
+    )).toThrow();
+    expect(db.prepare('SELECT status, output_sha256 FROM media_versions WHERE version_id = ?').get('version-1'))
+      .toEqual({ status: 'ready', output_sha256: 'f'.repeat(64) });
+    const duplicateKey = [...staging];
+    duplicateKey[0] = 'version-duplicate';
+    duplicateKey[10] = 'derived/version-duplicate/output.jpg';
+    expect(() => insert.run(...duplicateKey)).toThrow();
+    expect(() => insert.run(
+      'version-2', 'asset-1', 'library-1', null, 'bad', JSON.stringify({}), 'local-admin', '0123456789abcdef',
+      'c'.repeat(64), 'staging', 'derived/version-2/output.jpg', null, null, null, null, null, null,
+      'local-admin', 'now', 'now'
+    )).toThrow();
+    expect(() => insert.run(
+      'version-3', 'asset-1', 'library-1', null, 'a'.repeat(64), JSON.stringify({}), 'local-admin', 'fedcba9876543210',
+      'd'.repeat(64), 'ready', 'derived/version-3/output.jpg', null, null, null, null, null, null,
+      'local-admin', 'now', 'now'
+    )).toThrow();
+    expect(db.prepare('SELECT sha256, byte_size, storage_ref FROM asset_files WHERE file_id = ?').get('file-1'))
+      .toEqual({ sha256: 'a'.repeat(64), byte_size: 5, storage_ref: 'objects/asset-1/original.blob' });
+    db.close();
+  });
+
   it('requires a backup callback before applying migrations to a non-empty database', async () => {
     const db = new Database(':memory:');
     db.exec('CREATE TABLE legacy_data (value TEXT)');

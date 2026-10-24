@@ -6,12 +6,19 @@ import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 import 'background_sync.dart';
+import 'gallery_api.dart';
 import 'l10n/app_strings.dart';
 import 'node_settings.dart';
 import 'photo_library.dart';
+import 'remote_gallery.dart';
 import 'upload_job.dart';
 import 'upload_queue.dart';
 import 'upload_service.dart';
+
+String combineManualSelectionStatus({required String? queueStatus, required String selectionSummary}) {
+  if (queueStatus == null || queueStatus == selectionSummary) return selectionSummary;
+  return '$queueStatus\n$selectionSummary';
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -147,6 +154,31 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
     await _scanAndMaybeUpload();
   }
 
+  Future<void> _openRemoteGallery() async {
+    final settings = _settings;
+    if (settings == null) {
+      if (mounted) setState(() => _status = _s('nodeRequired'));
+      return;
+    }
+    final node = await settings.loadNode();
+    final token = await settings.loadToken();
+    if (!mounted) return;
+    if (node == null || token == null || token.isEmpty) {
+      setState(() => _status = _s('nodeRequired'));
+      return;
+    }
+    final api = MobileGalleryApi(
+      baseUrl: node.baseUrl,
+      libraryId: node.libraryId,
+      token: token,
+    );
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => RemoteGalleryScreen(api: api),
+      ),
+    );
+  }
+
   Future<void> _bindNode() async {
     final settings = _settings;
     if (settings == null) return;
@@ -226,13 +258,23 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
       },
     );
     if (selected == null) return;
-    var added = 0;
-    for (final asset in assets.where((asset) => selected.contains(asset.id))) {
-      if (await photos.queueAsset(asset) != null) added++;
+    final result = await queueSelectedPhotos(
+      assets.where((asset) => selected.contains(asset.id)),
+      photos.queueAsset,
+    );
+    var message = _s('manualAdded').replaceAll('{count}', '${result.queued}');
+    if (result.skipped > 0) {
+      message = '$message ${_s('manualSkipped').replaceAll('{count}', '${result.skipped}')}';
     }
-    if (mounted) setState(() => _status = _s('manualAdded').replaceAll('{count}', '$added'));
+    if (mounted) setState(() => _status = message);
     await _refreshQueue();
     await _processQueue(manual: true);
+    if (mounted && result.skipped > 0) {
+      setState(() => _status = combineManualSelectionStatus(
+            queueStatus: _status,
+            selectionSummary: message,
+          ));
+    }
   }
 
   Future<void> _processQueue({bool manual = false}) async {
@@ -257,6 +299,7 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
       queue: queue,
       settings: settings,
       resolveSource: photos.resolveOriginal,
+      galleryPermissionAllowed: photos.currentPermissionAllowsAccess,
       networkAllowed: () async => manual && _policy == NetworkPolicy.manualOnly
           ? (await Connectivity().checkConnectivity()).any((kind) => kind != ConnectivityResult.none)
           : networkPolicyAllows(_policy, await Connectivity().checkConnectivity()),
@@ -309,7 +352,8 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
       UploadJobState.needsPermission => 'needsPermission',
       UploadJobState.failed => 'failed',
     };
-    return '${_s(key)}${job.errorCode == null ? '' : ' · ${job.errorCode}'}';
+    final errorText = localizedUploadError(Localizations.localeOf(context).languageCode, job.errorCode);
+    return '${_s(key)}${errorText.isEmpty ? '' : ' · $errorText'}';
   }
 
   @override
@@ -331,7 +375,16 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final permissionGranted = _permission?.hasAccess ?? false;
     return Scaffold(
-      appBar: AppBar(title: Text(_s('title'))),
+      appBar: AppBar(
+        title: Text(_s('title')),
+        actions: [
+          IconButton(
+            tooltip: _s('remoteGallery'),
+            onPressed: _openRemoteGallery,
+            icon: const Icon(Icons.photo_library_outlined),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
