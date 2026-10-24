@@ -25,6 +25,12 @@ pnpm build:mobile
 
 These commands run `flutter pub get`, `flutter analyze`, and `flutter test`, or build the default APK, using the repository-local SDK when present.
 
+## APK signing and emulator smoke tests
+
+`pnpm build:mobile` runs `flutter build apk` in its default release mode. Gradle configures release signing only when `PHOTOMESH_ANDROID_KEYSTORE` is set; it also reads `PHOTOMESH_ANDROID_KEYSTORE_PASSWORD`, `PHOTOMESH_ANDROID_KEY_ALIAS`, and `PHOTOMESH_ANDROID_KEY_PASSWORD`. Without a keystore, the build can succeed while producing an unsigned APK that Android cannot install or publish. Do not treat that build result as release-ready.
+
+For a local emulator smoke test, build a debug-signed APK with `flutter build apk --debug`. For a distributable release, provide signing values through a secure local or CI secret store, never commit the keystore or passwords, and verify the artifact with `apksigner verify --verbose --print-certs` before distribution.
+
 To start the local emulator manually:
 
 ```powershell
