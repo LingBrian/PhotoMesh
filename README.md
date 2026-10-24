@@ -21,9 +21,9 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 
 ### 使用预构建节点包（Windows x64 / Linux x64）
 
-普通使用者下载已构建的节点软件包即可，无需在目标设备安装 Node.js 或编译源码。在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 选择同一版本的节点包和 `SHA256SUMS.txt`。
+普通使用者下载已构建的节点软件包即可，无需在目标设备安装 Node.js 或编译源码。在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 选择对应版本的 Windows 或 Linux 节点包。
 
-1. **下载与校验。** Windows 下载 `PhotoMesh-<版本>-node-agent-windows-x64.zip`；Linux 下载 `PhotoMesh-<版本>-node-agent-linux-x64.tar.gz`。使用清单中对应文件名的 SHA-256 值校验压缩包后再解压。
+1. **下载与解压。** Windows 下载 `PhotoMesh-<版本>-node-agent-windows-x64.zip`；Linux 下载 `PhotoMesh-<版本>-node-agent-linux-x64.tar.gz`，将其解压到你选择的目录。
 2. **Windows 解压并启动。** 在文件资源管理器右键 ZIP，选择“全部解压缩”。进入解压目录，双击 `start.bat`。首次运行会提示管理员令牌；留空会生成一次性令牌并显示，请保存到密码管理器。
 3. **Linux 解压并启动。** 假设下载目录为当前目录，执行：
    ```sh
@@ -43,7 +43,7 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 
 ### 终端连接步骤
 
-先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Windows x64 桌面安装包（`PhotoMesh-<版本>-windows-x64-unsigned.exe`）；下载同一版本的 `SHA256SUMS.txt`，在 PowerShell 用 `$asset = Get-ChildItem . -Filter '*windows-x64-unsigned.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS.txt -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
+先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Windows x64 桌面安装包（`PhotoMesh-<版本>-windows-x64-unsigned.exe`）。该安装包尚未进行代码签名，Windows 可能显示未知发布者或 SmartScreen 警告；只在测试电脑上安装。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
 
 1. **打开客户端。** 在节点电脑启动 Agent；再从开始菜单打开 PhotoMesh，或在仓库根目录另开 PowerShell 运行 `pnpm --filter @photomesh/web dev`，并打开终端打印的本地地址。
 2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把节点运行时的 `PHOTOMESH_ADMIN_TOKEN` 填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。
