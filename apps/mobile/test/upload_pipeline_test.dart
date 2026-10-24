@@ -250,6 +250,35 @@ void main() {
       client: client,
       fileAccess: _MemoryFiles(bytes),
       resolveSource: (_) async => null,
+      galleryPermissionAllowed: () async => false,
+    );
+
+    final result = await service.upload(job);
+    expect(result.state, UploadJobState.needsPermission);
+    expect(result.errorCode, 'PERMISSION_REVOKED');
+    expect(requests, 0);
+    service.close();
+  });
+
+  test('keeps an unavailable gallery source distinct when permission remains granted', () async {
+    final bytes = [47, 48, 49];
+    final base = _job(bytes);
+    final job = UploadJob(
+      id: 'missing-gallery-job', assetId: 'missing-media-id', filePath: base.filePath,
+      originalPath: base.originalPath, filename: base.filename, totalBytes: base.totalBytes,
+      sha256: base.sha256, idempotencyKey: base.idempotencyKey, state: UploadJobState.queued,
+      createdAt: base.createdAt, updatedAt: base.updatedAt,
+    );
+    await queue.enqueue(job);
+    var requests = 0;
+    final client = MockClient((_) async { requests++; return http.Response('', 500); });
+    final service = UploadService(
+      queue: queue,
+      settings: _Settings(),
+      client: client,
+      fileAccess: _MemoryFiles(bytes),
+      resolveSource: (_) async => null,
+      galleryPermissionAllowed: () async => true,
     );
 
     final result = await service.upload(job);

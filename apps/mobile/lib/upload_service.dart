@@ -67,7 +67,10 @@ class UploadService {
       final resolvedPath = await _resolveSource?.call(job);
       if (resolvedPath != null) current = current.copyWith(filePath: resolvedPath);
       if (resolvedPath == null && job.assetId != null && _resolveSource != null) {
-        return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: 'SOURCE_UNAVAILABLE'));
+        final permissionCheck = _galleryPermissionAllowed;
+        final permissionRevoked = permissionCheck != null && !await permissionCheck();
+        final errorCode = permissionRevoked ? 'PERMISSION_REVOKED' : 'SOURCE_UNAVAILABLE';
+        return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: errorCode));
       }
       if (await _files.length(current.filePath) != current.totalBytes) {
         return await _save(current.copyWith(state: UploadJobState.failed, errorCode: 'SOURCE_CHANGED'));
