@@ -35,6 +35,7 @@ void photoMeshCallbackDispatcher() {
         queue: queue,
         settings: settings,
         resolveSource: library.resolveOriginal,
+        galleryPermissionAllowed: library.currentPermissionAllowsAccess,
         networkAllowed: () async => networkPolicyAllows(policy, await Connectivity().checkConnectivity()),
       );
       try {

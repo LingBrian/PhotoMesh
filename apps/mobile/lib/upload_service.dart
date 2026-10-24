@@ -34,6 +34,7 @@ class UploadService {
     http.Client? client,
     UploadFileAccess fileAccess = const IoUploadFileAccess(),
     ResolveUploadSource? resolveSource,
+    Future<bool> Function()? galleryPermissionAllowed,
     Future<bool> Function()? networkAllowed,
     Duration requestTimeout = const Duration(seconds: 30),
     int chunkBytes = uploadChunkBytes,
@@ -42,6 +43,7 @@ class UploadService {
         _client = client ?? http.Client(),
         _files = fileAccess,
         _resolveSource = resolveSource,
+        _galleryPermissionAllowed = galleryPermissionAllowed,
         _networkAllowed = networkAllowed,
         _requestTimeout = requestTimeout,
         _chunkBytes = chunkBytes;
@@ -51,6 +53,7 @@ class UploadService {
   final http.Client _client;
   final UploadFileAccess _files;
   final ResolveUploadSource? _resolveSource;
+  final Future<bool> Function()? _galleryPermissionAllowed;
   final Future<bool> Function()? _networkAllowed;
   final Duration _requestTimeout;
   final int _chunkBytes;
@@ -113,6 +116,18 @@ class UploadService {
       while (offset < current.totalBytes) {
         if (_networkAllowed != null && !await _networkAllowed()) {
           return await _save(current.copyWith(state: UploadJobState.paused, errorCode: 'NETWORK_POLICY_BLOCKED'));
+        }
+        // An active chunk cannot be interrupted; recheck before reading the next one.
+        if (current.assetId != null) {
+          final permissionCheck = _galleryPermissionAllowed;
+          final sourceResolver = _resolveSource;
+          final permissionAllowed = permissionCheck != null
+              ? await permissionCheck()
+              : sourceResolver == null || await sourceResolver(job) != null;
+          if (!permissionAllowed) {
+            final errorCode = permissionCheck != null ? 'PERMISSION_REVOKED' : 'SOURCE_UNAVAILABLE';
+            return await _save(current.copyWith(state: UploadJobState.needsPermission, errorCode: errorCode));
+          }
         }
         final end = min(offset + _chunkBytes, current.totalBytes);
         final bytes = await _readRange(current.filePath, offset, end);

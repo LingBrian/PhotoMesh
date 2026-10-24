@@ -59,6 +59,16 @@ class PhotoLibraryService {
     return permission;
   }
 
+  Future<bool> currentPermissionAllowsAccess() async {
+    try {
+      return (await _gateway.currentPermission()).hasAccess;
+    } on FileSystemException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   Future<int> scanAndQueue({int pageSize = 80}) async {
     if (_scanning) return 0;
     _scanning = true;

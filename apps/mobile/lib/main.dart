@@ -257,6 +257,7 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
       queue: queue,
       settings: settings,
       resolveSource: photos.resolveOriginal,
+      galleryPermissionAllowed: photos.currentPermissionAllowsAccess,
       networkAllowed: () async => manual && _policy == NetworkPolicy.manualOnly
           ? (await Connectivity().checkConnectivity()).any((kind) => kind != ConnectivityResult.none)
           : networkPolicyAllows(_policy, await Connectivity().checkConnectivity()),
