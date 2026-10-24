@@ -32,7 +32,7 @@ function Get-PhotoMeshAndroidToolchain {
     $env:ANDROID_SDK_ROOT = $localSdk
     $env:ANDROID_USER_HOME = Join-Path $androidRoot '.android'
     $env:ANDROID_SDK_HOME = $androidRoot
-    $env:ANDROID_AVD_HOME = Join-Path $androidRoot 'avd'
+    $env:ANDROID_AVD_HOME = Join-Path $androidRoot '.android\avd'
   }
 
   $localJdk = Join-Path $androidRoot 'jdk-17'

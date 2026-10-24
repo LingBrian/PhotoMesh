@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -79,5 +79,39 @@ describe('managed upload filesystem', () => {
     await store.removeTree('staging/session');
     expect(await store.exists('staging/session/chunk.bin')).toBe(false);
     expect(await store.exists('staging/other/chunk.bin')).toBe(true);
+  });
+
+  it('rejects symlinked parent and leaf files when reading or hashing', async () => {
+    const store = await createStore();
+    const root = roots.at(-1)!;
+    const outside = await mkdtemp(join(tmpdir(), `photomesh-managed-test-${process.pid}-read-outside-`));
+    roots.push(outside);
+    const outsideFile = join(outside, 'secret.bin');
+    await writeFile(outsideFile, 'outside-secret');
+    await symlink(outside, join(root, 'read-escape'), 'junction');
+    await expect(store.openReadStream('read-escape/secret.bin')).rejects.toThrow('managed storage parent must be a real directory');
+    await expect(store.hashFile('read-escape/secret.bin')).rejects.toThrow('managed storage parent must be a real directory');
+
+    await mkdir(join(root, 'staging'), { recursive: true });
+    await symlink(outsideFile, join(root, 'staging', 'alias.bin'), 'file');
+    await expect(store.openReadStream('staging/alias.bin')).rejects.toThrow('managed media is not a regular file');
+    await expect(store.hashFile('staging/alias.bin')).rejects.toThrow('managed media is not a regular file');
+    expect(await readFile(outsideFile, 'utf8')).toBe('outside-secret');
+  });
+
+  it('rejects symlinked derived and staging parents before writing outside the root', async () => {
+    const store = await createStore();
+    const root = roots.at(-1)!;
+    const outside = await mkdtemp(join(tmpdir(), `photomesh-managed-test-${process.pid}-outside-`));
+    roots.push(outside);
+    await symlink(outside, join(root, 'derived'), 'junction');
+    await expect(store.writeExclusive('derived/version/output.jpg', new TextEncoder().encode('escape')))
+      .rejects.toThrow('managed storage parent must be a real directory');
+
+    await mkdir(join(root, 'staging'), { recursive: true });
+    await symlink(outside, join(root, 'staging', 'media-versions'), 'junction');
+    await expect(store.writeExclusive('staging/media-versions/version.part', new TextEncoder().encode('escape')))
+      .rejects.toThrow('managed storage parent must be a real directory');
+    expect(await readdir(outside)).toEqual([]);
   });
 });

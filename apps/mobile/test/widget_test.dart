@@ -6,6 +6,7 @@ void main() {
   testWidgets('shows the PhotoMesh scaffold', (tester) async {
     await tester.pumpWidget(const PhotoMeshApp(testMode: true));
     expect(find.textContaining('PhotoMesh'), findsOneWidget);
+    expect(find.byTooltip('Node gallery'), findsOneWidget);
     final backgroundNotice = find.textContaining('Android schedules background work');
     await tester.scrollUntilVisible(backgroundNotice, 300, scrollable: find.byType(Scrollable).first);
     expect(backgroundNotice, findsOneWidget);

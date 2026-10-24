@@ -2,9 +2,33 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:photomesh_mobile/l10n/app_strings.dart';
 
 void main() {
-  test(
-      'provides permission recovery and source availability copy in Chinese and English',
-      () {
+  test('provides gallery and preview copy in Chinese and English', () {
+    const galleryKeys = [
+      'remoteGallery',
+      'galleryEmpty',
+      'galleryLoadMore',
+      'galleryUnavailable',
+      'galleryRequestFailed',
+      'preview',
+      'previewLoading',
+      'previewTooLarge',
+      'previewUnsupported',
+      'previewUnavailable',
+      'sourceOffline',
+      'availabilityOnline',
+      'availabilityCached',
+      'availabilityOffline',
+      'availabilityMissing',
+      'close',
+    ];
+    for (final language in ['zh', 'en']) {
+      for (final key in galleryKeys) {
+        expect(appStrings[language]!.containsKey(key), isTrue,
+            reason: '$language:$key');
+      }
+    }
+    expect(appString('zh', 'preview'), '预览');
+    expect(appString('en', 'preview'), 'Preview');
     expect(appString('zh', 'permissionRevoked'), isNot('permissionRevoked'));
     expect(appString('en', 'permissionRevoked'), isNot('permissionRevoked'));
     expect(appString('zh', 'sourceUnavailable'), isNot('sourceUnavailable'));

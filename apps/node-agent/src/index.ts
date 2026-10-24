@@ -13,6 +13,8 @@ import { PairingService } from './auth/pairing-service.js';
 import { PairingApprovalQueue } from './auth/pairing-approval-queue.js';
 import { LanPairingNode } from './auth/lan-node.js';
 import type { PairingServerControl } from './server.js';
+import type { MediaVersionService } from './media/media-version-service.js';
+import type { MediaVersionSourceRecord } from './db/repository.js';
 import { timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
 import { SyncRepository } from './sync/sync-repository.js';
@@ -60,6 +62,25 @@ try {
 const managedFileSystem = new NodeUploadFileSystem(join(dataDirectory, 'managed'));
 const externalFileSystem = new NodeExternalFileSystem();
 let externalScan: ExternalScanService | undefined;
+const openOriginalMedia = async (media: Pick<MediaVersionSourceRecord, 'storageRef' | 'originalPath'>) => {
+  if (media.storageRef.startsWith('objects/')) return managedFileSystem.openReadStream(media.storageRef);
+  if (media.storageRef.startsWith('external:') && media.originalPath) {
+    const authorizedPath = await externalScan?.resolveAuthorizedReadPath(media.originalPath);
+    return authorizedPath ? externalFileSystem.openReadStream(authorizedPath) : undefined;
+  }
+  return undefined;
+};
+let mediaVersionService: MediaVersionService | undefined;
+try {
+  const [{ MediaVersionService }, { SharpMediaImageTransformer }] = await Promise.all([
+    import('./media/media-version-service.js'), import('./media/image-transformer.js')
+  ]);
+  mediaVersionService = new MediaVersionService({
+    repository, fileSystem: managedFileSystem, transformer: new SharpMediaImageTransformer(), openOriginal: openOriginalMedia
+  });
+} catch {
+  process.stderr.write('PhotoMesh media versioning unavailable; CPU image processing could not be loaded\n');
+}
 const uploadService = new UploadService({
   repository,
   fileSystem: managedFileSystem,
@@ -114,19 +135,16 @@ const server = createNodeAgentServer({
     listLibraries: () => repository.listGalleryLibraries(),
     listAssets: (libraryId, cursor, limit, query) => repository.listGalleryAssets(libraryId, cursor, limit, query),
     getOriginal: async (assetId) => repository.getGalleryMedia(assetId),
-    openOriginal: async (media) => {
-      if (media.storageRef.startsWith('objects/')) return managedFileSystem.openReadStream(media.storageRef);
-      if (media.storageRef.startsWith('external:') && media.originalPath) {
-        const authorizedPath = await externalScan?.resolveAuthorizedReadPath(media.originalPath);
-        return authorizedPath ? externalFileSystem.openReadStream(authorizedPath) : undefined;
-      }
-      return undefined;
-    },
+    openOriginal: openOriginalMedia,
     listTombstones: (libraryId) => repository.listActiveTombstones(libraryId)
   },
+  ...(mediaVersionService ? { mediaVersions: mediaVersionService } : {}),
   ...(pairingControl ? { pairingControl } : {})
 });
 server.listen(port, host, () => process.stdout.write(`PhotoMesh node-agent listening on ${host}:${port}\n`));
+const resumeMediaVersions = (): void => {
+  void mediaVersionService?.resumePending().catch(() => process.stderr.write('Media-version recovery could not be completed; pending records remain resumable\n'));
+};
 
 const rootsJson = process.env.PHOTOMESH_EXTERNAL_ROOTS;
 if (rootsJson) {
@@ -149,13 +167,19 @@ if (rootsJson) {
   void externalScan.start().then((results) => {
     const indexed = results.reduce((total, result) => total + result.indexed, 0);
     process.stdout.write(`External directory scan initialized (${results.length} roots, ${indexed} indexed paths)\n`);
-  }).catch(() => process.stderr.write('External directory scan initialization failed; configured roots remain read-only\n'));
+  }).catch(() => process.stderr.write('External directory scan initialization failed; configured roots remain read-only\n'))
+    .finally(resumeMediaVersions);
+} else {
+  resumeMediaVersions();
 }
 
 const shutdown = (): void => {
   externalScan?.stop();
   void lanNode?.stop();
-  server.close(() => database.close());
+  server.close(() => {
+    if (mediaVersionService) void mediaVersionService.stop().finally(() => database.close());
+    else database.close();
+  });
 };
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);

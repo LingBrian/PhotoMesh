@@ -7,7 +7,7 @@ The repository-local Android toolchain lives under the repository-root `android/
 - `android/flutter/` — Flutter SDK (currently 3.47.8 stable).
 - `android/sdk/` — Android SDK packages, including `platform-tools/`, `build-tools/`, `platforms/`, `system-images/`, and `emulator/`.
 - `android/jdk-17/` — JDK 17 used for Android Gradle builds.
-- `android/avd/PhotoMesh_API35.avd/` — local Pixel 6 API 35 virtual device and its writable emulator data.
+- `android/.android/avd/PhotoMesh_API35.avd/` — local Pixel 6 API 35 virtual device and its writable emulator data.
 - `android/.android/`, `android/.gradle/`, `android/pub-cache/` — local Android, Gradle, and Dart package caches.
 - `android/tmp/` — temporary scratch space for Flutter and its child tools.
 - `android/home/` and `android/appdata/` — Flutter/Gradle per-user home, config, and state directories.

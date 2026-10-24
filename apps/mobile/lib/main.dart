@@ -6,9 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 import 'background_sync.dart';
+import 'gallery_api.dart';
 import 'l10n/app_strings.dart';
 import 'node_settings.dart';
 import 'photo_library.dart';
+import 'remote_gallery.dart';
 import 'upload_job.dart';
 import 'upload_queue.dart';
 import 'upload_service.dart';
@@ -145,6 +147,31 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
     setState(() => _permission = permission);
     if (!permission.hasAccess) await PhotoManager.openSetting();
     await _scanAndMaybeUpload();
+  }
+
+  Future<void> _openRemoteGallery() async {
+    final settings = _settings;
+    if (settings == null) {
+      if (mounted) setState(() => _status = _s('nodeRequired'));
+      return;
+    }
+    final node = await settings.loadNode();
+    final token = await settings.loadToken();
+    if (!mounted) return;
+    if (node == null || token == null || token.isEmpty) {
+      setState(() => _status = _s('nodeRequired'));
+      return;
+    }
+    final api = MobileGalleryApi(
+      baseUrl: node.baseUrl,
+      libraryId: node.libraryId,
+      token: token,
+    );
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => RemoteGalleryScreen(api: api),
+      ),
+    );
   }
 
   Future<void> _bindNode() async {
@@ -333,7 +360,16 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final permissionGranted = _permission?.hasAccess ?? false;
     return Scaffold(
-      appBar: AppBar(title: Text(_s('title'))),
+      appBar: AppBar(
+        title: Text(_s('title')),
+        actions: [
+          IconButton(
+            tooltip: _s('remoteGallery'),
+            onPressed: _openRemoteGallery,
+            icon: const Icon(Icons.photo_library_outlined),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
