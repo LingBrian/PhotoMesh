@@ -43,6 +43,39 @@ describe('source contracts', () => {
     expect(complete({ sessionId: 's1', assetId: 'a1', fileId: 'f1', sha256: 'bad', byteLength: 2, storageRef: 'objects/s1/original.blob' })).toBe(false);
   });
 
+  it('validates immutable media-version requests and exposes version routes', async () => {
+    const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
+    const api = parse(await readFile(apiPath, 'utf8')) as {
+      components: { schemas: Record<string, object> };
+      paths: Record<string, Record<string, unknown>>;
+    };
+    const ajv = new Ajv2020.default({ allErrors: true });
+    registerFormats(ajv);
+    const dereferenced = await SwaggerParser.dereference(apiPath) as {
+      components: { schemas: Record<string, object> };
+    };
+    const createVersion = ajv.compile(dereferenced.components.schemas.MediaVersionCreate!);
+    const transform = ajv.compile(dereferenced.components.schemas.MediaTransform!);
+    expect(createVersion({
+      sourceVersionId: null,
+      sourceSha256: 'a'.repeat(64),
+      idempotencyKey: '01J9M4TESTIDEMPOTENCYKEY',
+      transform: { crop: { x: 0, y: 0, width: 1_000_000, height: 1_000_000 }, rotation: 90 }
+    })).toBe(true);
+    expect(createVersion({
+      sourceVersionId: null,
+      sourceSha256: 'not-a-sha',
+      idempotencyKey: 'short',
+      transform: { crop: { x: -1, y: 0, width: 1_000_001, height: 1_000_000 }, rotation: 45 }
+    })).toBe(false);
+    expect(transform({ crop: { x: 100, y: 100, width: 900_000, height: 900_000 }, rotation: 0 })).toBe(true);
+    expect(transform({ crop: { x: 0, y: 0, width: 1_000_001, height: 1_000_000 }, rotation: 0 })).toBe(false);
+    expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/versions']?.get).toBeDefined();
+    expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/versions']?.post).toBeDefined();
+    expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}']?.get).toBeDefined();
+    expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}/content']?.get).toBeDefined();
+  });
+
   it('validates one-time LAN invitation and administrator approval payloads', async () => {
     const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
     const api = parse(await readFile(apiPath, 'utf8')) as {

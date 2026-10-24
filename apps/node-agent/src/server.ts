@@ -8,6 +8,7 @@ import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.j
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
 import type { TrustedPeerRecord } from './db/repository.js';
 import type { Readable } from 'node:stream';
+import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage, MediaVersionView } from './media/media-version-service.js';
 
 export interface UploadAuthorizationRequest {
   token: string | undefined;
@@ -29,6 +30,7 @@ export interface NodeAgentServerOptions {
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
+  mediaVersions?: MediaVersionServerControl;
   pairingControl?: PairingServerControl;
   maxRequestBytes?: number;
 }
@@ -39,6 +41,15 @@ export interface GalleryServerControl {
   getOriginal(assetId: string): Promise<{ libraryId: string; filename: string; sha256: string; byteSize: number; availability: string; storageRef: string; originalPath: string | null } | undefined>;
   openOriginal(media: { storageRef: string; originalPath: string | null }): Promise<Readable | undefined> | Readable | undefined;
   listTombstones(libraryId?: string): unknown[];
+}
+
+export interface MediaVersionServerControl {
+  listVersions(libraryId: string, assetId: string): MediaVersionPage;
+  createVersion(libraryId: string, assetId: string, input: CreateMediaVersionRequest, principalId: string): Promise<MediaVersionOperation>;
+  getVersion(libraryId: string, assetId: string, versionId: string): MediaVersionView | undefined;
+  readVersionContent(libraryId: string, assetId: string, versionId: string): Promise<{
+    bytes: Buffer; mimeType: 'image/jpeg' | 'image/png' | 'image/webp'; sha256: string; byteSize: number;
+  }>;
 }
 
 export interface PairingServerControl {
@@ -74,7 +85,7 @@ export function createNodeAgentServer(options: NodeAgentServerOptions = {}) {
 async function handleRequest(request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string): Promise<void> {
   const url = new URL(request.url ?? '/', `http://${headerValue(request, 'host') ?? 'localhost'}`);
   if (request.method === 'GET' && url.pathname === '/v1/health') {
-    sendJson(response, 200, getHealth());
+    sendJson(response, 200, getHealth(options.mediaVersions ? ['mediaVersions'] : []));
     return;
   }
 
@@ -105,6 +116,71 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     });
     stream.on('error', () => { if (!response.headersSent) sendJson(response, 500, { error: 'media_read_failed', requestId }); else response.destroy(); });
     stream.pipe(response);
+    return;
+  }
+
+  const versionCollection = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/versions$/);
+  const versionResource = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/versions\/([^/]+)$/);
+  const versionContent = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/versions\/([^/]+)\/content$/);
+  if (versionCollection && (request.method === 'GET' || request.method === 'POST')) {
+    const libraryId = decodePathSegment(versionCollection[1]);
+    const assetId = decodePathSegment(versionCollection[2]);
+    if (!libraryId || !assetId) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const principalId = await authorizeMediaVersionRequest(request, response, options, libraryId, requestId);
+    if (!principalId) return;
+    const control = options.mediaVersions;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    if (request.method === 'GET') {
+      try { sendJson(response, 200, control.listVersions(libraryId, assetId)); }
+      catch (error) { sendMediaVersionError(response, error, requestId); }
+      return;
+    }
+    try {
+      const contentType = headerValue(request, 'content-type') ?? '';
+      if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+        sendJson(response, 415, { error: 'unsupported_media_type', requestId });
+        return;
+      }
+      const body = await readJsonBody(request, 64 * 1024);
+      if (!isCreateMediaVersionRequest(body)) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+      const operation = await control.createVersion(libraryId, assetId, body, principalId);
+      sendJson(response, 202, operation);
+    } catch (error) {
+      if (error instanceof UploadError) sendJson(response, statusFor(error), { error: error.code.toLowerCase(), requestId });
+      else sendMediaVersionError(response, error, requestId);
+    }
+    return;
+  }
+
+  const versionRoute = versionContent ?? versionResource;
+  if (versionRoute && request.method === 'GET') {
+    const libraryId = decodePathSegment(versionRoute[1]);
+    const assetId = decodePathSegment(versionRoute[2]);
+    const versionId = decodePathSegment(versionRoute[3]);
+    if (!libraryId || !assetId || !versionId) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const principalId = await authorizeMediaVersionRequest(request, response, options, libraryId, requestId);
+    if (!principalId) return;
+    const control = options.mediaVersions;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const version = control.getVersion(libraryId, assetId, versionId);
+    if (!version) { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    if (!versionContent) { sendJson(response, 200, version); return; }
+    if (version.status !== 'ready' || !version.outputSha256 || !version.mimeType || version.byteSize === null) {
+      sendJson(response, 409, { error: version.status === 'failed' ? 'version_failed' : 'version_not_ready', requestId });
+      return;
+    }
+    try {
+      const content = await control.readVersionContent(libraryId, assetId, versionId);
+      response.writeHead(200, {
+        'content-type': content.mimeType,
+        'content-length': String(content.byteSize),
+        'etag': `"${content.sha256}"`,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'content-disposition': 'inline'
+      });
+      response.end(content.bytes);
+    } catch (error) { sendMediaVersionError(response, error, requestId); }
     return;
   }
 
@@ -298,6 +374,80 @@ async function handlePairingRequest(
   sendJson(response, 404, { error: 'not_found', requestId });
   return true;
 }
+
+async function authorizeMediaVersionRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: NodeAgentServerOptions,
+  libraryId: string,
+  requestId: string
+): Promise<string | undefined> {
+  const token = bearerToken(request);
+  if (!await options.authorizePairingAdmin?.(token)) {
+    sendJson(response, 403, { error: 'forbidden', requestId });
+    return undefined;
+  }
+  const principalId = await options.authorizeLibraryRead?.(token, libraryId);
+  if (!principalId) {
+    sendJson(response, 403, { error: 'forbidden', requestId });
+    return undefined;
+  }
+  return principalId;
+}
+
+function decodePathSegment(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const decoded = decodeURIComponent(value);
+    return decoded.length > 0 && decoded.length <= 128 && !/[\\/\0]/.test(decoded) ? decoded : undefined;
+  } catch { return undefined; }
+}
+
+function isCreateMediaVersionRequest(value: unknown): value is CreateMediaVersionRequest {
+  if (!isPlainRecord(value) || !hasExactKeys(value, ['sourceVersionId', 'sourceSha256', 'transform', 'idempotencyKey'])) return false;
+  if (!(value.sourceVersionId === null || typeof value.sourceVersionId === 'string' && value.sourceVersionId.length > 0 && value.sourceVersionId.length <= 128) ||
+    typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.sourceSha256) ||
+    typeof value.idempotencyKey !== 'string' || !/^[A-Za-z0-9._~-]{16,128}$/.test(value.idempotencyKey) ||
+    !isPlainRecord(value.transform) || !hasExactKeys(value.transform, ['crop', 'rotation'])) return false;
+  const { crop, rotation } = value.transform;
+  if (!isPlainRecord(crop) || !hasExactKeys(crop, ['x', 'y', 'width', 'height']) ||
+    !Number.isSafeInteger(crop.x) || !Number.isSafeInteger(crop.y) || !Number.isSafeInteger(crop.width) || !Number.isSafeInteger(crop.height) ||
+    (crop.x as number) < 0 || (crop.y as number) < 0 || (crop.width as number) < 1 || (crop.height as number) < 1 ||
+    (crop.x as number) + (crop.width as number) > 1_000_000 || (crop.y as number) + (crop.height as number) > 1_000_000 ||
+    ![0, 90, 180, 270].includes(rotation as number)) return false;
+  return !(crop.x === 0 && crop.y === 0 && crop.width === 1_000_000 && crop.height === 1_000_000 && rotation === 0);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function sendMediaVersionError(response: ServerResponse, error: unknown, requestId: string): void {
+  const candidate = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+  const code = typeof candidate === 'string' && mediaVersionErrorStatuses[candidate]
+    ? candidate : 'STORAGE_FAILED';
+  sendJson(response, mediaVersionErrorStatuses[code]!, { error: code.toLowerCase(), requestId });
+}
+
+const mediaVersionErrorStatuses: Record<string, number> = {
+  INVALID_REQUEST: 400,
+  NOT_FOUND: 404,
+  SOURCE_CHANGED: 409,
+  SOURCE_OFFLINE: 503,
+  IDEMPOTENCY_CONFLICT: 409,
+  VERSION_NOT_READY: 409,
+  VERSION_FAILED: 409,
+  VERSION_UNAVAILABLE: 503,
+  TOO_LARGE: 413,
+  UNSUPPORTED_MEDIA: 415,
+  PROCESSING_FAILED: 500,
+  STORAGE_FAILED: 503
+};
 
 async function authorize(options: NodeAgentServerOptions, request: UploadAuthorizationRequest): Promise<UploadPrincipal | undefined> {
   return options.authorizeUpload?.(request);

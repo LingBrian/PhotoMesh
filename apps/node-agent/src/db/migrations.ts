@@ -273,5 +273,77 @@ export const migrations: readonly Migration[] = [
         received_at TEXT NOT NULL
       );
     `
+  },
+  {
+    id: '0004_media_versions',
+    sql: `
+      CREATE UNIQUE INDEX assets_asset_library_unique_idx ON assets (asset_id, library_id);
+      CREATE TABLE media_versions (
+        version_id TEXT PRIMARY KEY,
+        asset_id TEXT NOT NULL,
+        library_id TEXT NOT NULL,
+        source_version_id TEXT,
+        source_sha256 TEXT NOT NULL CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+        transform_json TEXT NOT NULL CHECK (json_valid(transform_json)),
+        idempotency_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 16 AND 128),
+        request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+        status TEXT NOT NULL CHECK (status IN ('staging', 'ready', 'failed')),
+        storage_ref TEXT NOT NULL UNIQUE CHECK (storage_ref GLOB 'derived/*' AND instr(storage_ref, '..') = 0),
+        output_sha256 TEXT CHECK (output_sha256 IS NULL OR (length(output_sha256) = 64 AND output_sha256 NOT GLOB '*[^0-9a-f]*')),
+        mime_type TEXT CHECK (mime_type IS NULL OR mime_type IN ('image/jpeg', 'image/png', 'image/webp')),
+        byte_size INTEGER CHECK (byte_size IS NULL OR byte_size > 0),
+        width INTEGER CHECK (width IS NULL OR width > 0),
+        height INTEGER CHECK (height IS NULL OR height > 0),
+        error_code TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (library_id, idempotency_scope, idempotency_key),
+        UNIQUE (version_id, asset_id, library_id),
+        FOREIGN KEY (asset_id, library_id) REFERENCES assets (asset_id, library_id) ON DELETE RESTRICT,
+        FOREIGN KEY (source_version_id, asset_id, library_id)
+          REFERENCES media_versions (version_id, asset_id, library_id) ON DELETE RESTRICT,
+        CHECK (
+          (status = 'ready' AND output_sha256 IS NOT NULL AND mime_type IS NOT NULL AND byte_size IS NOT NULL AND
+            width IS NOT NULL AND height IS NOT NULL AND error_code IS NULL) OR
+          (status = 'staging' AND output_sha256 IS NULL AND mime_type IS NULL AND byte_size IS NULL AND
+            width IS NULL AND height IS NULL AND error_code IS NULL) OR
+          (status = 'failed' AND output_sha256 IS NULL AND mime_type IS NULL AND byte_size IS NULL AND
+            width IS NULL AND height IS NULL AND error_code IS NOT NULL)
+        )
+      );
+      CREATE INDEX media_versions_asset_created_idx ON media_versions (library_id, asset_id, created_at DESC, version_id);
+      CREATE INDEX media_versions_status_created_idx ON media_versions (status, created_at);
+      CREATE TRIGGER media_versions_insert_guard BEFORE INSERT ON media_versions
+      WHEN NEW.status <> 'staging' OR NOT EXISTS (
+        SELECT 1 FROM assets a WHERE a.asset_id = NEW.asset_id AND a.library_id = NEW.library_id AND a.kind = 'photo'
+      ) OR (NEW.source_version_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM asset_files f WHERE f.asset_id = NEW.asset_id AND f.media_role = 'original' AND f.sha256 = NEW.source_sha256
+      )) OR (NEW.source_version_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM media_versions p WHERE p.version_id = NEW.source_version_id AND p.asset_id = NEW.asset_id
+          AND p.library_id = NEW.library_id AND p.status = 'ready' AND p.output_sha256 = NEW.source_sha256
+      ))
+      BEGIN SELECT RAISE(ABORT, 'media version source is invalid'); END;
+      CREATE TRIGGER media_versions_identity_guard BEFORE UPDATE ON media_versions
+      WHEN NEW.version_id IS NOT OLD.version_id OR NEW.asset_id IS NOT OLD.asset_id OR NEW.library_id IS NOT OLD.library_id OR
+        NEW.source_version_id IS NOT OLD.source_version_id OR NEW.source_sha256 IS NOT OLD.source_sha256 OR
+        NEW.transform_json IS NOT OLD.transform_json OR NEW.idempotency_scope IS NOT OLD.idempotency_scope OR
+        NEW.idempotency_key IS NOT OLD.idempotency_key OR NEW.request_fingerprint IS NOT OLD.request_fingerprint OR
+        NEW.storage_ref IS NOT OLD.storage_ref OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at
+      BEGIN SELECT RAISE(ABORT, 'media version identity is immutable'); END;
+      CREATE TRIGGER media_versions_status_guard BEFORE UPDATE OF status ON media_versions
+      WHEN OLD.status <> NEW.status AND NOT (OLD.status = 'staging' AND NEW.status IN ('ready', 'failed'))
+      BEGIN SELECT RAISE(ABORT, 'invalid media version status transition'); END;
+      CREATE TRIGGER media_versions_terminal_guard BEFORE UPDATE ON media_versions
+      WHEN OLD.status IN ('ready', 'failed') AND (
+        NEW.status IS NOT OLD.status OR NEW.output_sha256 IS NOT OLD.output_sha256 OR NEW.mime_type IS NOT OLD.mime_type OR
+        NEW.byte_size IS NOT OLD.byte_size OR NEW.width IS NOT OLD.width OR NEW.height IS NOT OLD.height OR
+        NEW.error_code IS NOT OLD.error_code OR NEW.updated_at IS NOT OLD.updated_at
+      )
+      BEGIN SELECT RAISE(ABORT, 'terminal media version is immutable'); END;
+      CREATE TRIGGER media_versions_no_delete BEFORE DELETE ON media_versions
+      BEGIN SELECT RAISE(ABORT, 'media version deletion is disabled'); END;
+    `
   }
 ];

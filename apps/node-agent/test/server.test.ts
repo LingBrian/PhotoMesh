@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Readable } from 'node:stream';
-import { createNodeAgentServer, type NodeAgentServerOptions, type PairingServerControl } from '../src/server.js';
+import { createNodeAgentServer, type MediaVersionServerControl, type NodeAgentServerOptions, type PairingServerControl } from '../src/server.js';
 
 const servers: ReturnType<typeof createNodeAgentServer>[] = [];
 
@@ -23,7 +23,7 @@ describe('node-agent health endpoint', () => {
   it('returns the health contract on loopback', async () => {
     const response = await request('/v1/health');
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: 'degraded', protocolMin: 0, protocolMax: 0 });
+    expect(await response.json()).toEqual({ status: 'degraded', protocolMin: 0, protocolMax: 0, capabilities: [] });
   });
 
   it('returns a structured 404 for unknown paths', async () => {
@@ -66,6 +66,181 @@ describe('pairing and library authorization endpoints', () => {
     const recycle = await request('/v1/recycle-bin?libraryId=library', options, { headers: { authorization: 'Bearer admin' } });
     expect(recycle.status).toBe(200);
     expect(await recycle.json()).toMatchObject({ items: [{ assetId: 'deleted' }] });
+  });
+
+  it('gates version APIs on current Node admin credentials and validates create requests', async () => {
+    const listVersions = vi.fn(() => ({ original: {
+      sourceVersionId: null, sha256: 'a'.repeat(64), mimeType: 'image/jpeg' as const,
+      byteSize: 10, filename: 'photo.jpg', availability: 'online' as const
+    }, items: [] }));
+    const createVersion = vi.fn<MediaVersionServerControl['createVersion']>(async () => ({
+      operationId: '550e8400-e29b-41d4-a716-446655440000',
+      versionId: '550e8400-e29b-41d4-a716-446655440000', status: 'staging'
+    }));
+    const options: NodeAgentServerOptions = {
+      mediaVersions: mediaVersionControl({ listVersions, createVersion }),
+      authorizePairingAdmin: (token) => token === 'admin-secret',
+      authorizeLibraryRead: (token, libraryId) => token === 'admin-secret' && libraryId === 'library' ? 'local-admin' : undefined
+    };
+    const health = await request('/v1/health', options);
+    expect(await health.json()).toEqual({ status: 'degraded', protocolMin: 0, protocolMax: 0, capabilities: ['mediaVersions'] });
+
+    const denied = await request('/v1/libraries/library/assets/asset/versions', options);
+    expect(denied.status).toBe(403);
+    expect(listVersions).not.toHaveBeenCalled();
+    const wrongLibrary = await request('/v1/libraries/private-library/assets/asset/versions', options, {
+      headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(wrongLibrary.status).toBe(403);
+    const encodedSeparator = await request('/v1/libraries/library%2Fprivate/assets/asset/versions', options, {
+      headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(encodedSeparator.status).toBe(400);
+
+    const authorized = await request('/v1/libraries/library/assets/asset/versions', options, {
+      headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(authorized.status).toBe(200);
+    expect(await authorized.json()).toMatchObject({ original: { sourceVersionId: null }, items: [] });
+
+    const wrongContentType = await request('/v1/libraries/library/assets/asset/versions', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret' }, body: '{}'
+    });
+    expect(wrongContentType.status).toBe(415);
+    const malformedJson = await request('/v1/libraries/library/assets/asset/versions', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' }, body: '{'
+    });
+    expect(malformedJson.status).toBe(400);
+    const oversizedBody = await request('/v1/libraries/library/assets/asset/versions', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+      body: 'x'.repeat(64 * 1024 + 1)
+    });
+    expect(oversizedBody.status).toBe(413);
+
+    const badBody = await request('/v1/libraries/library/assets/asset/versions', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourceVersionId: null, sourceSha256: 'a'.repeat(64), idempotencyKey: 'save-key-0123456789',
+        transform: { crop: { x: 900_000, y: 0, width: 200_000, height: 1_000_000 }, rotation: 0 }
+      })
+    });
+    expect(badBody.status).toBe(400);
+    expect(createVersion).not.toHaveBeenCalled();
+
+    const created = await request('/v1/libraries/library/assets/asset/versions', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourceVersionId: null, sourceSha256: 'a'.repeat(64), idempotencyKey: 'save-key-0123456789',
+        transform: { crop: { x: 0, y: 0, width: 500_000, height: 1_000_000 }, rotation: 90 }
+      })
+    });
+    expect(created.status).toBe(202);
+    expect(createVersion).toHaveBeenCalledWith('library', 'asset', expect.objectContaining({ sourceVersionId: null }), 'local-admin');
+
+    const offlineOptions: NodeAgentServerOptions = {
+      ...options,
+      mediaVersions: mediaVersionControl({ createVersion: async () => { throw { code: 'SOURCE_OFFLINE' }; } })
+    };
+    const offline = await request('/v1/libraries/library/assets/asset/versions', offlineOptions, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourceVersionId: null, sourceSha256: 'a'.repeat(64), idempotencyKey: 'offline-save-key-012345',
+        transform: { crop: { x: 0, y: 0, width: 500_000, height: 1_000_000 }, rotation: 90 }
+      })
+    });
+    expect(offline.status).toBe(503);
+    expect(await offline.json()).toMatchObject({ error: 'source_offline' });
+
+    const storageOptions: NodeAgentServerOptions = {
+      ...options,
+      mediaVersions: mediaVersionControl({ createVersion: async () => { throw { code: 'STORAGE_FAILED' }; } })
+    };
+    const storageFailure = await request('/v1/libraries/library/assets/asset/versions', storageOptions, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourceVersionId: null, sourceSha256: 'a'.repeat(64), idempotencyKey: 'storage-failure-012345',
+        transform: { crop: { x: 0, y: 0, width: 500_000, height: 1_000_000 }, rotation: 90 }
+      })
+    });
+    expect(storageFailure.status).toBe(503);
+    expect(await storageFailure.json()).toMatchObject({ error: 'storage_failed' });
+  });
+
+  it('streams only ready derived-version bytes after fresh authorization', async () => {
+    const versionId = '550e8400-e29b-41d4-a716-446655440000';
+    const readVersionContent = vi.fn(async () => ({
+      bytes: Buffer.from('derived-bytes'), mimeType: 'image/jpeg' as const, sha256: 'b'.repeat(64), byteSize: 13
+    }));
+    const options: NodeAgentServerOptions = {
+      mediaVersions: mediaVersionControl({ readVersionContent }),
+      authorizePairingAdmin: (token) => token === 'admin-secret',
+      authorizeLibraryRead: (token, libraryId) => token === 'admin-secret' && libraryId === 'library' ? 'local-admin' : undefined
+    };
+    const prefix = `/v1/libraries/library/assets/asset/versions/${versionId}`;
+    const denied = await request(`${prefix}/content`, options);
+    expect(denied.status).toBe(403);
+    expect(readVersionContent).not.toHaveBeenCalled();
+
+    const metadata = await request(prefix, options, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(metadata.status).toBe(200);
+    expect(await metadata.json()).toMatchObject({ versionId, status: 'ready' });
+
+    const content = await request(`${prefix}/content`, options, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(content.status).toBe(200);
+    expect(content.headers.get('content-type')).toBe('image/jpeg');
+    expect(content.headers.get('etag')).toBe(`"${'b'.repeat(64)}"`);
+    expect(content.headers.get('cache-control')).toBe('no-store');
+    expect(content.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(await content.text()).toBe('derived-bytes');
+
+    const missingOptions: NodeAgentServerOptions = {
+      ...options, mediaVersions: mediaVersionControl({ getVersion: () => undefined })
+    };
+    const missing = await request(prefix, missingOptions, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(missing.status).toBe(404);
+    const baseVersion = mediaVersionControl().getVersion('library', 'asset', versionId)!;
+    const stagingOptions: NodeAgentServerOptions = {
+      ...options, mediaVersions: mediaVersionControl({ getVersion: () => ({ ...baseVersion, status: 'staging' }) })
+    };
+    const staging = await request(`${prefix}/content`, stagingOptions, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(staging.status).toBe(409);
+    expect(await staging.json()).toMatchObject({ error: 'version_not_ready' });
+    const failedOptions: NodeAgentServerOptions = {
+      ...options, mediaVersions: mediaVersionControl({ getVersion: () => ({ ...baseVersion, status: 'failed', errorCode: 'processing_failed' }) })
+    };
+    const failed = await request(`${prefix}/content`, failedOptions, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(failed.status).toBe(409);
+    expect(await failed.json()).toMatchObject({ error: 'version_failed' });
+
+    const notReadyOptions: NodeAgentServerOptions = {
+      ...options,
+      mediaVersions: mediaVersionControl({ readVersionContent: async () => { throw { code: 'VERSION_NOT_READY' }; } })
+    };
+    const notReady = await request(`${prefix}/content`, notReadyOptions, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(notReady.status).toBe(409);
+    expect(await notReady.text()).not.toContain('original');
+
+    const unavailableOptions: NodeAgentServerOptions = {
+      ...options,
+      mediaVersions: mediaVersionControl({ readVersionContent: async () => { throw { code: 'VERSION_UNAVAILABLE' }; } })
+    };
+    const unavailable = await request(`${prefix}/content`, unavailableOptions, {
+      headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toMatchObject({ error: 'version_unavailable' });
+  });
+
+  it('fails closed when media-version capability is unavailable', async () => {
+    const options: NodeAgentServerOptions = {
+      authorizePairingAdmin: (token) => token === 'admin-secret',
+      authorizeLibraryRead: (token, libraryId) => token === 'admin-secret' && libraryId === 'library' ? 'local-admin' : undefined
+    };
+    const response = await request('/v1/libraries/library/assets/asset/versions', options, {
+      headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: 'capability_unavailable' });
   });
 
   it('adds CORS only for local web and Tauri origins', async () => {
@@ -149,5 +324,26 @@ function pairingControl(overrides: Partial<PairingServerControl> = {}): PairingS
     listPeers: () => [], listPending: () => [], decide: () => false, revokePeer: async () => false,
     grantLibraryRead: () => undefined, readLibraryIndex: () => undefined, listDiscoveredPeers: () => [],
     dialManualIp: async () => ({ peerId: 'peer', addresses: [] }), ...overrides
+  };
+}
+
+function mediaVersionControl(overrides: Partial<MediaVersionServerControl> = {}): MediaVersionServerControl {
+  const versionId = '550e8400-e29b-41d4-a716-446655440000';
+  return {
+    listVersions: () => ({ original: {
+      sourceVersionId: null, sha256: 'a'.repeat(64), mimeType: 'image/jpeg', byteSize: 10,
+      filename: 'photo.jpg', availability: 'online'
+    }, items: [] }),
+    createVersion: async () => ({ operationId: versionId, versionId, status: 'staging' }),
+    getVersion: () => ({
+      versionId, assetId: 'asset', sourceVersionId: null, sourceSha256: 'a'.repeat(64),
+      outputSha256: 'b'.repeat(64), mimeType: 'image/jpeg', byteSize: 13, width: 2, height: 3,
+      transform: { crop: { x: 0, y: 0, width: 500_000, height: 1_000_000 }, rotation: 90 },
+      status: 'ready', createdAt: '2026-10-24T00:00:00.000Z', errorCode: null
+    }),
+    readVersionContent: async () => ({
+      bytes: Buffer.from('derived-bytes'), mimeType: 'image/jpeg', sha256: 'b'.repeat(64), byteSize: 13
+    }),
+    ...overrides
   };
 }

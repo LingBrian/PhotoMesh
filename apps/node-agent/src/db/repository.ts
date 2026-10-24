@@ -118,6 +118,58 @@ export interface GalleryMediaRecord {
   availability: 'online' | 'cached' | 'offline' | 'missing';
 }
 
+export interface MediaVersionTransform {
+  crop: { x: number; y: number; width: number; height: number };
+  rotation: 0 | 90 | 180 | 270;
+}
+
+export type MediaVersionStatus = 'staging' | 'ready' | 'failed';
+
+export interface MediaVersionSourceRecord extends GalleryMediaRecord {
+  assetId: string;
+  sourceVersionId: string | null;
+  kind: AssetKind;
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp' | null;
+}
+
+export interface MediaVersionRecord {
+  versionId: string;
+  assetId: string;
+  libraryId: string;
+  sourceVersionId: string | null;
+  sourceSha256: string;
+  transform: MediaVersionTransform;
+  idempotencyScope: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  status: MediaVersionStatus;
+  storageRef: string;
+  outputSha256: string | null;
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp' | null;
+  byteSize: number | null;
+  width: number | null;
+  height: number | null;
+  errorCode: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateMediaVersionRecord {
+  versionId: string;
+  assetId: string;
+  libraryId: string;
+  sourceVersionId: string | null;
+  sourceSha256: string;
+  transform: MediaVersionTransform;
+  idempotencyScope: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  storageRef: string;
+  createdBy: string;
+  createdAt: string;
+}
+
 export interface UploadRepository {
   getUploadSession(sessionId: string): UploadSessionRecord | undefined;
   getUploadSessionByIdempotency(scope: string, key: string): UploadSessionRecord | undefined;
@@ -182,6 +234,29 @@ interface ChunkRow {
   staging_ref: string;
   accepted_offset: number;
   created_at: string;
+}
+
+interface MediaVersionSqlRow {
+  version_id: string;
+  asset_id: string;
+  library_id: string;
+  source_version_id: string | null;
+  source_sha256: string;
+  transform_json: string;
+  idempotency_scope: string;
+  idempotency_key: string;
+  request_fingerprint: string;
+  status: MediaVersionStatus;
+  storage_ref: string;
+  output_sha256: string | null;
+  mime_type: MediaVersionRecord['mimeType'];
+  byte_size: number | null;
+  width: number | null;
+  height: number | null;
+  error_code: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export class SqliteRepository implements UploadRepository {
@@ -429,6 +504,90 @@ export class SqliteRepository implements UploadRepository {
     if (!row) return undefined;
     return { libraryId: row.library_id, storageRef: row.storage_ref, sha256: row.sha256, byteSize: row.byte_size,
       filename: row.filename, originalPath: row.original_path, availability: row.availability };
+  }
+
+  getMediaVersionSource(libraryId: string, assetId: string, sourceVersionId: string | null): MediaVersionSourceRecord | undefined {
+    const asset = this.db.prepare(`SELECT a.kind FROM assets a WHERE a.asset_id = ? AND a.library_id = ?
+      AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id
+        AND p.tombstone_event_id IS NOT NULL)`).get(assetId, libraryId) as { kind: AssetKind } | undefined;
+    if (!asset || asset.kind !== 'photo') return undefined;
+    if (sourceVersionId === null) {
+      const original = this.getGalleryMedia(assetId);
+      if (!original || original.libraryId !== libraryId) return undefined;
+      return { ...original, assetId, sourceVersionId: null, kind: asset.kind, mimeType: null };
+    }
+    const version = this.getMediaVersion(libraryId, assetId, sourceVersionId);
+    if (!version || version.status !== 'ready' || !version.outputSha256 || !version.mimeType ||
+      version.byteSize === null || version.width === null || version.height === null) return undefined;
+    const original = this.getGalleryMedia(assetId);
+    return {
+      assetId, libraryId, sourceVersionId: version.versionId, kind: asset.kind,
+      filename: original?.filename ?? assetId, sha256: version.outputSha256, byteSize: version.byteSize,
+      storageRef: version.storageRef, originalPath: null, availability: 'online', mimeType: version.mimeType
+    };
+  }
+
+  listMediaVersions(libraryId: string, assetId: string): MediaVersionRecord[] {
+    const rows = this.db.prepare(`SELECT v.* FROM media_versions v JOIN assets a
+      ON a.asset_id = v.asset_id AND a.library_id = v.library_id
+      WHERE v.library_id = ? AND v.asset_id = ? AND NOT EXISTS (
+        SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id
+          AND p.tombstone_event_id IS NOT NULL)
+      ORDER BY v.created_at, v.version_id`).all(libraryId, assetId) as MediaVersionSqlRow[];
+    return rows.map(toMediaVersionRecord);
+  }
+
+  getMediaVersion(libraryId: string, assetId: string, versionId: string): MediaVersionRecord | undefined {
+    const row = this.db.prepare(`SELECT v.* FROM media_versions v JOIN assets a
+      ON a.asset_id = v.asset_id AND a.library_id = v.library_id
+      WHERE v.library_id = ? AND v.asset_id = ? AND v.version_id = ? AND NOT EXISTS (
+        SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id
+          AND p.tombstone_event_id IS NOT NULL)`).get(libraryId, assetId, versionId) as MediaVersionSqlRow | undefined;
+    return row ? toMediaVersionRecord(row) : undefined;
+  }
+
+  getMediaVersionById(versionId: string): MediaVersionRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM media_versions WHERE version_id = ?').get(versionId) as MediaVersionSqlRow | undefined;
+    return row ? toMediaVersionRecord(row) : undefined;
+  }
+
+  getMediaVersionByIdempotency(libraryId: string, scope: string, key: string): MediaVersionRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM media_versions WHERE library_id = ? AND idempotency_scope = ? AND idempotency_key = ?')
+      .get(libraryId, scope, key) as MediaVersionSqlRow | undefined;
+    return row ? toMediaVersionRecord(row) : undefined;
+  }
+
+  createMediaVersion(record: CreateMediaVersionRecord): void {
+    this.db.prepare(`INSERT INTO media_versions (
+      version_id, asset_id, library_id, source_version_id, source_sha256, transform_json, idempotency_scope,
+      idempotency_key, request_fingerprint, status, storage_ref, output_sha256, mime_type, byte_size, width, height,
+      error_code, created_by, created_at, updated_at
+    ) VALUES (
+      @versionId, @assetId, @libraryId, @sourceVersionId, @sourceSha256, @transformJson, @idempotencyScope,
+      @idempotencyKey, @requestFingerprint, 'staging', @storageRef, NULL, NULL, NULL, NULL, NULL,
+      NULL, @createdBy, @createdAt, @createdAt
+    )`).run({ ...record, transformJson: JSON.stringify(record.transform) });
+  }
+
+  markMediaVersionReady(versionId: string, output: {
+    sha256: string; mimeType: 'image/jpeg' | 'image/png' | 'image/webp'; byteSize: number; width: number; height: number;
+  }, now: string): boolean {
+    const result = this.db.prepare(`UPDATE media_versions SET status = 'ready', output_sha256 = ?, mime_type = ?,
+      byte_size = ?, width = ?, height = ?, updated_at = ? WHERE version_id = ? AND status = 'staging'`)
+      .run(output.sha256, output.mimeType, output.byteSize, output.width, output.height, now, versionId);
+    return result.changes === 1;
+  }
+
+  markMediaVersionFailed(versionId: string, errorCode: string, now: string): boolean {
+    const result = this.db.prepare(`UPDATE media_versions SET status = 'failed', error_code = ?, updated_at = ?
+      WHERE version_id = ? AND status = 'staging'`).run(errorCode, now, versionId);
+    return result.changes === 1;
+  }
+
+  listStagingMediaVersions(): MediaVersionRecord[] {
+    const rows = this.db.prepare("SELECT * FROM media_versions WHERE status = 'staging' ORDER BY created_at, version_id")
+      .all() as MediaVersionSqlRow[];
+    return rows.map(toMediaVersionRecord);
   }
 
   listActiveTombstones(libraryId?: string): Array<{ assetId: string; libraryId: string; eventId: string }> {
@@ -688,5 +847,18 @@ function toChunkRecord(row: ChunkRow): UploadChunkRecord {
     stagingRef: row.staging_ref,
     acceptedOffset: row.accepted_offset,
     createdAt: row.created_at
+  };
+}
+
+function toMediaVersionRecord(row: MediaVersionSqlRow): MediaVersionRecord {
+  return {
+    versionId: row.version_id, assetId: row.asset_id, libraryId: row.library_id,
+    sourceVersionId: row.source_version_id, sourceSha256: row.source_sha256,
+    transform: JSON.parse(row.transform_json) as MediaVersionTransform,
+    idempotencyScope: row.idempotency_scope, idempotencyKey: row.idempotency_key,
+    requestFingerprint: row.request_fingerprint, status: row.status, storageRef: row.storage_ref,
+    outputSha256: row.output_sha256, mimeType: row.mime_type, byteSize: row.byte_size,
+    width: row.width, height: row.height, errorCode: row.error_code,
+    createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at
   };
 }
