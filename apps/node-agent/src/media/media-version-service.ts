@@ -93,6 +93,7 @@ export class MediaVersionService {
   private readonly queue: string[] = [];
   private readonly queued = new Set<string>();
   private readonly active = new Set<string>();
+  private readonly inFlightAdmissions = new Map<string, { fingerprint: string; promise: Promise<MediaVersionOperation> }>();
   private workerPromise: Promise<void> | undefined;
   private stopping = false;
 
@@ -124,6 +125,13 @@ export class MediaVersionService {
       return operationFor(prior);
     }
 
+    const idempotencyIdentity = JSON.stringify([libraryId, principalId, normalized.idempotencyKey]);
+    const inFlight = this.inFlightAdmissions.get(idempotencyIdentity);
+    if (inFlight) {
+      if (inFlight.fingerprint !== fingerprint) throw new MediaVersionError('IDEMPOTENCY_CONFLICT');
+      return inFlight.promise;
+    }
+
     const source = this.repository.getMediaVersionSource(libraryId, assetId, normalized.sourceVersionId);
     if (!source) {
       if (normalized.sourceVersionId !== null) {
@@ -136,6 +144,22 @@ export class MediaVersionService {
     if (!['online', 'cached'].includes(source.availability)) throw new MediaVersionError('SOURCE_OFFLINE');
     if (source.sha256 !== normalized.sourceSha256) throw new MediaVersionError('SOURCE_CHANGED');
     this.reserveAdmission();
+    const promise = this.createVersionFromSource(libraryId, assetId, normalized, fingerprint, source, principalId);
+    const admission = { fingerprint, promise };
+    this.inFlightAdmissions.set(idempotencyIdentity, admission);
+    try {
+      return await promise;
+    } finally {
+      if (this.inFlightAdmissions.get(idempotencyIdentity) === admission) {
+        this.inFlightAdmissions.delete(idempotencyIdentity);
+      }
+    }
+  }
+
+  private async createVersionFromSource(
+    libraryId: string, assetId: string, normalized: CreateMediaVersionRequest, fingerprint: string,
+    source: MediaVersionSourceRecord, principalId: string
+  ): Promise<MediaVersionOperation> {
     try {
       const bytes = await this.readSource(source);
       if (digest(bytes) !== source.sha256) throw new MediaVersionError('SOURCE_CHANGED');
