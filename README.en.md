@@ -21,9 +21,9 @@ PhotoMesh is a self-hosted, decentralized photo library. Each node keeps its own
 
 ### Use prebuilt node packages (Windows x64 / Linux x64)
 
-Download the built node package; you do not need to install Node.js or compile source on the target computer. Choose the package and `SHA256SUMS.txt` from the same version on [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases).
+Download the built node package; you do not need to install Node.js or compile source on the target computer. Choose the Windows or Linux package from the desired version on [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases).
 
-1. **Download and verify.** Windows: `PhotoMesh-<version>-node-agent-windows-x64.zip`. Linux: `PhotoMesh-<version>-node-agent-linux-x64.tar.gz`. Verify the archive against its matching SHA-256 entry before extracting.
+1. **Download and extract.** Windows: `PhotoMesh-<version>-node-agent-windows-x64.zip`. Linux: `PhotoMesh-<version>-node-agent-linux-x64.tar.gz`. Extract the archive to a directory of your choice.
 2. **Windows extraction and start.** In File Explorer, right-click the ZIP and select **Extract All**. Open the extracted folder and run `start.bat`. On first run, the launcher prompts for an administrator token. Leave it blank to generate a one-time token, then save the displayed token in a password manager.
 3. **Linux extraction and start.** If the archive is in the current directory, run:
    ```sh
@@ -43,7 +43,7 @@ The release also provides `PhotoMesh-<version>-node-agent-linux-amd64.docker.tar
 
 ### Connect a client device
 
-Download the latest Windows x64 desktop installer (`PhotoMesh-<version>-windows-x64-unsigned.exe`) from [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases), and download that release's `SHA256SUMS.txt`. Verify it in PowerShell with `$asset = Get-ChildItem . -Filter '*windows-x64-unsigned.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS.txt -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` before installing. The current installer is unsigned; continue only on a test computer if Windows displays a security warning. If no release asset is available, use the source download and local Web development steps above.
+Download the latest Windows x64 desktop installer (`PhotoMesh-<version>-windows-x64-unsigned.exe`) from [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases). The installer is unsigned and Windows may display an unknown-publisher or SmartScreen warning; install it only on a test computer. If no release asset is available, use the source download and local Web development steps above.
 
 1. **Open the client.** Start the Agent on its node computer, then launch PhotoMesh from the Start menu. Or, from the repository root, run `pnpm --filter @photomesh/web dev` in another PowerShell and open the local URL printed in the terminal.
 2. **Enter the node URL and token.** Open **Settings → Node settings**. On the same computer, enter `http://127.0.0.1:8443`. For a node on another computer, use its private LAN IP (for example `http://192.168.1.20:8443`), and expose the HTTP API across devices only behind a trusted TLS reverse proxy. Enter the node's `PHOTOMESH_ADMIN_TOKEN`, click **Save and connect**, and confirm the status is online and the library list loads. Give this token only to trusted administrator devices.
