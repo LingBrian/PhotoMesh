@@ -55,7 +55,7 @@ export interface MediaVersionPage {
 
 export type MediaVersionErrorCode =
   | 'INVALID_REQUEST' | 'NOT_FOUND' | 'SOURCE_CHANGED' | 'SOURCE_OFFLINE' | 'IDEMPOTENCY_CONFLICT'
-  | 'TOO_LARGE' | 'UNSUPPORTED_MEDIA' | 'PROCESSING_FAILED' | 'STORAGE_FAILED'
+  | 'TOO_LARGE' | 'UNSUPPORTED_MEDIA' | 'PROCESSING_FAILED' | 'STORAGE_FAILED' | 'QUEUE_FULL'
   | 'VERSION_NOT_READY' | 'VERSION_FAILED' | 'VERSION_UNAVAILABLE' | 'STORAGE_CORRUPT';
 
 export class MediaVersionError extends Error {
@@ -74,6 +74,8 @@ export interface MediaVersionServiceOptions {
   maxInputBytes?: number;
   maxOutputBytes?: number;
   maxPixels?: number;
+  maxPendingVersions?: number;
+  maxConcurrentPreflights?: number;
 }
 
 export class MediaVersionService {
@@ -85,6 +87,9 @@ export class MediaVersionService {
   private readonly maxInputBytes: number;
   private readonly maxOutputBytes: number;
   private readonly maxPixels: number;
+  private readonly maxPendingVersions: number;
+  private readonly maxConcurrentPreflights: number;
+  private pendingAdmissions = 0;
   private readonly queue: string[] = [];
   private readonly queued = new Set<string>();
   private readonly active = new Set<string>();
@@ -100,6 +105,12 @@ export class MediaVersionService {
     this.maxInputBytes = options.maxInputBytes ?? maxMediaVersionInputBytes;
     this.maxOutputBytes = options.maxOutputBytes ?? maxMediaVersionOutputBytes;
     this.maxPixels = options.maxPixels ?? maxMediaVersionPixels;
+    this.maxPendingVersions = options.maxPendingVersions ?? 16;
+    this.maxConcurrentPreflights = options.maxConcurrentPreflights ?? 2;
+    if (!Number.isSafeInteger(this.maxPendingVersions) || this.maxPendingVersions < 1 ||
+        !Number.isSafeInteger(this.maxConcurrentPreflights) || this.maxConcurrentPreflights < 1) {
+      throw new RangeError('Media-version queue limits must be positive integers');
+    }
   }
 
   async createVersion(libraryId: string, assetId: string, input: CreateMediaVersionRequest, principalId: string): Promise<MediaVersionOperation> {
@@ -124,35 +135,48 @@ export class MediaVersionService {
     }
     if (!['online', 'cached'].includes(source.availability)) throw new MediaVersionError('SOURCE_OFFLINE');
     if (source.sha256 !== normalized.sourceSha256) throw new MediaVersionError('SOURCE_CHANGED');
-    const bytes = await this.readSource(source);
-    if (digest(bytes) !== source.sha256) throw new MediaVersionError('SOURCE_CHANGED');
-    const probe = await this.inspect(bytes);
-    this.assertImageProbe(probe, source.mimeType);
-    const sourceMime = mimeForFormat(probe.format);
-    if (!sourceMime) throw new MediaVersionError('UNSUPPORTED_MEDIA');
-
-    const versionId = randomUUID();
-    const record: CreateMediaVersionRecord = {
-      versionId, assetId, libraryId, sourceVersionId: normalized.sourceVersionId,
-      sourceSha256: normalized.sourceSha256, transform: normalized.transform, idempotencyScope: principalId,
-      idempotencyKey: normalized.idempotencyKey, requestFingerprint: fingerprint,
-      storageRef: `derived/${versionId}/output.${extensionForMime(sourceMime)}`,
-      createdBy: principalId, createdAt: this.now()
-    };
+    this.reserveAdmission();
     try {
-      this.repository.createMediaVersion(record);
-    } catch (error) {
-      const raced = this.repository.getMediaVersionByIdempotency(libraryId, principalId, normalized.idempotencyKey);
-      if (raced) {
-        if (raced.requestFingerprint !== fingerprint) throw new MediaVersionError('IDEMPOTENCY_CONFLICT');
-        if (raced.status === 'staging') this.enqueue(raced.versionId);
-        return operationFor(raced);
+      const bytes = await this.readSource(source);
+      if (digest(bytes) !== source.sha256) throw new MediaVersionError('SOURCE_CHANGED');
+      const probe = await this.inspect(bytes);
+      this.assertImageProbe(probe, source.mimeType);
+      const sourceMime = mimeForFormat(probe.format);
+      if (!sourceMime) throw new MediaVersionError('UNSUPPORTED_MEDIA');
+
+      const versionId = randomUUID();
+      const record: CreateMediaVersionRecord = {
+        versionId, assetId, libraryId, sourceVersionId: normalized.sourceVersionId,
+        sourceSha256: normalized.sourceSha256, transform: normalized.transform, idempotencyScope: principalId,
+        idempotencyKey: normalized.idempotencyKey, requestFingerprint: fingerprint,
+        storageRef: `derived/${versionId}/output.${extensionForMime(sourceMime)}`,
+        createdBy: principalId, createdAt: this.now()
+      };
+      try {
+        this.repository.createMediaVersion(record);
+      } catch (error) {
+        const raced = this.repository.getMediaVersionByIdempotency(libraryId, principalId, normalized.idempotencyKey);
+        if (raced) {
+          if (raced.requestFingerprint !== fingerprint) throw new MediaVersionError('IDEMPOTENCY_CONFLICT');
+          if (raced.status === 'staging') this.enqueue(raced.versionId);
+          return operationFor(raced);
+        }
+        if (error instanceof RepositoryConflictError) throw new MediaVersionError('IDEMPOTENCY_CONFLICT');
+        throw new MediaVersionError('STORAGE_FAILED');
       }
-      if (error instanceof RepositoryConflictError) throw new MediaVersionError('IDEMPOTENCY_CONFLICT');
-      throw new MediaVersionError('STORAGE_FAILED');
+      this.enqueue(versionId);
+      return { operationId: versionId, versionId, status: 'staging' };
+    } finally {
+      this.pendingAdmissions--;
     }
-    this.enqueue(versionId);
-    return { operationId: versionId, versionId, status: 'staging' };
+  }
+
+  private reserveAdmission(): void {
+    const pending = this.queue.length + this.active.size + this.pendingAdmissions;
+    if (this.pendingAdmissions >= this.maxConcurrentPreflights || pending >= this.maxPendingVersions) {
+      throw new MediaVersionError('QUEUE_FULL');
+    }
+    this.pendingAdmissions++;
   }
 
   listVersions(libraryId: string, assetId: string): MediaVersionPage {

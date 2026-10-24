@@ -253,11 +253,15 @@ class _BackupHomeState extends State<BackupHome> with WidgetsBindingObserver {
       },
     );
     if (selected == null) return;
-    var added = 0;
-    for (final asset in assets.where((asset) => selected.contains(asset.id))) {
-      if (await photos.queueAsset(asset) != null) added++;
+    final result = await queueSelectedPhotos(
+      assets.where((asset) => selected.contains(asset.id)),
+      photos.queueAsset,
+    );
+    var message = _s('manualAdded').replaceAll('{count}', '${result.queued}');
+    if (result.skipped > 0) {
+      message = '$message ${_s('manualSkipped').replaceAll('{count}', '${result.skipped}')}';
     }
-    if (mounted) setState(() => _status = _s('manualAdded').replaceAll('{count}', '$added'));
+    if (mounted) setState(() => _status = message);
     await _refreshQueue();
     await _processQueue(manual: true);
   }

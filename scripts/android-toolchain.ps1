@@ -54,8 +54,14 @@ function Get-PhotoMeshAndroidToolchain {
   $null = New-Item -ItemType Directory -Path $localHome -Force
   $env:HOME = $localHome
   $env:USERPROFILE = $localHome
-  $env:HOMEDRIVE = Split-Path -Path $localHome -Qualifier
-  $env:HOMEPATH = $localHome.Substring($env:HOMEDRIVE.Length)
+  $homeRoot = [System.IO.Path]::GetPathRoot($localHome)
+  if ($homeRoot -match '^[A-Za-z]:') {
+    $env:HOMEDRIVE = $homeRoot.Substring(0, 2)
+    $env:HOMEPATH = $localHome.Substring($env:HOMEDRIVE.Length)
+  } else {
+    Remove-Item Env:HOMEDRIVE -ErrorAction SilentlyContinue
+    Remove-Item Env:HOMEPATH -ErrorAction SilentlyContinue
+  }
   $localAppData = Join-Path $androidRoot 'appdata'
   $env:APPDATA = Join-Path $localAppData 'roaming'
   $env:LOCALAPPDATA = Join-Path $localAppData 'local'

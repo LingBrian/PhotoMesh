@@ -126,7 +126,7 @@ paths:
         '413': {description: 'Input-size or pixel limit exceeded before the asynchronous operation is accepted'}
         '415': {description: Unsupported media format}
         '500': {description: Internal transform or database error}
-        '503': {description: 'Source, storage, or Node media capability unavailable'}
+        '503': {description: 'Source or storage unavailable, or temporary media-version capacity limit reached; retry later'}
   /v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}:
     parameters:
       - in: path

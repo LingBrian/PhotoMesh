@@ -12,7 +12,7 @@ The repository-local Android toolchain lives under the repository-root `android/
 - `android/tmp/` — temporary scratch space for Flutter and its child tools.
 - `android/home/` and `android/appdata/` — Flutter/Gradle per-user home, config, and state directories.
 
-`scripts/android-toolchain.ps1` prioritizes this local toolchain when present and sets `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_AVD_HOME`, `ANDROID_USER_HOME`, `ANDROID_SDK_HOME`, `JAVA_HOME`, `HOME`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `TEMP`, `TMP`, `APPDATA`, `LOCALAPPDATA`, `GRADLE_USER_HOME`, and `PUB_CACHE` only in the invoking PowerShell process; it does not persist machine-wide environment changes. If no local Flutter SDK is installed, Flutter can be selected from `PATH`; set `PHOTOMESH_FLUTTER_BIN` to explicitly override the CLI.
+`scripts/android-toolchain.ps1` prioritizes this local toolchain when present and sets `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_AVD_HOME`, `ANDROID_USER_HOME`, `ANDROID_SDK_HOME`, `JAVA_HOME`, `HOME`, `USERPROFILE`, `TEMP`, `TMP`, `APPDATA`, `LOCALAPPDATA`, `GRADLE_USER_HOME`, and `PUB_CACHE` only in the invoking PowerShell process; on Windows it also sets `HOMEDRIVE` and `HOMEPATH`. It does not persist machine-wide environment changes. If no local Flutter SDK is installed, Flutter can be selected from `PATH`; set `PHOTOMESH_FLUTTER_BIN` to explicitly override the CLI.
 
 ## Common commands
 

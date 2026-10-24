@@ -446,7 +446,8 @@ const mediaVersionErrorStatuses: Record<string, number> = {
   TOO_LARGE: 413,
   UNSUPPORTED_MEDIA: 415,
   PROCESSING_FAILED: 500,
-  STORAGE_FAILED: 503
+  STORAGE_FAILED: 503,
+  QUEUE_FULL: 503
 };
 
 async function authorize(options: NodeAgentServerOptions, request: UploadAuthorizationRequest): Promise<UploadPrincipal | undefined> {

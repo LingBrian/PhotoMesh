@@ -164,6 +164,20 @@ describe('pairing and library authorization endpoints', () => {
     });
     expect(storageFailure.status).toBe(503);
     expect(await storageFailure.json()).toMatchObject({ error: 'storage_failed' });
+
+    const queueOptions: NodeAgentServerOptions = {
+      ...options,
+      mediaVersions: mediaVersionControl({ createVersion: async () => { throw { code: 'QUEUE_FULL' }; } })
+    };
+    const queueFull = await request('/v1/libraries/library/assets/asset/versions', queueOptions, {
+      method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourceVersionId: null, sourceSha256: 'a'.repeat(64), idempotencyKey: 'queue-full-save-key-0123',
+        transform: { crop: { x: 0, y: 0, width: 500_000, height: 1_000_000 }, rotation: 90 }
+      })
+    });
+    expect(queueFull.status).toBe(503);
+    expect(await queueFull.json()).toMatchObject({ error: 'queue_full' });
   });
 
   it('streams only ready derived-version bytes after fresh authorization', async () => {

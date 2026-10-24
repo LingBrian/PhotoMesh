@@ -40,6 +40,63 @@ describe('MediaVersionService', () => {
     expect(harness.repository.getMediaVersionSource('library', 'asset', null)?.sha256).toBe(sourceSha256);
   });
 
+  it('rejects invalid media-version admission limits', async () => {
+    const harness = await createHarness();
+    const options = {
+      repository: harness.repository, fileSystem: harness.files,
+      transformer: harness.transformer, openOriginal: harness.openOriginal
+    };
+    expect(() => new MediaVersionService({ ...options, maxPendingVersions: 0 })).toThrow(RangeError);
+    expect(() => new MediaVersionService({ ...options, maxConcurrentPreflights: 0 })).toThrow(RangeError);
+  });
+
+  it('limits simultaneous source preflights before reading another image', async () => {
+    const harness = await createHarness({ maxConcurrentPreflights: 1 });
+    let releaseInspect!: () => void;
+    const inspectGate = new Promise<void>((resolve) => { releaseInspect = resolve; });
+    vi.mocked(harness.transformer.inspect).mockImplementation(async () => {
+      await inspectGate;
+      return { format: 'jpeg', width: 2, height: 3, pages: 1 };
+    });
+
+    const firstRequest = request('preflight-first-key-0123');
+    const first = harness.service.createVersion('library', 'asset', firstRequest, 'local-admin');
+    try {
+      await vi.waitFor(() => expect(harness.transformer.inspect).toHaveBeenCalledTimes(1));
+      await expect(harness.service.createVersion('library', 'asset', request('preflight-second-key-0123'), 'local-admin'))
+        .rejects.toMatchObject({ code: 'QUEUE_FULL' });
+      expect(harness.openOriginal).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseInspect();
+      await first;
+      await harness.service.waitForIdle();
+    }
+  });
+
+  it('bounds pending transforms while preserving idempotent retries', async () => {
+    const harness = await createHarness({ maxPendingVersions: 1 });
+    let releaseTransform: (() => void) | undefined;
+    vi.mocked(harness.transformer.transform).mockImplementation(async () => {
+      await new Promise<void>((resolve) => { releaseTransform = resolve; });
+      return { bytes: harness.outputBytes, mimeType: harness.outputMime, width: 2, height: 3 };
+    });
+
+    const firstRequest = request('queue-first-key-012345');
+    try {
+      const first = await harness.service.createVersion('library', 'asset', firstRequest, 'local-admin');
+      await vi.waitFor(() => expect(releaseTransform).toBeDefined());
+      const inspectCalls = vi.mocked(harness.transformer.inspect).mock.calls.length;
+      await expect(harness.service.createVersion('library', 'asset', request('queue-second-key-01234'), 'local-admin'))
+        .rejects.toMatchObject({ code: 'QUEUE_FULL' });
+      expect(vi.mocked(harness.transformer.inspect)).toHaveBeenCalledTimes(inspectCalls);
+      const replay = await harness.service.createVersion('library', 'asset', firstRequest, 'local-admin');
+      expect(replay.versionId).toBe(first.versionId);
+    } finally {
+      releaseTransform?.();
+      await harness.service.waitForIdle();
+    }
+  });
+
   it('preserves supported source MIME types and uses matching server-generated keys', async () => {
     for (const format of ['png', 'webp'] as const) {
       const harness = await createHarness({ format });
@@ -432,6 +489,8 @@ async function createHarness(options: {
   maxInputBytes?: number;
   maxOutputBytes?: number;
   maxPixels?: number;
+  maxPendingVersions?: number;
+  maxConcurrentPreflights?: number;
   format?: 'jpeg' | 'png' | 'webp';
 } = {}) {
   const database = new Database(':memory:');
@@ -457,13 +516,15 @@ async function createHarness(options: {
     inspect: vi.fn(async () => ({ format, width: 2, height: 3, pages: 1 })),
     transform: vi.fn(async () => ({ bytes: outputBytes, mimeType: outputMime, width: 2, height: 3 }))
   };
-  const openOriginal = async () => Readable.from([originalBytes]);
+  const openOriginal = vi.fn(async () => Readable.from([originalBytes]));
   const service = new MediaVersionService({
     repository, fileSystem: files, transformer, openOriginal,
     now: () => '2026-10-24T00:00:01.000Z',
     ...(options.maxInputBytes === undefined ? {} : { maxInputBytes: options.maxInputBytes }),
     ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
-    ...(options.maxPixels === undefined ? {} : { maxPixels: options.maxPixels })
+    ...(options.maxPixels === undefined ? {} : { maxPixels: options.maxPixels }),
+     ...(options.maxPendingVersions === undefined ? {} : { maxPendingVersions: options.maxPendingVersions }),
+     ...(options.maxConcurrentPreflights === undefined ? {} : { maxConcurrentPreflights: options.maxConcurrentPreflights })
   });
   services.push(service);
   return { repository, service, files, transformer, originalBytes, outputBytes, outputMime, openOriginal };
