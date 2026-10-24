@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -71,6 +72,20 @@ void main() {
     await tempDirectory.delete(recursive: true);
   });
 
+  test('continues manual selection after gallery access failures and reports skipped items', () async {
+    final visited = <int>[];
+    final result = await queueSelectedPhotos<int>([1, 2, 3, 4], (id) async {
+      visited.add(id);
+      if (id == 2) throw FileSystemException('permission revoked');
+      if (id == 3) throw const PlatformException(code: 'permission_revoked');
+      return id == 1 ? _job([1, 2, 3]) : null;
+    });
+
+    expect(visited, [1, 2, 3, 4]);
+    expect(result.queued, 1);
+    expect(result.skipped, 3);
+  });
+
   test('upload verifies the source and server SHA-256 before completing', () async {
     final bytes = [1, 2, 3, 4, 5, 6];
     final job = _job(bytes);
@@ -108,6 +123,54 @@ void main() {
     expect(result.state, UploadJobState.completed);
     expect(result.offset, bytes.length);
     expect((await queue.get(job.id))?.state, UploadJobState.completed);
+    service.close();
+  });
+
+  test('keeps final gallery chunk uncompleted when access is revoked during transfer', () async {
+    final bytes = [7, 8, 9];
+    final base = _job(bytes);
+    final galleryJob = UploadJob(
+      id: 'revoked-final-chunk', assetId: 'media-store-id', filePath: base.filePath,
+      originalPath: base.originalPath, filename: base.filename, totalBytes: base.totalBytes,
+      sha256: base.sha256, idempotencyKey: base.idempotencyKey, state: UploadJobState.queued,
+      createdAt: base.createdAt, updatedAt: base.updatedAt,
+    );
+    await queue.enqueue(galleryJob);
+    var remoteOffset = 0;
+    var permissionChecks = 0;
+    var completionCalls = 0;
+    final client = MockClient((request) async {
+      if (request.url.path == '/v1/uploads') return http.Response('{"sessionId":"last-chunk","offset":0}', 201);
+      if (request.url.path == '/v1/uploads/last-chunk') {
+        return http.Response(jsonEncode({'sessionId': 'last-chunk', 'offset': remoteOffset, 'state': 'uploading'}), 200);
+      }
+      if (request.url.path.contains('/chunks/')) {
+        remoteOffset += request.bodyBytes.length;
+        return http.Response(jsonEncode({'sessionId': 'last-chunk', 'offset': remoteOffset}), 200);
+      }
+      if (request.url.path.endsWith('/complete')) {
+        completionCalls++;
+        return http.Response(jsonEncode({'sha256': base.sha256, 'byteLength': bytes.length}), 200);
+      }
+      return http.Response('', 404);
+    });
+    final service = UploadService(
+      queue: queue,
+      settings: _Settings(),
+      client: client,
+      fileAccess: _MemoryFiles(bytes),
+      resolveSource: (_) async => base.filePath,
+      galleryPermissionAllowed: () async => ++permissionChecks == 1,
+      chunkBytes: bytes.length,
+    );
+
+    final result = await service.upload(galleryJob);
+    expect(permissionChecks, 2);
+    expect(remoteOffset, bytes.length);
+    expect(completionCalls, 0);
+    expect(result.state, UploadJobState.needsPermission);
+    expect(result.errorCode, 'PERMISSION_REVOKED');
+    expect(result.offset, bytes.length);
     service.close();
   });
 

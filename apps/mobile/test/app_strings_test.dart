@@ -33,6 +33,8 @@ void main() {
     expect(appString('en', 'permissionRevoked'), isNot('permissionRevoked'));
     expect(appString('zh', 'sourceUnavailable'), isNot('sourceUnavailable'));
     expect(appString('en', 'sourceUnavailable'), isNot('sourceUnavailable'));
+    expect(appString('zh', 'manualSkipped'), contains('未加入'));
+    expect(appString('en', 'manualSkipped'), contains('not added'));
   });
 
   test('localizes known upload errors and preserves unknown diagnostic codes',
