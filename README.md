@@ -19,24 +19,31 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 
 ## 节点部署教程
 
-### 一键安装节点（Windows x64 / Linux x64）
+### 使用预构建节点包（Windows x64 / Linux x64）
 
-普通使用者应下载预构建节点包，无需下载源码或在目标设备编译。到 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Pre-release 的平台安装脚本：
+普通使用者下载已构建的节点软件包即可，无需在目标设备安装 Node.js 或编译源码。在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 选择对应版本的 Windows 或 Linux 节点包。
 
-1. **Windows x64：** 下载 `install.bat` 到一个新文件夹，双击运行。脚本会定位最新预发布，下载匹配的 `install.ps1`、Node Agent ZIP 和 `SHA256SUMS.txt`，校验 SHA-256 后安装内含 Node.js runtime 的节点包。
-2. **Linux x64：** 下载同一预发布里的 `install.sh`，执行 `chmod +x install.sh && ./install.sh`。脚本下载匹配版本的节点包和校验清单，验 hash 后解压并启动。
-3. **首次运行：** 脚本会提示管理员令牌。留空会生成一次性令牌并显示；请保存到密码管理器。可选输入一个要只读扫描的照片目录；留空则先不扫描照片。服务默认只监听本机 `127.0.0.1:8443)，在本机验证健康接口：`curl http://127.0.0.1:8443/v1/health`。Windows 用 `Invoke-RestMethod http://127.0.0.1:8443/v1/health`。
-4. 节点在前台运行，关闭窗口或按 Ctrl+C 会停止。Windows 数据目录为 `%LOCALAPPDATA%\PhotoMesh\data`；Linux 默认是 `~/.local/share/photomesh`。保存管理员令牌，重启后需重新输入相同令牌。
-5. Linux 节点身份密钥依赖 Secret Service。无可用 Secret Service 时，节点仍可启动本机 API，但安全配对/P2P 会关闭；不要把宿主机完整 D-Bus 会话暴露给不可信容器。
-6. 当前发布包仅为 x64/amd64；没有 ARM64 NAS 包。先用合成照片验证，预览版不要作为唯一原图副本。
-
+1. **下载与解压。** Windows 下载 `PhotoMesh-<版本>-node-agent-windows-x64.zip`；Linux 下载 `PhotoMesh-<版本>-node-agent-linux-x64.tar.gz`，将其解压到你选择的目录。
+2. **Windows 解压并启动。** 在文件资源管理器右键 ZIP，选择“全部解压缩”。进入解压目录，双击 `start.bat`。首次运行会提示管理员令牌；留空会生成一次性令牌并显示，请保存到密码管理器。
+3. **Linux 解压并启动。** 假设下载目录为当前目录，执行：
+   ```sh
+   mkdir -p "$HOME/.local/opt/photomesh/node-agent/<版本>"
+   tar -xzf PhotoMesh-<版本>-node-agent-linux-x64.tar.gz -C "$HOME/.local/opt/photomesh/node-agent/<版本>"
+   cd "$HOME/.local/opt/photomesh/node-agent/<版本>"
+   ./start.sh
+   ```
+   首次运行按提示设置管理员令牌；留空会生成一次性令牌并显示，请安全保存。
+4. **可选来源目录。** 启动器可填写一个外部照片目录供只读扫描；留空则不扫描。不要把 PhotoMesh 数据目录放在外部来源目录内。
+5. **确认服务启动。** Agent 在前台运行，关闭窗口或按 Ctrl+C 会停止。服务默认只监听本机 `127.0.0.1:8443`。在另一终端检查：Windows 运行 `Invoke-RestMethod http://127.0.0.1:8443/v1/health`；Linux 运行 `curl http://127.0.0.1:8443/v1/health`。
+6. Windows 数据目录默认为 `%LOCALAPPDATA%\PhotoMesh\data`；Linux 默认是 `~/.local/share/photomesh`。重启后需输入相同管理员令牌。Linux 节点身份密钥依赖 Secret Service；未配置时，安全配对/P2P 会关闭。
+7. 当前节点包仅支持 x64/amd64；没有 ARM64 NAS 包。先用合成照片验证，预览版不要作为唯一原图副本。
 ### Linux Docker 镜像（可选）
 
 发布包也提供 `PhotoMesh-<版本>-node-agent-linux-amd64.docker.tar`。下载后运行 `docker load -i <镜像归档>`，然后用专用数据卷启动。详细命令、回滚与网络边界见[部署与预发布教程](docs/预发布发布流程.md)。
 
 ### 终端连接步骤
 
-先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Windows x64 桌面安装包（`PhotoMesh-<版本>-windows-x64-unsigned.exe`）；下载同一版本的 `SHA256SUMS.txt`，在 PowerShell 用 `$asset = Get-ChildItem . -Filter '*x64-setup.exe' | Select-Object -First 1; $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLower(); if ((Get-Content .\SHA256SUMS -Raw) -notmatch [regex]::Escape($hash)) { throw 'SHA-256 mismatch' }` 核对后再安装。Windows 安全提示当前未签名安装包时，只在测试电脑上确认继续。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
+先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Windows x64 桌面安装包（`PhotoMesh-<版本>-windows-x64-unsigned.exe`）。该安装包尚未进行代码签名，Windows 可能显示未知发布者或 SmartScreen 警告；只在测试电脑上安装。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
 
 1. **打开客户端。** 在节点电脑启动 Agent；再从开始菜单打开 PhotoMesh，或在仓库根目录另开 PowerShell 运行 `pnpm --filter @photomesh/web dev`，并打开终端打印的本地地址。
 2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把节点运行时的 `PHOTOMESH_ADMIN_TOKEN` 填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。

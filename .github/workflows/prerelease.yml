@@ -22,7 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.validate.outputs.version }}
+      sha: ${{ steps.validate.outputs.sha }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - id: validate
         env:
           VERSION: ${{ inputs.version }}
@@ -38,7 +42,13 @@ jobs:
             echo "Release v$VERSION already exists." >&2
             exit 1
           fi
+          repository_version="$(jq -r '.version' package.json)"
+          if [[ "$repository_version" != "$VERSION" ]]; then
+            echo "Repository version ($repository_version) does not match requested release ($VERSION)." >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
   gate:
     name: Release acceptance gate
@@ -48,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.validate.outputs.sha }}
       - uses: pnpm/action-setup@v4
         with:
           version: 11.25.0
@@ -83,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.validate.outputs.sha }}
       - uses: pnpm/action-setup@v4
         with:
           version: 11.25.0
@@ -124,7 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.validate.outputs.sha }}
       - uses: pnpm/action-setup@v4
         with:
           version: 11.25.0
@@ -189,7 +199,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.validate.outputs.sha }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -232,9 +242,6 @@ jobs:
           test -n "$apksigner"
           "$apksigner" verify --verbose "$apk"
           cp "$apk" "$output/PhotoMesh-$VERSION-android-arm64.apk"
-          keytool -exportcert -rfc -keystore "$PHOTOMESH_ANDROID_KEYSTORE" \
-            -storepass "$PHOTOMESH_ANDROID_KEYSTORE_PASSWORD" -alias "$PHOTOMESH_ANDROID_KEY_ALIAS" \
-            -file "$output/PhotoMesh-$VERSION-android-signing-certificate.pem"
       - uses: actions/upload-artifact@v4
         with:
           name: photomesh-${{ needs.validate.outputs.version }}-android
@@ -250,7 +257,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.validate.outputs.sha }}
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: pnpm/action-setup@v4
         with:
@@ -284,9 +291,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $destination = Join-Path $out "PhotoMesh-$env:VERSION-windows-x64-unsigned.exe"
           Copy-Item -LiteralPath $installers[0].FullName -Destination $destination
-          $hash = Get-FileHash -LiteralPath $destination -Algorithm SHA256
           Write-Output "Unsigned Windows NSIS installer ready: $destination ($((Get-Item -LiteralPath $destination).Length) bytes)."
-          Write-Output "SHA-256: $($hash.Hash)"
       - uses: actions/upload-artifact@v4
         with:
           name: photomesh-${{ needs.validate.outputs.version }}-windows
@@ -300,8 +305,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -327,38 +330,45 @@ jobs:
         with:
           name: photomesh-${{ needs.validate.outputs.version }}-node-windows-x64
           path: release-assets/products/node-windows-x64
-      - name: Verify gate verdict and create checksums
+      - name: Curate product assets and release notes
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
           test "$(jq -r .verdict "release-assets/review/release-report.json")" = "ready-for-human-review"
+          published="release-assets/published"
+          mkdir -p "$published"
+          files=(
+            "release-assets/products/android/PhotoMesh-$VERSION-android-arm64.apk"
+            "release-assets/products/web-nas/PhotoMesh-$VERSION-web.tar.gz"
+            "release-assets/products/web-nas/PhotoMesh-$VERSION-node-agent-linux-amd64.docker.tar"
+            "release-assets/products/windows/PhotoMesh-$VERSION-windows-x64-unsigned.exe"
+            "release-assets/products/node-linux-x64/PhotoMesh-$VERSION-node-agent-linux-x64.tar.gz"
+            "release-assets/products/node-windows-x64/PhotoMesh-$VERSION-node-agent-windows-x64.zip"
+          )
+          for file in "${files[@]}"; do
+            test -s "$file"
+            cp "$file" "$published/"
+          done
+          count="$(find "$published" -maxdepth 1 -type f | wc -l)"
+          test "$count" -eq 6
           {
             cat "release-assets/review/CHANGELOG.md"
             echo
-            echo "## Windows installer signature"
+            echo "## Platform notes"
             echo
-            echo "The Windows NSIS installer is unsigned because this project does not yet have a trusted code-signing certificate. Windows may show an unknown-publisher or SmartScreen warning. Verify the download against SHA256SUMS.txt before installing, and use a test device."
-            echo
-            echo "The Android APK uses a one-time CI signing identity that changes per candidate; uninstall an earlier preview before installing a newer one."
-            echo
-            echo "Verify downloaded files against SHA256SUMS.txt and the GitHub build provenance attestation."
+            echo "The Windows desktop installer is unsigned. Install previews only on a test computer."
+            echo "The Android APK uses a one-time CI signing identity; uninstall an earlier preview before installing a newer one."
           } > release-assets/RELEASE_NOTES.md
-          while IFS= read -r -d '' file; do
-            hash="$(sha256sum "$file" | cut -d ' ' -f1)"
-            printf '%s  %s\n' "$hash" "${file##*/}"
-          done < <(find release-assets -type f ! -name SHA256SUMS.txt -print0 | sort -z) > release-assets/SHA256SUMS.txt
-      - name: Attest release assets
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: release-assets/**/*
       - name: Create prerelease
         env:
           VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mapfile -d '' assets < <(find release-assets -type f -print0 | sort -z)
-          gh release create "v$VERSION" "${assets[@]}" --target main --prerelease \
+          mapfile -d '' assets < <(find release-assets/published -maxdepth 1 -type f -print0 | sort -z)
+          test "${#assets[@]}" -eq 6
+          gh release create "v$VERSION" "${assets[@]}" --target "$SOURCE_SHA" --prerelease \
             --title "PhotoMesh $VERSION" --notes-file release-assets/RELEASE_NOTES.md
