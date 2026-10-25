@@ -67,6 +67,9 @@ test('keeps the authorized session timeline available offline and previews only 
   await expect(page.getByRole('status').filter({ hasText: 'Node is offline' })).toHaveCount(0);
   await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
   expect(originalReads).toBe(1);
+  if (process.env.PHOTOMESH_GALLERY_SCREENSHOT_PATH) {
+    await page.screenshot({ path: process.env.PHOTOMESH_GALLERY_SCREENSHOT_PATH, fullPage: true });
+  }
 });
 
 test('does not fail a valid preview when browser thumbnail storage is unavailable', async ({ page }) => {
