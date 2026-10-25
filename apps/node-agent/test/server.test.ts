@@ -46,7 +46,8 @@ describe('pairing and library authorization endpoints', () => {
         listAssets: () => ({ items: [{ assetId: 'asset' }], nextCursor: null }),
         getOriginal: async () => readOriginal(),
         openOriginal,
-        listTombstones: () => [{ assetId: 'deleted', libraryId: 'library', eventId: 'evt' }]
+        listTombstones: () => [{ assetId: 'deleted', libraryId: 'library', eventId: 'evt' }],
+        restoreTombstone: async () => ({ status: 'restored', restoreEventId: 'restore-event' })
       }
     };
     const noAuth = await request('/v1/libraries', options);
@@ -66,6 +67,60 @@ describe('pairing and library authorization endpoints', () => {
     const recycle = await request('/v1/recycle-bin?libraryId=library', options, { headers: { authorization: 'Bearer admin' } });
     expect(recycle.status).toBe(200);
     expect(await recycle.json()).toMatchObject({ items: [{ assetId: 'deleted' }] });
+  });
+
+  it('restores only authorized active tombstones and requires a valid causal parent identifier', async () => {
+    const eventId = '550e8400-e29b-41d4-a716-446655440001';
+    const restoreTombstone = vi.fn(async (): Promise<{ status: 'restored'; restoreEventId: string } | 'not_found' | 'inactive' | 'conflict'> => ({ status: 'restored', restoreEventId: '550e8400-e29b-41d4-a716-446655440099' }));
+    const options: NodeAgentServerOptions = {
+      authorizePairingAdmin: (token) => token === 'admin',
+      authorizeLibraryRead: (token, libraryId) => token === 'admin' && libraryId === 'library' ? 'local-admin' : undefined,
+      gallery: {
+        listLibraries: () => [], listAssets: () => ({ items: [], nextCursor: null }),
+        getOriginal: async () => undefined, openOriginal: () => undefined, listTombstones: () => [], restoreTombstone
+      }
+    };
+    const body = JSON.stringify({ libraryId: 'library', eventId });
+    const unauthenticated = await request('/v1/recycle-bin/restore', options, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body
+    });
+    expect(unauthenticated.status).toBe(403);
+    expect(restoreTombstone).not.toHaveBeenCalled();
+
+    const wrongLibrary = await request('/v1/recycle-bin/restore', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ libraryId: 'other-library', eventId })
+    });
+    expect(wrongLibrary.status).toBe(403);
+    expect(restoreTombstone).not.toHaveBeenCalled();
+
+    const malformed = await request('/v1/recycle-bin/restore', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ libraryId: 'library', eventId: 'not-an-event-id' })
+    });
+    expect(malformed.status).toBe(400);
+    expect(restoreTombstone).not.toHaveBeenCalled();
+
+    const restored = await request('/v1/recycle-bin/restore', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body
+    });
+    expect(restored.status).toBe(200);
+    expect(await restored.json()).toEqual({ status: 'restored', tombstoneEventId: eventId, restoreEventId: '550e8400-e29b-41d4-a716-446655440099' });
+    expect(restoreTombstone).toHaveBeenCalledWith('library', eventId);
+
+    restoreTombstone.mockResolvedValue('inactive');
+    const alreadyRestored = await request('/v1/recycle-bin/restore', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body
+    });
+    expect(alreadyRestored.status).toBe(409);
+    expect(await alreadyRestored.json()).toMatchObject({ error: 'tombstone_not_active' });
+
+    restoreTombstone.mockResolvedValue('conflict');
+    const causalConflict = await request('/v1/recycle-bin/restore', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body
+    });
+    expect(causalConflict.status).toBe(409);
+    expect(await causalConflict.json()).toMatchObject({ error: 'causal_context_conflict' });
   });
 
   it('gates version APIs on current Node admin credentials and validates create requests', async () => {
@@ -257,7 +312,7 @@ describe('pairing and library authorization endpoints', () => {
     expect(await response.json()).toMatchObject({ error: 'capability_unavailable' });
   });
 
-  it('adds CORS only for local web and Tauri origins', async () => {
+  it('adds CORS only for local web and Tauri origins by default', async () => {
     const allowed = await request('/v1/health', {}, { headers: { origin: 'http://localhost:5173' } });
     expect(allowed.headers.get('access-control-allow-origin')).toBe('http://localhost:5173');
     const preflight = await request('/v1/libraries', {}, { method: 'OPTIONS', headers: { origin: 'tauri://localhost' } });
@@ -265,6 +320,20 @@ describe('pairing and library authorization endpoints', () => {
     expect(preflight.headers.get('access-control-allow-origin')).toBe('tauri://localhost');
     const denied = await request('/v1/health', {}, { headers: { origin: 'https://attacker.example' } });
     expect(denied.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('allows a configured remote Web origin exactly, while rejecting other origins', async () => {
+    const allowedOrigin = 'https://gallery.example.com';
+    const preflight = await request('/v1/recycle-bin/restore', { allowedWebOrigins: [allowedOrigin] }, {
+      method: 'OPTIONS', headers: { origin: allowedOrigin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'authorization,content-type' }
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('access-control-allow-origin')).toBe(allowedOrigin);
+    expect(preflight.headers.get('access-control-allow-credentials')).toBeNull();
+    const denied = await request('/v1/health', { allowedWebOrigins: [allowedOrigin] }, { headers: { origin: 'https://gallery.example.com.evil' } });
+    expect(denied.headers.get('access-control-allow-origin')).toBeNull();
+    expect(() => createNodeAgentServer({ allowedWebOrigins: ['https://gallery.example.com/gallery'] })).toThrow(/PHOTOMESH_WEB_ORIGINS/);
+    expect(() => createNodeAgentServer({ allowedWebOrigins: ['http://gallery.example.com'] })).toThrow(/PHOTOMESH_WEB_ORIGINS/);
   });
 
   it('denies library index reads without a trusted principal and a persisted library grant', async () => {
