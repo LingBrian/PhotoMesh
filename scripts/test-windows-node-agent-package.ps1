@@ -90,12 +90,14 @@ console.log('Windows external photo-root prompt smoke passed.');
 
   # Literal-path handling must preserve shell metacharacters and Unicode.
   $specialPath = Join-Path $testRootPath ('photos [1] & ' + [char]0x7167 + [char]0x7247)
-  New-Item -ItemType Directory -Path $specialPath -ErrorAction Stop | Out-Null
+  $null = [System.IO.Directory]::CreateDirectory($specialPath)
   foreach ($inputPath in @($specialPath, ('"' + $specialPath + '"'), ("'" + $specialPath + "'"))) {
     $specialJson = ConvertTo-PhotoMeshExternalRootJson -Path $inputPath
-    $specialRoot = @($specialJson | ConvertFrom-Json)
-    if ($specialRoot.Count -ne 1 -or $specialRoot[0].path -ne $specialPath -or -not $specialJson.StartsWith('[')) {
-      throw 'Quoted, Unicode or literal special-character path did not round-trip.'
+    $specialRoot = @(ConvertFrom-Json -InputObject $specialJson)
+    $actualPath = if ($specialRoot.Count -gt 0) { [string]$specialRoot[0].path } else { '' }
+    $pathMatches = [string]::Equals($actualPath, $specialPath, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($specialRoot.Count -ne 1 -or -not $pathMatches -or -not $specialJson.TrimStart().StartsWith('[')) {
+      throw "Quoted, Unicode or literal special-character path did not round-trip. Input=[$inputPath]; Expected=[$specialPath]; Actual=[$actualPath]; roots=$($specialRoot.Count); JSON=[$specialJson]; PowerShell=$($PSVersionTable.PSVersion)."
     }
   }
   $providerRejected = $false
