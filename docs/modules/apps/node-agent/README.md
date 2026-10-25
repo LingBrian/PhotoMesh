@@ -33,6 +33,8 @@ Unit tests use an in-memory SQLite database and `VirtualFileSystem` with injecta
 
 The agent watches discovered directories and also performs a full scheduled scan every 15 minutes, because platform and NAS watchers can drop events. A watcher event triggers a debounced rescan. Symlinks are followed only when their resolved targets are within an explicitly configured root; directory cycles are reported and skipped. Inaccessible paths become `offline`; confirmed absent paths become `missing`. An incomplete directory scan does not infer deletions. Neither state transition deletes an asset, source file, or global metadata.
 
+On Windows, `start.bat` asks for an optional external photo folder. The launcher verifies that the path resolves to a readable directory and serializes it as a one-entry JSON root allowlist. Invalid paths display the underlying reason and prompt again; pressing Enter skips external folders. The selected source remains read-only.
+
 ## LAN identity and pairing
 
 Each node creates an Ed25519 libp2p identity whose private key is stored in Windows Credential Manager or Linux Secret Service; the public Peer ID/key is stored in SQLite. Linux pairing fails closed if Secret Service is unavailable. TCP connections use Noise XX and mDNS only advertises untrusted discovery hints. Configure `PHOTOMESH_LAN_BIND_ADDRESSES` with explicit private interface IPs and `PHOTOMESH_P2P_PORT` to enable LAN listening. Wildcard/public binds are rejected.

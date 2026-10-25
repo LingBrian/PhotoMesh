@@ -158,6 +158,7 @@ jobs:
           Copy-Item -Path 'apps/node-agent/dist/*' -Destination (Join-Path $stage 'dist') -Recurse -Force
           Copy-Item -LiteralPath (Get-Command node).Source -Destination (Join-Path $stage 'runtime/node.exe')
           Copy-Item -LiteralPath 'scripts/node-agent/start.ps1' -Destination (Join-Path $stage 'start.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/external-roots.ps1' -Destination (Join-Path $stage 'external-roots.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/start.bat' -Destination (Join-Path $stage 'start.bat')
           $out = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
