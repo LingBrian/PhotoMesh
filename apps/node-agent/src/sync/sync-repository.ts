@@ -38,6 +38,12 @@ export class SyncRepository {
     return row.restored_by_event_id === null ? 'active' : 'inactive';
   }
 
+  getTombstoneRestoreEventId(libraryId: string, eventId: string): string | null {
+    const row = this.db.prepare(`SELECT restored_by_event_id FROM sync_tombstones
+      WHERE library_id = ? AND event_id = ?`).get(libraryId, eventId) as { restored_by_event_id: string | null } | undefined;
+    return row?.restored_by_event_id ?? null;
+  }
+
   /** Caller includes this write in the same SQLite transaction as its source mutation. */
   reserveLocalEventDraft(libraryId: string, authorPeerId: string, factory: EventDraftFactory): UnsignedEventEnvelope {
     const event = factory(this.readLocalEventContext(libraryId, authorPeerId));

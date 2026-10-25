@@ -204,7 +204,7 @@ paths:
   /v1/recycle-bin/restore:
     post:
       summary: Restore an active tombstone by appending a signed asset.restored event
-      description: Requires current Node administrator credentials and read authorization for the specified library. Never deletes or rewrites source originals.
+      description: Requires current Node administrator credentials and read authorization for the specified library. Repeating a request after commit reuses the recorded restore event ID without appending another event. Never deletes or rewrites source originals.
       requestBody:
         required: true
         content:
@@ -218,7 +218,7 @@ paths:
                 eventId: {type: string, format: uuid}
       responses:
         '200':
-          description: Restore event created; tombstone event is a causal parent
+          description: Restore completed or already recorded; retries reuse the persisted restore event ID without appending another event
           content:
             application/json:
               schema:
@@ -227,11 +227,11 @@ paths:
                 properties:
                   status: {type: string, const: restored}
                   tombstoneEventId: {type: string, format: uuid, description: Original active tombstone event ID}
-                  restoreEventId: {type: string, format: uuid, description: Newly signed asset.restored event ID}
+                  restoreEventId: {type: string, format: uuid, description: Newly signed or previously recorded asset.restored event ID}
         '400': {description: Invalid request}
         '403': {description: Admin authorization or library read authorization denied}
         '404': {description: Tombstone not found in the specified library}
-        '409': {description: Tombstone is no longer active or causal frontier cannot be represented}
+        '409': {description: "Tombstone is inactive without a recorded restore event, or causal frontier cannot be represented"}
         '503': {description: Sync capability unavailable}
   /v1/pairing/invitations:
     post:

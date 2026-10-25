@@ -108,6 +108,13 @@ describe('pairing and library authorization endpoints', () => {
     expect(await restored.json()).toEqual({ status: 'restored', tombstoneEventId: eventId, restoreEventId: '550e8400-e29b-41d4-a716-446655440099' });
     expect(restoreTombstone).toHaveBeenCalledWith('library', eventId);
 
+    const retried = await request('/v1/recycle-bin/restore', options, {
+      method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body
+    });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ status: 'restored', tombstoneEventId: eventId, restoreEventId: '550e8400-e29b-41d4-a716-446655440099' });
+    expect(restoreTombstone).toHaveBeenCalledTimes(2);
+
     restoreTombstone.mockResolvedValue('inactive');
     const alreadyRestored = await request('/v1/recycle-bin/restore', options, {
       method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body

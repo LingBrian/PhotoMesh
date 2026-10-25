@@ -17,9 +17,10 @@ import type { MediaVersionService } from './media/media-version-service.js';
 import type { MediaVersionSourceRecord } from './db/repository.js';
 import { timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
-import { SyncCausalityError, SyncRepository } from './sync/sync-repository.js';
+import { SyncRepository } from './sync/sync-repository.js';
 import { SyncService } from './sync/sync-service.js';
 import { TombstoneRestoreCoordinator } from './sync/restore-coordinator.js';
+import { restoreTombstoneOperation } from './sync/restore-operation.js';
 
 const port = Number(process.env.PORT ?? 8443);
 const dataDirectory = resolve(process.env.PHOTOMESH_DATA_DIR ?? './data');
@@ -140,26 +141,8 @@ const server = createNodeAgentServer({
     getOriginal: async (assetId) => repository.getGalleryMedia(assetId),
     openOriginal: openOriginalMedia,
     listTombstones: (libraryId) => repository.listActiveTombstones(libraryId),
-    restoreTombstone: (libraryId, eventId) => restoreCoordinator.run(libraryId, eventId, async () => {
-      if (!syncService) return 'unavailable';
-      const state = syncService.repository.getTombstoneState(libraryId, eventId);
-      if (state === 'not_found') return 'not_found';
-      if (state === 'inactive') return 'inactive';
-      const tombstone = repository.listActiveTombstones(libraryId).find((item) => item.eventId === eventId);
-      if (!tombstone) return 'inactive';
-      try {
-        const event = await syncService.createLocalEvent({
-          libraryId, eventType: 'asset.restored', causalParents: [eventId],
-          payload: { assetId: tombstone.assetId, tombstoneEventId: eventId }
-        }, eventId);
-        return { status: 'restored', restoreEventId: event.eventId };
-      } catch (error) {
-        if (error instanceof SyncCausalityError) {
-          return syncService.repository.getTombstoneState(libraryId, eventId) === 'active' ? 'conflict' : 'inactive';
-        }
-        throw error;
-      }
-    })
+    restoreTombstone: (libraryId, eventId) => restoreCoordinator.run(libraryId, eventId,
+      () => restoreTombstoneOperation(libraryId, eventId, syncService, (id) => repository.listActiveTombstones(id)))
   },
   ...(mediaVersionService ? { mediaVersions: mediaVersionService } : {}),
   ...(pairingControl ? { pairingControl } : {})
