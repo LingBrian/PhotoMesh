@@ -117,6 +117,26 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Build and smoke-test Windows Node Agent ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP ('photomesh-node-agent-ci-' + [guid]::NewGuid().ToString('N'))
+          pnpm --filter @photomesh/node-agent build
+          if ($LASTEXITCODE -ne 0) { throw 'Node Agent build failed.' }
+          pnpm --config.inject-workspace-packages=true --config.node-linker=hoisted --filter @photomesh/node-agent deploy --prod $stage
+          if ($LASTEXITCODE -ne 0) { throw 'Node Agent production deploy failed.' }
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'dist'), (Join-Path $stage 'runtime') | Out-Null
+          Copy-Item -Path 'apps/node-agent/dist/*' -Destination (Join-Path $stage 'dist') -Recurse -Force
+          Copy-Item -LiteralPath (Get-Command node).Source -Destination (Join-Path $stage 'runtime/node.exe')
+          Copy-Item -LiteralPath 'scripts/node-agent/start.ps1' -Destination (Join-Path $stage 'start.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/start.bat' -Destination (Join-Path $stage 'start.bat')
+          $archive = "$stage.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive
+          $smoke = "$stage-extracted"
+          Expand-Archive -LiteralPath $archive -DestinationPath $smoke
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-package.ps1' -PackageRoot $smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Node Agent ZIP smoke test failed.' }
       - run: pnpm --filter @photomesh/desktop build
       - run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
 
