@@ -152,7 +152,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'photomesh-node-agent'
-          pnpm --filter @photomesh/node-agent deploy --prod --legacy $stage
+          pnpm --config.inject-workspace-packages=true --config.node-linker=hoisted --filter @photomesh/node-agent deploy --prod $stage
           if ($LASTEXITCODE -ne 0) { throw 'pnpm deploy failed.' }
           New-Item -ItemType Directory -Force -Path (Join-Path $stage 'dist'), (Join-Path $stage 'runtime') | Out-Null
           Copy-Item -Path 'apps/node-agent/dist/*' -Destination (Join-Path $stage 'dist') -Recurse -Force
@@ -168,6 +168,18 @@ jobs:
           Set-Content -NoNewline -Encoding utf8 (Join-Path $out 'install.bat') $installerBat
           if (Select-String -Path (Join-Path $out 'install.ps1'), (Join-Path $out 'install.bat') -Pattern 'api\.github\.com') { throw 'Windows installers must not call the rate-limited GitHub API.' }
           if ((Get-Content -Raw (Join-Path $out 'install.bat')) -match '__VERSION__') { throw 'Windows release bootstrap was not version-pinned.' }
+      - name: Smoke-test Windows x64 Node Agent ZIP
+        if: matrix.platform == 'windows-x64'
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:GITHUB_WORKSPACE "release-assets\PhotoMesh-$env:VERSION-node-agent-windows-x64.zip"
+          $smoke = Join-Path $env:RUNNER_TEMP ('photomesh-node-agent-smoke-' + [guid]::NewGuid().ToString('N'))
+          Expand-Archive -LiteralPath $archive -DestinationPath $smoke
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-package.ps1' -PackageRoot $smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows Node Agent ZIP smoke test failed.' }
       - name: Package Linux x64 Node Agent
         if: matrix.platform == 'linux-x64'
         env:
