@@ -226,7 +226,7 @@ paths:
                 required: [status, tombstoneEventId, restoreEventId]
                 properties:
                   status: {type: string, const: restored}
-                  tombstoneEventId: {type: string, format: uuid, description: Original active tombstone event ID}
+                  tombstoneEventId: {type: string, format: uuid, description: Tombstone event ID targeted by this request}
                   restoreEventId: {type: string, format: uuid, description: Newly signed or previously recorded asset.restored event ID}
         '400': {description: Invalid request}
         '403': {description: Admin authorization or library read authorization denied}
