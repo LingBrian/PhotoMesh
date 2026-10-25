@@ -31,6 +31,13 @@ export class SyncRepository {
     return this.readLocalEventContext(libraryId, authorPeerId);
   }
 
+  getTombstoneState(libraryId: string, eventId: string): 'active' | 'inactive' | 'not_found' {
+    const row = this.db.prepare(`SELECT restored_by_event_id FROM sync_tombstones
+      WHERE library_id = ? AND event_id = ?`).get(libraryId, eventId) as { restored_by_event_id: string | null } | undefined;
+    if (!row) return 'not_found';
+    return row.restored_by_event_id === null ? 'active' : 'inactive';
+  }
+
   /** Caller includes this write in the same SQLite transaction as its source mutation. */
   reserveLocalEventDraft(libraryId: string, authorPeerId: string, factory: EventDraftFactory): UnsignedEventEnvelope {
     const event = factory(this.readLocalEventContext(libraryId, authorPeerId));
@@ -90,10 +97,20 @@ export class SyncRepository {
     complete.immediate();
   }
 
-  appendLocalEvent(event: EventEnvelope): void {
+  appendLocalEvent(event: EventEnvelope, requireActiveTombstoneId?: string): void {
     const append = this.db.transaction(() => {
+      if (requireActiveTombstoneId !== undefined) {
+        if (event.eventType !== 'asset.restored' || (event.payload as Record<string, JsonValue>).tombstoneEventId !== requireActiveTombstoneId ||
+            this.getTombstoneState(event.libraryId, requireActiveTombstoneId) !== 'active') {
+          throw new SyncCausalityError('restore tombstone is no longer active in this library');
+        }
+      }
       const context = this.readLocalEventContext(event.libraryId, event.authorPeerId);
-      if (event.authorSequence !== context.authorSequence || !sameStrings(event.causalParents, context.causalParents)) {
+      const expectedParents = requireActiveTombstoneId === undefined
+        ? context.causalParents
+        : [...new Set([...context.causalParents, requireActiveTombstoneId])].sort();
+      if (expectedParents.length > 64) throw new SyncCausalityError('causal frontier exceeds the 64-parent limit');
+      if (event.authorSequence !== context.authorSequence || !sameStrings(event.causalParents, expectedParents)) {
         throw new SyncProtocolConflictError('local event context changed while the event was being signed');
       }
       this.insertEvent(event);

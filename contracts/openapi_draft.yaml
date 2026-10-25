@@ -201,6 +201,38 @@ paths:
                 properties:
                   items: {type: array, items: {$ref: '#/components/schemas/Tombstone'}}
         '403': {description: Library access denied}
+  /v1/recycle-bin/restore:
+    post:
+      summary: Restore an active tombstone by appending a signed asset.restored event
+      description: Requires current Node administrator credentials and read authorization for the specified library. Never deletes or rewrites source originals.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [libraryId, eventId]
+              properties:
+                libraryId: {type: string, minLength: 1, maxLength: 128}
+                eventId: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Restore event created; tombstone event is a causal parent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, tombstoneEventId, restoreEventId]
+                properties:
+                  status: {type: string, const: restored}
+                  tombstoneEventId: {type: string, format: uuid, description: Original active tombstone event ID}
+                  restoreEventId: {type: string, format: uuid, description: Newly signed asset.restored event ID}
+        '400': {description: Invalid request}
+        '403': {description: Admin authorization or library read authorization denied}
+        '404': {description: Tombstone not found in the specified library}
+        '409': {description: Tombstone is no longer active or causal frontier cannot be represented}
+        '503': {description: Sync capability unavailable}
   /v1/pairing/invitations:
     post:
       summary: 创建短期一次性 LAN 配对邀请（返回供客户端编码为二维码的载荷）

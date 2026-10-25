@@ -41,6 +41,10 @@ Each node creates an Ed25519 libp2p identity whose private key is stored in Wind
 
 The local loopback management API requires `PHOTOMESH_ADMIN_TOKEN` for pairing actions. `POST /v1/pairing/invitations` returns a two-minute, single-use invite with a PNG QR data URL. The host must approve each authenticated peer. Pairing grants no library access by default; only explicit per-library read grants expose the index. Revocation closes the peer connection and is checked on every index request. See [LAN security pairing operations](../../../operations/LAN安全配对.md) for Windows PowerShell, firewall, Linux/NAS and Docker examples.
 
+### Web client origins
+
+By default, browser CORS is restricted to local Web origins and the Tauri origin. To use a Web client hosted at a remote, known origin, set `PHOTOMESH_WEB_ORIGINS` to a comma-separated allowlist of exact HTTPS origins (loopback HTTP origins may be used for development; scheme, host, and optional port only; no path, wildcard, or credentials). The agent reflects only an exact configured origin and does not enable cookie credentials. This is CORS configuration, not authorization: every protected API request still requires the current bearer credential and backend library ACL. Use HTTPS and an authenticated TLS reverse proxy when exposing the API beyond loopback; do not set a wildcard origin.
+
 ### Windows PowerShell (NTFS)
 
 Run the agent with the intended source folder in the explicit allowlist. The source folder is never opened for writing:

@@ -2,7 +2,7 @@ import type { LocalIdentity } from '../auth/local-identity.js';
 import type { PairingService } from '../auth/pairing-service.js';
 import type { EventEnvelope, EventContext, EventDraftFactory, JsonValue, SyncEventType, UnsignedEventEnvelope } from './event-envelope.js';
 import { makeUnsignedEvent, parseEventEnvelope, signEvent, verifyEvent, EVENT_SCHEMA_VERSION, MAX_EVENT_BYTES } from './event-envelope.js';
-import { SyncAuthorizationError, SyncProtocolConflictError, SyncRepository, type IngestResult, type SyncCursor } from './sync-repository.js';
+import { SyncAuthorizationError, SyncCausalityError, SyncProtocolConflictError, SyncRepository, type IngestResult, type SyncCursor } from './sync-repository.js';
 
 export const SYNC_PROTOCOL = '/photomesh/event-sync/1.0.0';
 export const SYNC_BATCH_LIMIT = 64;
@@ -66,16 +66,20 @@ export class SyncService {
     };
   }
 
-  async createLocalEvent(input: { libraryId: string; eventType: SyncEventType; payload: JsonValue; createdAt?: string }): Promise<EventEnvelope> {
+  async createLocalEvent(input: { libraryId: string; eventType: SyncEventType; payload: JsonValue; createdAt?: string; causalParents?: string[] }, requireActiveTombstoneId?: string): Promise<EventEnvelope> {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const context = this.repository.getLocalEventContext(input.libraryId, this.identity.peerId);
+      const causalParents = [...new Set([
+        ...context.causalParents, ...(input.causalParents ?? []), ...(requireActiveTombstoneId ? [requireActiveTombstoneId] : [])
+      ])].sort();
+      if (causalParents.length > 64) throw new SyncCausalityError('causal frontier exceeds the 64-parent limit');
       const unsigned = makeUnsignedEvent({
         ...input, authorPeerId: this.identity.peerId, authorSequence: context.authorSequence,
-        causalParents: context.causalParents, createdAt: input.createdAt ?? this.now()
+        causalParents, createdAt: input.createdAt ?? this.now()
       });
       const signed = await signEvent(unsigned, this.identity);
       try {
-        this.repository.appendLocalEvent(signed);
+        this.repository.appendLocalEvent(signed, requireActiveTombstoneId);
         return signed;
       } catch (error) {
         if (!(error instanceof SyncProtocolConflictError) || attempt === 3) throw error;
