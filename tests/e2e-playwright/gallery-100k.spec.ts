@@ -136,7 +136,7 @@ test('virtual timeline pages through 100k records and search stays server pagina
   page.on('request', (request) => { if (request.method() === 'DELETE') destructiveRequests.push(request.url()); });
   page.on('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: '清理本机缓存' }).click();
-  await expect(page.getByText('本机缩略图缓存')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '本机缩略图缓存' })).toBeVisible();
   await page.getByRole('button', { name: '全局回收站' }).click();
   await expect(page.getByText('墓碑状态，不是原图删除')).toBeVisible();
   expect(destructiveRequests).toEqual([]);
