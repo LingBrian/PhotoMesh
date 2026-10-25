@@ -19,6 +19,8 @@ import { timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
 import { SyncRepository } from './sync/sync-repository.js';
 import { SyncService } from './sync/sync-service.js';
+import { TombstoneRestoreCoordinator } from './sync/restore-coordinator.js';
+import { restoreTombstoneOperation } from './sync/restore-operation.js';
 
 const port = Number(process.env.PORT ?? 8443);
 const dataDirectory = resolve(process.env.PHOTOMESH_DATA_DIR ?? './data');
@@ -116,6 +118,7 @@ const pairingControl: PairingServerControl | undefined = pairing ? {
   }
 } : undefined;
 
+const restoreCoordinator = new TombstoneRestoreCoordinator();
 const configuredAdminToken = process.env.PHOTOMESH_ADMIN_TOKEN;
 repository.markExternalLocationsOffline(nodeId);
 const authorizePairingAdmin = (token: string | undefined): boolean => {
@@ -128,6 +131,7 @@ const host = process.env.PHOTOMESH_API_BIND_ADDRESS ?? '127.0.0.1';
 if (!isSafeServiceBind(host)) throw new Error('PHOTOMESH_API_BIND_ADDRESS must be loopback or an explicit private LAN IP');
 const server = createNodeAgentServer({
   uploadService, authorizePairingAdmin,
+  allowedWebOrigins: (process.env.PHOTOMESH_WEB_ORIGINS ?? '').split(',').map((origin) => origin.trim()).filter(Boolean),
   authorizeUpload: (request) => authorizePairingAdmin(request.token) ? { principalId: 'local-admin' } : undefined,
   authorizeLibraryList: (token) => authorizePairingAdmin(token),
   authorizeLibraryRead: (token) => authorizePairingAdmin(token) ? 'local-admin' : undefined,
@@ -136,7 +140,9 @@ const server = createNodeAgentServer({
     listAssets: (libraryId, cursor, limit, query) => repository.listGalleryAssets(libraryId, cursor, limit, query),
     getOriginal: async (assetId) => repository.getGalleryMedia(assetId),
     openOriginal: openOriginalMedia,
-    listTombstones: (libraryId) => repository.listActiveTombstones(libraryId)
+    listTombstones: (libraryId) => repository.listActiveTombstones(libraryId),
+    restoreTombstone: (libraryId, eventId) => restoreCoordinator.run(libraryId, eventId,
+      () => restoreTombstoneOperation(libraryId, eventId, syncService, (id) => repository.listActiveTombstones(id)))
   },
   ...(mediaVersionService ? { mediaVersions: mediaVersionService } : {}),
   ...(pairingControl ? { pairingControl } : {})

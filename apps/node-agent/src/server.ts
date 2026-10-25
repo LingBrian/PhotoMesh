@@ -32,6 +32,7 @@ export interface NodeAgentServerOptions {
   gallery?: GalleryServerControl;
   mediaVersions?: MediaVersionServerControl;
   pairingControl?: PairingServerControl;
+  allowedWebOrigins?: readonly string[];
   maxRequestBytes?: number;
 }
 
@@ -41,6 +42,7 @@ export interface GalleryServerControl {
   getOriginal(assetId: string): Promise<{ libraryId: string; filename: string; sha256: string; byteSize: number; availability: string; storageRef: string; originalPath: string | null } | undefined>;
   openOriginal(media: { storageRef: string; originalPath: string | null }): Promise<Readable | undefined> | Readable | undefined;
   listTombstones(libraryId?: string): unknown[];
+  restoreTombstone(libraryId: string, eventId: string): Promise<{ status: 'restored'; restoreEventId: string } | 'not_found' | 'inactive' | 'conflict' | 'unavailable'>;
 }
 
 export interface MediaVersionServerControl {
@@ -66,8 +68,9 @@ export interface PairingServerControl {
 }
 
 export function createNodeAgentServer(options: NodeAgentServerOptions = {}) {
+  const allowedWebOrigins = normalizeAllowedWebOrigins(options.allowedWebOrigins ?? []);
   return createServer((request, response) => {
-    setCorsHeaders(request, response);
+    setCorsHeaders(request, response, allowedWebOrigins);
     const requestId = headerValue(request, 'x-request-id') ?? randomUUID();
     response.setHeader('x-request-id', requestId);
     if (request.method === 'OPTIONS') {
@@ -190,6 +193,28 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       sendJson(response, 403, { error: 'forbidden', requestId }); return;
     }
     sendJson(response, 200, { items: options.gallery?.listTombstones(libraryId) ?? [] });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/v1/recycle-bin/restore') {
+    const token = bearerToken(request);
+    if (!await options.authorizePairingAdmin?.(token)) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    let input: unknown;
+    try { input = await readJsonBody(request, 16 * 1024); }
+    catch (error) {
+      if (error instanceof UploadError) { sendJson(response, statusFor(error), { error: error.code.toLowerCase(), requestId }); return; }
+      throw error;
+    }
+    if (!isRestoreTombstoneRequest(input)) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    if (!await options.authorizeLibraryRead?.(token, input.libraryId)) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    const gallery = options.gallery;
+    if (!gallery) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const result = await gallery.restoreTombstone(input.libraryId, input.eventId);
+    if (result === 'not_found') { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    if (result === 'inactive') { sendJson(response, 409, { error: 'tombstone_not_active', requestId }); return; }
+    if (result === 'conflict') { sendJson(response, 409, { error: 'causal_context_conflict', requestId }); return; }
+    if (result === 'unavailable') { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    sendJson(response, 200, { status: 'restored', tombstoneEventId: input.eventId, restoreEventId: result.restoreEventId });
     return;
   }
 
@@ -403,6 +428,12 @@ function decodePathSegment(value: string | undefined): string | undefined {
   } catch { return undefined; }
 }
 
+function isRestoreTombstoneRequest(value: unknown): value is { libraryId: string; eventId: string } {
+  return isPlainRecord(value) && hasExactKeys(value, ['libraryId', 'eventId']) &&
+    typeof value.libraryId === 'string' && value.libraryId.length > 0 && value.libraryId.length <= 128 && !/[\\/\0]/.test(value.libraryId) &&
+    typeof value.eventId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89abAB][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.eventId);
+}
+
 function isCreateMediaVersionRequest(value: unknown): value is CreateMediaVersionRequest {
   if (!isPlainRecord(value) || !hasExactKeys(value, ['sourceVersionId', 'sourceSha256', 'transform', 'idempotencyKey'])) return false;
   if (!(value.sourceVersionId === null || typeof value.sourceVersionId === 'string' && value.sourceVersionId.length > 0 && value.sourceVersionId.length <= 128) ||
@@ -533,9 +564,9 @@ function headerValue(request: IncomingMessage, name: string): string | undefined
   return Array.isArray(value) ? value[0] : value;
 }
 
-function setCorsHeaders(request: IncomingMessage, response: ServerResponse): void {
+function setCorsHeaders(request: IncomingMessage, response: ServerResponse, allowedWebOrigins: ReadonlySet<string>): void {
   const origin = headerValue(request, 'origin');
-  if (!origin || !isAllowedLocalOrigin(origin)) return;
+  if (!origin || (!isAllowedLocalOrigin(origin) && !allowedWebOrigins.has(origin))) return;
   response.setHeader('access-control-allow-origin', origin);
   response.setHeader('vary', 'Origin');
   response.setHeader('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -543,11 +574,26 @@ function setCorsHeaders(request: IncomingMessage, response: ServerResponse): voi
   response.setHeader('access-control-expose-headers', 'Content-Disposition, ETag, X-Request-ID');
 }
 
+function normalizeAllowedWebOrigins(origins: readonly string[]): ReadonlySet<string> {
+  const normalized = new Set<string>();
+  for (const value of origins) {
+    let origin: URL;
+    try { origin = new URL(value); }
+    catch { throw new Error('PHOTOMESH_WEB_ORIGINS must contain valid HTTP(S) origins'); }
+    if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash ||
+        origin.protocol === 'http:' && !isAllowedLocalOrigin(origin.origin)) {
+      throw new Error('PHOTOMESH_WEB_ORIGINS must contain HTTPS origins (or loopback HTTP origins) without credentials or paths');
+    }
+    normalized.add(origin.origin);
+  }
+  return normalized;
+}
+
 function isAllowedLocalOrigin(value: string): boolean {
   try {
     const origin = new URL(value);
     return origin.protocol === 'tauri:' && origin.hostname === 'localhost' ||
-      (origin.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(origin.hostname)) ||
+      (origin.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) ||
       (origin.protocol === 'https:' && origin.hostname === 'tauri.localhost');
   } catch { return false; }
 }

@@ -13,11 +13,26 @@ type Asset = {
 };
 type Page = { items: Asset[]; nextCursor: string | null };
 type Tombstone = { assetId: string; libraryId: string; eventId: string };
+type PendingPeerApproval = { peerId: string; publicKey: string; proposedLabel: string; requestedAt: string };
 type Album = { id: string; name: string; tag: string };
+class NodeApiError extends Error {
+  constructor(readonly status: number) { super(String(status)); }
+}
+function readPreference(key: string): string | null { try { return localStorage.getItem(key); } catch { return null; } }
+function writePreference(key: string, value: string): void { try { localStorage.setItem(key, value); } catch { /* Preferences are optional and never block the gallery. */ } }
 const { t, locale } = useI18n();
+const savedLocale = readPreference('photomesh-ui-locale');
+if (savedLocale === 'zh-CN' || savedLocale === 'en') locale.value = savedLocale;
 const endpoint = ref('http://127.0.0.1:8443');
+const endpointInput = ref(endpoint.value);
 const token = ref('');
+const tokenInput = ref('');
 const connected = ref(false);
+const hasSession = ref(false);
+const lastHealthCheck = ref<Date | null>(null);
+const cacheAvailable = ref(true);
+const isCachedPreview = ref(false);
+const isDesktopRuntime = '__TAURI_INTERNALS__' in window;
 const busy = ref(false);
 const error = ref('');
 const libraries = ref<Library[]>([]);
@@ -27,10 +42,19 @@ const cursor = ref<string | null>(null);
 const search = ref('');
 const section = ref<'timeline' | 'recycle' | 'settings'>('timeline');
 const tombstones = ref<Tombstone[]>([]);
+const tombstonesBusy = ref(false);
+const tombstoneError = ref('');
+const tombstoneStatus = ref('');
+const restoringTombstones = ref<Record<string, boolean>>({});
 const peers = ref<Array<{ peerId: string; label: string; trustState: string }>>([]);
+const pendingPeers = ref<PendingPeerApproval[]>([]);
+const grantLibraryByPeer = ref<Record<string, string>>({});
+const peersBusy = ref(false);
+const peersError = ref('');
 const invitation = ref<{ qrDataUrl: string; invite: unknown } | null>(null);
 const scannedInvite = ref('');
-const theme = ref<'light' | 'dark'>(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+const savedTheme = readPreference('photomesh-ui-theme');
+const theme = ref<'light' | 'dark'>(savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 const scrollElement = ref<HTMLElement>();
 const scrollTop = ref(0);
 const tags = ref<Record<string, string[]>>({});
@@ -60,6 +84,8 @@ let previewAbort: AbortController | undefined;
 let imageObserver: IntersectionObserver | undefined;
 let healthTimer: ReturnType<typeof setInterval> | undefined;
 let pageGeneration = 0;
+let cacheGeneration = 0;
+let metadataGeneration = 0;
 let suppressLibraryReload = false;
 const rowHeight = 164;
 const pageSize = 100;
@@ -82,42 +108,109 @@ const topSpacer = computed(() => visibleStart.value * rowHeight);
 const bottomSpacer = computed(() => Math.max(0, (filteredAssets.value.length - visibleEnd.value) * rowHeight));
 const apiBase = computed(() => endpoint.value.trim().replace(/\/+$/, ''));
 
+function normalizeEndpoint(value: string): string {
+  const parsed = new URL(value.trim());
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') {
+    throw new Error(t('gallery.invalidNodeAddress'));
+  }
+  return parsed.origin;
+}
+function isLoopbackEndpoint(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
+  } catch { return false; }
+}
+function clearAuthorizedSession(clearCredentials = false): void {
+  pageGeneration += 1; metadataGeneration += 1;
+  busy.value = false; tombstonesBusy.value = false; peersBusy.value = false;
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = undefined; }
+  hasSession.value = false; connected.value = false; lastHealthCheck.value = null;
+  libraries.value = []; libraryId.value = ''; assets.value = []; cursor.value = null;
+  tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
+  peers.value = []; pendingPeers.value = []; peersError.value = ''; grantLibraryByPeer.value = {}; invitation.value = null;
+  tags.value = {}; albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
+  mediaVersionsEnabled.value = false;
+  closePreview(); clearThumbnailUrls();
+  if (clearCredentials) { token.value = ''; tokenInput.value = ''; }
+}
 function headers() { return { authorization: `Bearer ${token.value.trim()}` }; }
 async function request<T>(path: string, init: NonNullable<Parameters<typeof fetch>[1]> = {}): Promise<T> {
   const response = await fetch(`${apiBase.value}${path}`, { ...init, headers: { ...headers(), ...init.headers } });
-  if (!response.ok) throw new Error(response.status === 409 ? t('gallery.sourceOffline') : `${response.status}`);
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      clearAuthorizedSession(true);
+      error.value = t('gallery.authorizationRequired');
+    }
+    throw new NodeApiError(response.status);
+  }
   return response.status === 204 ? undefined as T : await response.json() as T;
 }
-async function connect(): Promise<void> {
-  closePreview();
-  clearThumbnailUrls();
+async function connect(preserveSession = false): Promise<void> {
+  let requestedEndpoint: string;
+  try { requestedEndpoint = normalizeEndpoint(endpointInput.value); }
+  catch (cause) { error.value = errorText(cause); return; }
+  if (isDesktopRuntime && !isLoopbackEndpoint(requestedEndpoint)) {
+    error.value = t('gallery.desktopRemoteNodeUnsupported'); return;
+  }
+  if (new URL(requestedEndpoint).protocol === 'http:' && !isLoopbackEndpoint(requestedEndpoint)) {
+    error.value = t('gallery.insecureRemoteNode'); return;
+  }
+  const requestedToken = tokenInput.value.trim();
+  const sameSession = hasSession.value && requestedEndpoint === endpoint.value && requestedToken === token.value;
+  const previousLibraryId = libraryId.value;
+  if (!preserveSession || !sameSession) clearAuthorizedSession();
+  endpoint.value = requestedEndpoint; token.value = requestedToken;
   error.value = ''; busy.value = true; connected.value = false;
   try {
     const health = await fetch(`${apiBase.value}/v1/health`);
+    lastHealthCheck.value = new Date();
     if (!health.ok) throw new Error(t('gallery.connectionFailed'));
     const healthResult = await health.json() as { capabilities?: string[] };
     mediaVersionsEnabled.value = healthResult.capabilities?.includes('mediaVersions') ?? false;
     const result = await request<{ items: Library[] }>('/v1/libraries');
     libraries.value = result.items;
     suppressLibraryReload = true;
-    libraryId.value = libraries.value[0]?.libraryId ?? '';
+    libraryId.value = sameSession && result.items.some((item) => item.libraryId === previousLibraryId)
+      ? previousLibraryId
+      : result.items[0]?.libraryId ?? '';
     suppressLibraryReload = false;
-    connected.value = true;
-    await loadPage(true);
+    connected.value = true; hasSession.value = true;
+    await loadLocalMetadata();
+    if (libraryId.value) await loadPage(true, sameSession);
+    if (!hasSession.value) return;
     await loadPeerList();
     if (healthTimer) clearInterval(healthTimer);
     healthTimer = setInterval(() => { void checkHealth(); }, 30000);
   } catch (cause) { error.value = errorText(cause); }
   finally { busy.value = false; }
 }
-async function checkHealth(): Promise<void> {
-  try { const response = await fetch(`${apiBase.value}/v1/health`); connected.value = response.ok; if (response.ok) mediaVersionsEnabled.value = ((await response.json()) as { capabilities?: string[] }).capabilities?.includes('mediaVersions') ?? false; }
-  catch { connected.value = false; mediaVersionsEnabled.value = false; }
+function disconnectSession(): void {
+  clearAuthorizedSession(true);
+  endpointInput.value = endpoint.value;
+  error.value = '';
+  section.value = 'timeline';
 }
-async function loadPage(reset = false): Promise<void> {
-  if (!connected.value || !libraryId.value || busy.value && !reset) return;
+async function checkHealth(): Promise<void> {
+  const wasConnected = connected.value;
+  lastHealthCheck.value = new Date();
+  try {
+    const response = await fetch(`${apiBase.value}/v1/health`);
+    connected.value = response.ok;
+    if (response.ok) mediaVersionsEnabled.value = ((await response.json()) as { capabilities?: string[] }).capabilities?.includes('mediaVersions') ?? false;
+    if (response.ok && !wasConnected && hasSession.value) {
+      await loadPage(true, true);
+      await loadPeerList();
+      if (section.value === 'recycle') await loadRecycleBin();
+    }
+  } catch { connected.value = false; mediaVersionsEnabled.value = false; }
+}
+async function loadPage(reset = false, preserveOnFailure = false): Promise<boolean> {
+  if (!connected.value || !hasSession.value || !libraryId.value || busy.value && !reset) return false;
+  const previousAssets = assets.value;
+  const previousCursor = cursor.value;
   if (reset) { pageGeneration += 1; assets.value = []; cursor.value = null; scrollTop.value = 0; }
-  if (cursor.value === '') return;
+  if (cursor.value === '') return true;
   const generation = pageGeneration;
   busy.value = true; error.value = '';
   try {
@@ -125,23 +218,39 @@ async function loadPage(reset = false): Promise<void> {
     if (cursor.value) query.set('cursor', cursor.value);
     if (search.value.trim()) query.set('q', search.value.trim());
     const page = await request<Page>(`/v1/assets?${query.toString()}`);
-    if (generation !== pageGeneration) return;
+    if (generation !== pageGeneration) return false;
     assets.value = reset ? page.items : [...assets.value, ...page.items];
     cursor.value = page.nextCursor ?? '';
-  } catch (cause) { if (generation === pageGeneration) error.value = errorText(cause); }
-  finally { if (generation === pageGeneration) busy.value = false; }
+    return true;
+  } catch (cause) {
+    if (generation === pageGeneration) {
+      if (cause instanceof TypeError) connected.value = false;
+      if (preserveOnFailure && hasSession.value) { assets.value = previousAssets; cursor.value = previousCursor; }
+      error.value = errorText(cause);
+    }
+    return false;
+  } finally { if (generation === pageGeneration) busy.value = false; }
 }
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 watch(search, () => { if (searchTimer) clearTimeout(searchTimer); searchTimer = setTimeout(() => void loadPage(true), 250); });
-watch(libraryId, () => {
+watch(libraryId, (value) => {
   closePreview();
   clearThumbnailUrls();
+  activeAlbum.value = '';
+  tags.value = {}; albums.value = [];
+  if (!suppressLibraryReload) { pageGeneration += 1; busy.value = false; assets.value = []; cursor.value = null; scrollTop.value = 0; }
+  if (!suppressLibraryReload && value) void loadLocalMetadata();
   if (connected.value && !suppressLibraryReload) void loadPage(true);
 }, { flush: 'sync' });
-watch(theme, (value) => { document.documentElement.dataset.theme = value; }, { immediate: true });
+watch(theme, (value) => { document.documentElement.dataset.theme = value; writePreference('photomesh-ui-theme', value); }, { immediate: true });
+watch(locale, (value) => {
+  const normalized = value === 'zh-CN' ? 'zh-CN' : 'en';
+  document.documentElement.lang = normalized;
+  writePreference('photomesh-ui-locale', normalized);
+}, { immediate: true });
 function onScroll(): void {
   scrollTop.value = scrollElement.value?.scrollTop ?? 0;
-  if (visibleEnd.value >= filteredAssets.value.length - 8 && cursor.value && !busy.value) void loadPage();
+  if (!activeAlbum.value && visibleEnd.value >= filteredAssets.value.length - 8 && cursor.value && !busy.value) void loadPage();
 }
 function observeImages(): void {
   void nextTick(() => {
@@ -157,9 +266,13 @@ function observeImages(): void {
 }
 watch(visibleAssets, observeImages);
 function thumbnailCacheKey(asset: Asset): string {
-  return `${apiBase.value}:${asset.libraryId}:${asset.originNodeId}:${asset.assetId}:${asset.version}`;
+  return JSON.stringify([apiBase.value, asset.libraryId, asset.originNodeId, asset.assetId, asset.version]);
+}
+function localMetadataKey(): string {
+  return JSON.stringify([apiBase.value, libraryId.value]);
 }
 function clearThumbnailUrls(): void {
+  cacheGeneration += 1;
   for (const url of Object.values(thumbnailUrls.value)) URL.revokeObjectURL(url);
   thumbnailUrls.value = {};
 }
@@ -168,9 +281,13 @@ async function ensureThumbnail(assetId: string): Promise<void> {
   if (thumbnailUrls.value[assetId]) return;
   const asset = assets.value.find((item) => item.assetId === assetId);
   if (!asset) return;
+  const generation = cacheGeneration;
+  const key = thumbnailCacheKey(asset);
   try {
-    const cached = await idbGet<Blob>('thumbnails', thumbnailCacheKey(asset));
-    if (cached) thumbnailUrls.value[assetId] = URL.createObjectURL(cached);
+    const cached = await idbGet<Blob>('thumbnails', key);
+    if (cached && generation === cacheGeneration && assets.value.some((item) => thumbnailCacheKey(item) === key)) {
+      thumbnailUrls.value = { ...thumbnailUrls.value, [assetId]: URL.createObjectURL(cached) };
+    }
   } catch { /* A cache miss never triggers an implicit original read. */ }
 }
 
@@ -187,6 +304,7 @@ function closePreview(): void {
   previewAsset.value = null;
   previewBusy.value = false;
   previewErrorCode.value = null;
+  isCachedPreview.value = false;
 }
 
 async function resizeImage(source: Blob, maxWidth: number, maxHeight: number): Promise<Blob> {
@@ -211,19 +329,31 @@ async function openPreview(asset: Asset): Promise<void> {
   const controller = new AbortController();
   previewAbort = controller;
   previewAsset.value = asset;
-  if (mediaVersionsEnabled.value) void loadVersions();
+  isCachedPreview.value = false;
+  if (connected.value && mediaVersionsEnabled.value) void loadVersions();
   previewBusy.value = true;
   await nextTick();
   if (generation !== previewGeneration) return;
   document.querySelector<HTMLElement>('.preview-dialog')?.focus();
   try {
+    if (!connected.value) {
+      const cached = await idbGet<Blob>('thumbnails', thumbnailCacheKey(asset));
+      if (!cached) throw new GalleryPreviewError('source-offline');
+      if (generation !== previewGeneration) return;
+      previewUrl.value = URL.createObjectURL(cached);
+      isCachedPreview.value = true;
+      return;
+    }
     const original = await loadAssetPreview({ apiBase: apiBase.value, token: token.value, asset, signal: controller.signal });
     if (generation !== previewGeneration) return;
     const view = await resizeImage(original, 1600, 1200);
     if (generation !== previewGeneration) return;
     const thumbnail = await resizeImage(view, 360, 220);
     if (generation !== previewGeneration) return;
-    await idbPut('thumbnails', { key: thumbnailCacheKey(asset), value: thumbnail });
+    try {
+      await idbPut('thumbnails', { key: thumbnailCacheKey(asset), value: thumbnail });
+      cacheAvailable.value = true;
+    } catch { cacheAvailable.value = false; }
     if (generation !== previewGeneration) return;
     const oldThumbnailUrl = thumbnailUrls.value[asset.assetId];
     if (oldThumbnailUrl) URL.revokeObjectURL(oldThumbnailUrl);
@@ -231,6 +361,9 @@ async function openPreview(asset: Asset): Promise<void> {
     previewUrl.value = URL.createObjectURL(view);
   } catch (cause) {
     if (generation === previewGeneration && !controller.signal.aborted) {
+      if (cause instanceof GalleryPreviewError && cause.code === 'unauthorized') {
+        clearAuthorizedSession(true); error.value = t('gallery.authorizationRequired');
+      }
       previewErrorCode.value = cause instanceof GalleryPreviewError ? cause.code : 'unsupported-media';
     }
   } finally {
@@ -313,28 +446,77 @@ async function previewVersion(versionId: string): Promise<void> {
 }
 
 async function downloadOriginal(asset: Asset): Promise<void> {
+  if (!connected.value || !hasSession.value) return;
   try {
-    const response = await fetch(`${apiBase.value}/v1/assets/${encodeURIComponent(asset.assetId)}/original`, { headers: headers() });
-    if (!response.ok) throw new Error(response.status === 409 ? t('gallery.sourceOffline') : `${response.status}`);
+    const response = await fetch(`${apiBase.value}/v1/assets/${encodeURIComponent(asset.assetId)}/original`, { headers: headers(), cache: 'no-store' });
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) { clearAuthorizedSession(true); error.value = t('gallery.authorizationRequired'); }
+      throw new NodeApiError(response.status);
+    }
     const blob = await response.blob(); const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a'); anchor.href = url; anchor.download = asset.filename; anchor.click(); URL.revokeObjectURL(url);
-  } catch (cause) { error.value = errorText(cause); }
+  } catch (cause) { error.value = cause instanceof NodeApiError && cause.status === 409 ? t('gallery.sourceOffline') : errorText(cause); }
 }
 async function clearLocalCache(): Promise<void> {
-  if (!window.confirm(t('gallery.clearCacheConfirm', { node: endpoint.value.trim() || t('gallery.currentNode') }))) return;
+  if (!window.confirm(t('gallery.clearCacheConfirm'))) return;
   closePreview();
-  await idbClear('thumbnails');
-  clearThumbnailUrls();
-  error.value = '';
+  try {
+    await idbClear('thumbnails');
+    clearThumbnailUrls(); cacheAvailable.value = true; error.value = '';
+  } catch { cacheAvailable.value = false; error.value = t('gallery.cacheClearFailed'); }
 }
 async function loadRecycleBin(): Promise<void> {
-  if (!libraryId.value) return;
+  if (!libraryId.value || !hasSession.value || !connected.value) return;
+  tombstonesBusy.value = true; tombstoneError.value = ''; tombstoneStatus.value = '';
   try { tombstones.value = (await request<{ items: Tombstone[] }>(`/v1/recycle-bin?libraryId=${encodeURIComponent(libraryId.value)}`)).items; }
-  catch (cause) { error.value = errorText(cause); }
+  catch (cause) { tombstoneError.value = errorText(cause); }
+  finally { tombstonesBusy.value = false; }
+}
+async function restoreTombstone(item: Tombstone): Promise<void> {
+  if (!connected.value || !hasSession.value) return;
+  if (!window.confirm(t('gallery.restoreConfirm'))) return;
+  restoringTombstones.value = { ...restoringTombstones.value, [item.eventId]: true };
+  tombstoneError.value = '';
+  try {
+    await request('/v1/recycle-bin/restore', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ libraryId: item.libraryId, eventId: item.eventId })
+    });
+    await loadRecycleBin();
+    tombstoneStatus.value = t('gallery.restoreSucceeded');
+  } catch { tombstoneError.value = t('gallery.restoreFailed'); }
+  finally { restoringTombstones.value = { ...restoringTombstones.value, [item.eventId]: false }; }
 }
 async function loadPeerList(): Promise<void> {
-  try { peers.value = (await request<{ peers: typeof peers.value }>('/v1/pairing/peers')).peers; }
-  catch { peers.value = []; }
+  if (!hasSession.value || !connected.value) return;
+  peersBusy.value = true; peersError.value = '';
+  try {
+    const result = await request<{ peers: typeof peers.value; pending: PendingPeerApproval[] }>('/v1/pairing/peers');
+    peers.value = result.peers; pendingPeers.value = result.pending;
+    for (const peer of peers.value) if (!grantLibraryByPeer.value[peer.peerId]) {
+      grantLibraryByPeer.value[peer.peerId] = libraryId.value || libraries.value[0]?.libraryId || '';
+    }
+  } catch (cause) { peersError.value = errorText(cause); }
+  finally { peersBusy.value = false; }
+}
+async function decidePeer(peer: PendingPeerApproval, approved: boolean): Promise<void> {
+  const prompt = approved ? t('gallery.approvePeerConfirm') : t('gallery.rejectPeerConfirm');
+  if (!window.confirm(`${prompt}\n\n${peer.peerId}`)) return;
+  try {
+    await request(`/v1/pairing/peers/${encodeURIComponent(peer.peerId)}/approval`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ approved, ...(approved ? { label: peer.proposedLabel, libraryIds: [] } : {}) })
+    });
+    await loadPeerList();
+  } catch (cause) { peersError.value = errorText(cause); }
+}
+async function grantPeerLibrary(peerId: string): Promise<void> {
+  const selectedLibrary = grantLibraryByPeer.value[peerId];
+  if (!selectedLibrary) { peersError.value = t('gallery.selectLibraryToGrant'); return; }
+  try {
+    await request(`/v1/pairing/peers/${encodeURIComponent(peerId)}/libraries/${encodeURIComponent(selectedLibrary)}`, { method: 'PUT' });
+    peersError.value = '';
+  } catch (cause) { peersError.value = errorText(cause); }
 }
 async function createInvitation(): Promise<void> {
   try {
@@ -356,24 +538,53 @@ async function revokePeer(peerId: string): Promise<void> {
   catch (cause) { error.value = errorText(cause); }
 }
 async function loadLocalMetadata(): Promise<void> {
+  const generation = ++metadataGeneration;
+  if (!hasSession.value || !libraryId.value) { tags.value = {}; albums.value = []; return; }
+  const key = localMetadataKey();
   try {
-    tags.value = await idbGet<Record<string, string[]>>('tags', 'all') ?? {};
-    albums.value = await idbGet<Album[]>('albums', 'all') ?? [];
-  } catch { tags.value = {}; albums.value = []; }
+    const [storedTags, storedAlbums] = await Promise.all([
+      idbGet<Record<string, string[]>>('tags', key), idbGet<Album[]>('albums', key)
+    ]);
+    if (generation !== metadataGeneration || key !== localMetadataKey()) return;
+    tags.value = storedTags ?? {}; albums.value = storedAlbums ?? [];
+  } catch {
+    if (generation === metadataGeneration) { tags.value = {}; albums.value = []; }
+  }
 }
 async function saveTagAndAlbum(): Promise<void> {
   const tag = tagInput.value.trim(); const asset = selectedAsset.value;
-  if (!tag || !asset) return;
-  tags.value[asset.assetId] = [...new Set([...(tags.value[asset.assetId] ?? []), tag])];
-  await idbPut('tags', { key: 'all', value: tags.value });
-  if (!albums.value.some((album) => album.tag === tag)) {
-    const album = { id: crypto.randomUUID(), name: tag, tag }; albums.value.push(album);
-    await idbPut('albums', { key: 'all', value: albums.value });
-  }
-  tagInput.value = ''; selectedAsset.value = null;
+  if (!tag || !asset || !libraryId.value || !hasSession.value) return;
+  const key = localMetadataKey();
+  const nextTags = { ...tags.value, [asset.assetId]: [...new Set([...(tags.value[asset.assetId] ?? []), tag])] };
+  const nextAlbums = albums.value.some((album) => album.tag === tag)
+    ? albums.value
+    : [...albums.value, { id: crypto.randomUUID(), name: tag, tag }];
+  try {
+    await idbPut('tags', { key, value: nextTags });
+    await idbPut('albums', { key, value: nextAlbums });
+    tags.value = nextTags; albums.value = nextAlbums;
+    tagInput.value = ''; selectedAsset.value = null;
+  } catch { error.value = t('gallery.localMetadataSaveFailed'); }
 }
-function errorText(cause: unknown): string { return cause instanceof Error ? cause.message : t('gallery.unknownError'); }
+function errorText(cause: unknown): string {
+  if (cause instanceof NodeApiError) {
+    if (cause.status === 401 || cause.status === 403) return t('gallery.authorizationRequired');
+    if (cause.status === 409) return t('gallery.requestConflict');
+    return t('gallery.requestFailedWithStatus', { status: cause.status });
+  }
+  if (cause instanceof TypeError) return t('gallery.connectionFailed');
+  if (cause instanceof Error) return cause.message;
+  return t('gallery.unknownError');
+}
 function formatDate(value: string | null): string { return value ? new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : t('gallery.unknownDate'); }
+function versionStatusText(status: string): string {
+  switch (status.toLowerCase()) {
+    case 'staging': return t('gallery.versionStatus.staging');
+    case 'ready': return t('gallery.versionStatus.ready');
+    case 'failed': return t('gallery.versionStatus.failed');
+    default: return t('gallery.unknownStatus');
+  }
+}
 function formatSize(bytes: number): string { return new Intl.NumberFormat(locale.value, { style: 'unit', unit: 'byte', unitDisplay: 'narrow', notation: bytes > 1_000_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(bytes); }
 function changeSection(value: typeof section.value): void { section.value = value; if (value === 'recycle') void loadRecycleBin(); }
 onMounted(() => { void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value; });
@@ -491,23 +702,30 @@ async function idbClear(store: string): Promise<void> {
 
       <main class="content">
         <div
-          v-if="!connected"
+          v-if="!hasSession"
           class="connect-card"
         >
-          <div class="welcome-icon">◈</div><p class="eyebrow">{{ t('gallery.localFirst') }}</p><h1>{{ t('gallery.connectTitle') }}</h1><p class="muted">{{ t('gallery.connectDescription') }}</p>
+          <div class="welcome-icon">◈</div><p class="eyebrow">{{ t('gallery.localFirst') }}</p><h1>{{ t('gallery.connectTitle') }}</h1><p class="muted">{{ isDesktopRuntime ? t('gallery.desktopConnectDescription') : t('gallery.connectDescription') }}</p>
+          <div
+            v-if="error"
+            class="notice error-notice"
+            role="alert"
+          >
+            {{ error }}
+          </div>
           <form
             class="connect-form"
-            @submit.prevent="connect"
+            @submit.prevent="connect()"
           >
             <label>{{ t('gallery.nodeAddress') }}<input
-              v-model="endpoint"
+              v-model="endpointInput"
               type="url"
               required
               autocomplete="url"
               placeholder="http://127.0.0.1:8443"
             ></label>
             <label>{{ t('gallery.adminToken') }}<input
-              v-model="token"
+              v-model="tokenInput"
               type="password"
               required
               autocomplete="off"
@@ -541,8 +759,30 @@ async function idbClear(store: string): Promise<void> {
                 >
                   {{ library.title }}
                 </option>
-              </select><span class="count-chip">{{ filteredAssets.length.toLocaleString(locale) }} {{ t('gallery.items') }}</span>
+              </select><span class="count-chip">{{ filteredAssets.length.toLocaleString(locale) }} {{ t('gallery.items') }}</span><button
+                type="button"
+                class="secondary-button"
+                :disabled="busy"
+                @click="checkHealth"
+              >
+                {{ t('gallery.refreshNodeStatus') }}
+              </button>
             </div>
+          </div>
+          <div
+            v-if="!connected"
+            class="notice offline-notice"
+            role="status"
+          >
+            <span>{{ t('gallery.offlineSessionNotice') }}</span>
+            <button
+              type="button"
+              class="secondary-button"
+              :disabled="busy"
+              @click="connect(true)"
+            >
+              {{ t('gallery.retryConnection') }}
+            </button>
           </div>
           <div
             v-if="error"
@@ -574,7 +814,7 @@ async function idbClear(store: string): Promise<void> {
               v-if="!filteredAssets.length && !busy"
               class="empty-state"
             >
-              <span>◇</span><h2>{{ search ? t('gallery.noSearchResults') : t('gallery.emptyLibrary') }}</h2><p>{{ t('gallery.emptyHint') }}</p>
+              <span>◇</span><h2>{{ activeAlbum ? t('gallery.noTaggedItemsLoaded') : search ? t('gallery.noSearchResults') : t('gallery.emptyLibrary') }}</h2><p>{{ activeAlbum && cursor ? t('gallery.localAlbumPageHint') : t('gallery.emptyHint') }}</p>
             </div>
             <div
               :style="{ height: `${topSpacer}px` }"
@@ -592,7 +832,7 @@ async function idbClear(store: string): Promise<void> {
                   type="button"
                   class="asset-preview-trigger"
                   :aria-label="t('gallery.previewAsset', { filename: asset.filename })"
-                  :disabled="asset.kind !== 'photo' || !['online', 'cached'].includes(asset.availability)"
+                  :disabled="asset.kind !== 'photo' || (!['online', 'cached'].includes(asset.availability) && !thumbnailUrls[asset.assetId]) || (!connected && !thumbnailUrls[asset.assetId])"
                   @click="openPreview(asset)"
                 >
                   <img
@@ -637,7 +877,7 @@ async function idbClear(store: string): Promise<void> {
                   ＋
                 </button><button
                   class="download-button"
-                  :disabled="!['online', 'cached'].includes(asset.availability)"
+                  :disabled="!connected || !['online', 'cached'].includes(asset.availability)"
                   @click="downloadOriginal(asset)"
                 >
                   {{ t('gallery.downloadOriginal') }} <span aria-hidden="true">↓</span>
@@ -661,6 +901,19 @@ async function idbClear(store: string): Promise<void> {
             >
               {{ t('gallery.endOfTimeline') }}
             </div>
+            <div
+              v-if="activeAlbum && cursor && cursor !== '' && !busy"
+              class="end-row"
+            >
+              <p>{{ t('gallery.localAlbumPageHint') }}</p>
+              <button
+                type="button"
+                class="secondary-button"
+                @click="loadPage()"
+              >
+                {{ t('gallery.loadMoreForAlbum') }}
+              </button>
+            </div>
           </div>
         </template>
         <section
@@ -668,9 +921,59 @@ async function idbClear(store: string): Promise<void> {
           class="page-section"
         >
           <p class="eyebrow">{{ t('gallery.recycleLabel') }}</p><h1>{{ t('gallery.recycleBin') }}</h1><p class="muted">{{ t('gallery.recycleDescription') }}</p>
-          <div class="safety-callout"><strong>↺ {{ t('gallery.recycleSafetyTitle') }}</strong><p>{{ t('gallery.recycleSafetyText') }}</p></div>
+          <p class="muted">{{ t('gallery.currentLibrary') }}: {{ libraries.find((item) => item.libraryId === libraryId)?.title ?? libraryId }}</p>
           <div
-            v-if="!tombstones.length"
+            v-if="!connected"
+            class="notice offline-notice"
+            role="status"
+          >
+            <span>{{ t('gallery.offlineSessionNotice') }}</span>
+            <button
+              type="button"
+              class="secondary-button"
+              :disabled="busy"
+              @click="connect(true)"
+            >
+              {{ t('gallery.retryConnection') }}
+            </button>
+          </div>
+          <div class="safety-callout"><strong>↺ {{ t('gallery.recycleSafetyTitle') }}</strong><p>{{ t('gallery.recycleSafetyText') }}</p></div>
+          <div class="recycle-controls">
+            <span
+              v-if="lastHealthCheck"
+              class="muted"
+            >{{ t('gallery.lastHealthCheck', { time: formatDate(lastHealthCheck.toISOString()) }) }}</span><button
+              type="button"
+              class="secondary-button"
+              :disabled="!connected || tombstonesBusy"
+              @click="loadRecycleBin"
+            >
+              {{ t('gallery.refreshRecycleBin') }}
+            </button>
+          </div>
+          <div
+            v-if="tombstonesBusy"
+            class="loading-row"
+            role="status"
+          >
+            {{ t('gallery.recycleLoading') }}
+          </div>
+          <div
+            v-if="tombstoneError"
+            class="notice error-notice"
+            role="alert"
+          >
+            {{ tombstoneError }}
+          </div>
+          <div
+            v-if="tombstoneStatus"
+            class="notice success-notice"
+            role="status"
+          >
+            {{ tombstoneStatus }}
+          </div>
+          <div
+            v-if="!tombstonesBusy && !tombstoneError && !tombstones.length"
             class="empty-state"
           >
             <span>◇</span><h2>{{ t('gallery.recycleEmpty') }}</h2>
@@ -680,7 +983,14 @@ async function idbClear(store: string): Promise<void> {
             :key="item.eventId"
             class="tombstone-row"
           >
-            <div><strong>{{ item.assetId }}</strong><small>{{ item.libraryId }} · {{ item.eventId }}</small></div><span class="tombstone-state">{{ t('gallery.removedFromIndex') }}</span>
+            <div><strong>{{ item.assetId }}</strong><small>{{ item.libraryId }} · {{ item.eventId }}</small></div><span class="tombstone-state">{{ t('gallery.removedFromIndex') }}</span><button
+              type="button"
+              class="secondary-button"
+              :disabled="!connected || restoringTombstones[item.eventId]"
+              @click="restoreTombstone(item)"
+            >
+              {{ restoringTombstones[item.eventId] ? t('gallery.restoringItem') : t('gallery.restoreItem') }}
+            </button>
           </div>
         </section>
         <section
@@ -688,6 +998,21 @@ async function idbClear(store: string): Promise<void> {
           class="page-section settings-page"
         >
           <p class="eyebrow">{{ t('gallery.settingsLabel') }}</p><h1>{{ t('gallery.nodeSettings') }}</h1><p class="muted">{{ t('gallery.settingsDescription') }}</p>
+          <div
+            v-if="!connected"
+            class="notice offline-notice"
+            role="status"
+          >
+            <span>{{ t('gallery.offlineSessionNotice') }}</span>
+            <button
+              type="button"
+              class="secondary-button"
+              :disabled="busy"
+              @click="connect(true)"
+            >
+              {{ t('gallery.retryConnection') }}
+            </button>
+          </div>
           <div
             v-if="error"
             class="notice error-notice"
@@ -697,23 +1022,48 @@ async function idbClear(store: string): Promise<void> {
           </div>
           <div class="settings-card">
             <div class="settings-card-heading">
-              <div><h2>{{ t('gallery.nodeConnection') }}</h2><p>{{ t('gallery.nodeConnectionDescription') }}</p></div><span
-                class="connection-pill"
-                :class="connected ? 'online' : 'offline'"
-              ><i />{{ connected ? t('gallery.online') : t('gallery.offline') }}</span>
+              <div>
+                <h2>{{ t('gallery.nodeConnection') }}</h2><p>{{ t('gallery.nodeConnectionDescription') }}</p><p
+                  v-if="lastHealthCheck"
+                  class="muted"
+                >
+                  {{ t('gallery.lastHealthCheck', { time: formatDate(lastHealthCheck.toISOString()) }) }}
+                </p>
+              </div><div class="node-status-actions">
+                <span
+                  class="connection-pill"
+                  :class="connected ? 'online' : 'offline'"
+                ><i />{{ connected ? t('gallery.online') : t('gallery.offline') }}</span><button
+                  type="button"
+                  class="secondary-button"
+                  :disabled="busy"
+                  @click="checkHealth"
+                >
+                  {{ t('gallery.refreshNodeStatus') }}
+                </button>
+              </div>
             </div>
             <label>{{ t('gallery.nodeAddress') }}<input
-              v-model="endpoint"
+              v-model="endpointInput"
               type="url"
             ></label><label>{{ t('gallery.adminToken') }}<input
-              v-model="token"
+              v-model="tokenInput"
               type="password"
               autocomplete="off"
             ></label><button
               class="primary-button small-primary"
-              @click="connect"
+              :disabled="busy"
+              @click="connect()"
             >
               {{ t('gallery.saveAndConnect') }}
+            </button>
+            <button
+              type="button"
+              class="secondary-button"
+              :disabled="busy"
+              @click="disconnectSession"
+            >
+              {{ t('gallery.disconnectSession') }}
             </button>
           </div>
           <div class="settings-card">
@@ -721,6 +1071,7 @@ async function idbClear(store: string): Promise<void> {
             <div class="pairing-actions">
               <button
                 class="secondary-button"
+                :disabled="!connected || busy"
                 @click="createInvitation"
               >
                 {{ t('gallery.createInvite') }}
@@ -741,29 +1092,114 @@ async function idbClear(store: string): Promise<void> {
               :placeholder="t('gallery.scanInvitePlaceholder')"
             /></label><button
               class="secondary-button"
-              :disabled="!scannedInvite"
+              :disabled="!connected || !scannedInvite || busy"
               @click="pairFromInvite"
             >
               {{ t('gallery.joinNode') }}
             </button>
-            <h3>{{ t('gallery.trustedNodes') }}</h3><div
-              v-if="!peers.length"
+            <div class="peer-list-heading">
+              <h3>{{ t('gallery.trustedNodes') }}</h3><button
+                type="button"
+                class="secondary-button"
+                :disabled="!connected || peersBusy"
+                @click="loadPeerList"
+              >
+                {{ t('gallery.refreshPeers') }}
+              </button>
+            </div>
+            <div
+              v-if="peersError"
+              class="notice error-notice"
+              role="alert"
+            >
+              {{ peersError }}
+            </div>
+            <div
+              v-if="peersBusy"
+              class="loading-row"
+              role="status"
+            >
+              {{ t('gallery.loading') }}
+            </div>
+            <div
+              v-if="!peers.length && !pendingPeers.length && !peersBusy"
               class="muted"
             >
               {{ t('gallery.noTrustedNodes') }}
-            </div><div
+            </div>
+            <div
               v-for="peer in peers"
               :key="peer.peerId"
               class="peer-row"
             >
-              <div><strong>{{ peer.label }}</strong><small>{{ peer.peerId }} · {{ t(`gallery.trust.${peer.trustState}`) }}</small></div><button
+              <div><strong>{{ peer.label }}</strong><small>{{ peer.peerId }} · {{ t(`gallery.trust.${peer.trustState}`) }}</small></div>
+              <div
                 v-if="peer.trustState === 'trusted'"
-                class="text-button danger-text"
-                @click="revokePeer(peer.peerId)"
+                class="peer-actions"
               >
-                {{ t('gallery.revoke') }}
-              </button>
+                <label
+                  class="sr-only"
+                  :for="`grant-library-${peer.peerId}`"
+                >{{ t('gallery.grantReadAccess') }}</label>
+                <select
+                  :id="`grant-library-${peer.peerId}`"
+                  v-model="grantLibraryByPeer[peer.peerId]"
+                  class="field-select"
+                  :disabled="!connected || !libraries.length"
+                >
+                  <option
+                    v-for="library in libraries"
+                    :key="library.libraryId"
+                    :value="library.libraryId"
+                  >
+                    {{ library.title }}
+                  </option>
+                </select>
+                <button
+                  type="button"
+                  class="secondary-button"
+                  :disabled="!connected || !libraries.length"
+                  @click="grantPeerLibrary(peer.peerId)"
+                >
+                  {{ t('gallery.grantLibrary') }}
+                </button>
+                <button
+                  type="button"
+                  class="text-button danger-text"
+                  :disabled="!connected"
+                  @click="revokePeer(peer.peerId)"
+                >
+                  {{ t('gallery.revoke') }}
+                </button>
+              </div>
             </div>
+            <template v-if="pendingPeers.length">
+              <h3>{{ t('gallery.pendingApprovals') }}</h3>
+              <div
+                v-for="pending in pendingPeers"
+                :key="pending.peerId"
+                class="peer-row pending-peer-row"
+              >
+                <div><strong>{{ pending.proposedLabel }}</strong><small>{{ t('gallery.peerFingerprint', { peerId: pending.peerId }) }} · {{ formatDate(pending.requestedAt) }}</small></div>
+                <div class="peer-actions">
+                  <button
+                    type="button"
+                    class="secondary-button"
+                    :disabled="!connected"
+                    @click="decidePeer(pending, true)"
+                  >
+                    {{ t('gallery.approvePeer') }}
+                  </button><button
+                    type="button"
+                    class="text-button danger-text"
+                    :disabled="!connected"
+                    @click="decidePeer(pending, false)"
+                  >
+                    {{ t('gallery.rejectPeer') }}
+                  </button>
+                </div>
+              </div>
+            </template>
           </div>
           <div class="settings-card cleanup-card">
             <div><h2>{{ t('gallery.localCacheTitle') }}</h2><p>{{ t('gallery.localCacheDescription') }}</p></div><button
@@ -815,12 +1251,30 @@ async function idbClear(store: string): Promise<void> {
           >
             {{ previewErrorMessage(previewErrorCode) }}
           </p>
-          <img
+          <div
             v-else-if="previewUrl"
-            class="preview-image"
-            :src="previewUrl"
-            :alt="previewAsset.filename"
+            class="preview-content"
           >
+            <p
+              v-if="isCachedPreview"
+              class="muted cached-preview-note"
+              role="status"
+            >
+              {{ t('gallery.cachedPreviewNote') }}
+            </p>
+            <p
+              v-if="!cacheAvailable"
+              class="muted cached-preview-note"
+              role="status"
+            >
+              {{ t('gallery.cacheUnavailable') }}
+            </p>
+            <img
+              class="preview-image"
+              :src="previewUrl"
+              :alt="previewAsset.filename"
+            >
+          </div>
         </div>
         <section
           class="version-editor"
@@ -937,7 +1391,7 @@ async function idbClear(store: string): Promise<void> {
                   v-for="item in versions.items"
                   :key="item.versionId"
                 >
-                  <span>{{ item.versionId.slice(0, 8) }} · {{ item.status }} · {{ formatDate(item.createdAt) }}</span>
+                  <span>{{ item.versionId.slice(0, 8) }} · {{ versionStatusText(item.status) }} · {{ formatDate(item.createdAt) }}</span>
                   <button
                     v-if="item.status.toLowerCase() === 'ready'"
                     class="secondary-button"

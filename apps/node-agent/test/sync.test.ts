@@ -6,6 +6,7 @@ import { SqliteRepository } from '../src/db/repository.js';
 import { migrations } from '../src/db/migrations.js';
 import { SyncRepository, SyncAuthorizationError, SyncProtocolConflictError } from '../src/sync/sync-repository.js';
 import { isSyncExchangeRequest, negotiateProtocol, SyncService, type SyncHello } from '../src/sync/sync-service.js';
+import { restoreTombstoneOperation } from '../src/sync/restore-operation.js';
 import { makeUnsignedEvent, signEvent } from '../src/sync/event-envelope.js';
 
 const databases: Database.Database[] = [];
@@ -183,6 +184,59 @@ describe('P2P signed event synchronization', () => {
     expect(b.database.prepare('SELECT count(*) AS count FROM sync_conflicts WHERE resolved_by_event_id IS NULL').get()).toEqual({ count: 1 });
   });
 
+  it('rejects a stale local restore atomically if sync deactivates its tombstone before append', async () => {
+    const a = await createNode();
+    const b = await createNode();
+    await trustEachOther(a, b);
+    const indexed = await indexAsset(a);
+    b.syncRepository.ingest(a.identity.peerId, indexed);
+    const tombstone = await a.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.tombstoned', payload: { assetId: 'asset-1', reason: 'removed' } });
+    b.syncRepository.ingest(a.identity.peerId, tombstone);
+    const context = a.syncRepository.getLocalEventContext('family', a.identity.peerId);
+    const staleRestore = await signEvent(makeUnsignedEvent({
+      libraryId: 'family', authorPeerId: a.identity.peerId, authorSequence: context.authorSequence,
+      causalParents: [...context.causalParents, tombstone.eventId], eventType: 'asset.restored', createdAt: '2026-10-21T00:00:00.000Z',
+      payload: { assetId: 'asset-1', tombstoneEventId: tombstone.eventId }
+    }), a.identity);
+    const competingRestore = await b.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.restored',
+      payload: { assetId: 'asset-1', tombstoneEventId: tombstone.eventId } });
+    a.syncRepository.ingest(b.identity.peerId, competingRestore);
+
+    expect(() => a.syncRepository.appendLocalEvent(staleRestore, tombstone.eventId)).toThrow('restore tombstone is no longer active');
+    expect(a.database.prepare('SELECT 1 FROM sync_event_log WHERE event_id = ?').get(staleRestore.eventId)).toBeUndefined();
+    expect(a.syncRepository.getTombstoneState('family', tombstone.eventId)).toBe('inactive');
+  });
+
+  it('returns the committed restore event on retry without appending another event', async () => {
+    const node = await createNode();
+    await indexAsset(node);
+    const tombstone = await node.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.tombstoned',
+      payload: { assetId: 'asset-1', reason: 'removed' } });
+    await node.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.metadata.updated',
+      payload: { assetId: 'asset-1', fields: { caption: 'kept' } } });
+    const listTombstones = (libraryId: string) => node.pairingRepository.listActiveTombstones(libraryId);
+    const countRestoreEvents = () => (node.database.prepare(`SELECT COUNT(*) AS count FROM sync_event_log
+      WHERE library_id = ? AND event_type = 'asset.restored'`).get('family') as { count: number }).count;
+
+    expect(node.syncRepository.getTombstoneRestoreEventId('family', tombstone.eventId)).toBeNull();
+    const first = await restoreTombstoneOperation('family', tombstone.eventId, node.sync, listTombstones);
+    if (typeof first === 'string') throw new Error(`Expected restore success, got ${first}`);
+    expect(first.status).toBe('restored');
+    expect(node.syncRepository.getTombstoneState('family', tombstone.eventId)).toBe('inactive');
+    expect(node.syncRepository.getTombstoneRestoreEventId('family', tombstone.eventId)).toBe(first.restoreEventId);
+    expect(countRestoreEvents()).toBe(1);
+    const stored = node.database.prepare('SELECT causal_parents_json FROM sync_event_log WHERE event_id = ?')
+      .get(first.restoreEventId) as { causal_parents_json: string };
+    const parents = JSON.parse(stored.causal_parents_json) as string[];
+    expect(parents).toContain(tombstone.eventId);
+    expect(parents).toEqual([...parents].sort());
+
+    const retry = await restoreTombstoneOperation('family', tombstone.eventId, node.sync, listTombstones);
+    expect(retry).toEqual(first);
+    expect(countRestoreEvents()).toBe(1);
+    expect(node.syncRepository.getProjection('family', 'asset-1')?.tombstoned).toBe(false);
+  });
+
   it('keeps tombstones as metadata, wins concurrent updates, and requires an explicit causally linked restore', async () => {
     const a = await createNode();
     const b = await createNode();
@@ -197,7 +251,7 @@ describe('P2P signed event synchronization', () => {
     b.syncRepository.ingest(a.identity.peerId, tombstone);
     expect(a.syncRepository.getProjection('family', 'asset-1')?.tombstoned).toBe(true);
     expect(b.syncRepository.getProjection('family', 'asset-1')?.tombstoned).toBe(true);
-    const restored = await a.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.restored', payload: { assetId: 'asset-1', tombstoneEventId: tombstone.eventId } });
+    const restored = await a.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.restored', causalParents: [tombstone.eventId], payload: { assetId: 'asset-1', tombstoneEventId: tombstone.eventId } });
     expect(restored.causalParents).toContain(tombstone.eventId);
     expect(restored.causalParents).toContain(concurrentTombstone.eventId);
     b.syncRepository.ingest(a.identity.peerId, restored);

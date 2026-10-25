@@ -81,8 +81,14 @@ test('Windows gallery loads image bytes only after an explicit preview action an
   expect(writeRequests).toEqual([]);
   expect(Buffer.from(previewPng).toString('hex')).toBe(originalDigestBefore);
 
+  await page.getByRole('button', { name: 'Add a tag or create a virtual album' }).click();
+  await page.getByLabel('Tag name').fill('Work');
+  await page.getByRole('button', { name: 'Save tag' }).click();
+  await expect(page.getByText('Work', { exact: true }).first()).toBeVisible();
+
   await page.locator('#library-choice').selectOption('other-library');
   await expect(page.getByRole('button', { name: 'Preview other-photo.png' })).toBeVisible();
+  await expect(page.getByText('Work', { exact: true })).toHaveCount(0);
   await expect(page.locator('.asset-preview img')).toHaveCount(0);
   expect(originalReads).toBe(1);
 });
