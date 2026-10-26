@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
 import QRCode from 'qrcode';
@@ -9,6 +9,8 @@ import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
 import type { TrustedPeerRecord } from './db/repository.js';
 import type { Readable } from 'node:stream';
 import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage, MediaVersionView } from './media/media-version-service.js';
+import type { ThumbnailContent } from './media/thumbnail-service.js';
+import { maxThumbnailOutputBytes } from './media/image-transformer.js';
 
 export interface UploadAuthorizationRequest {
   token: string | undefined;
@@ -31,6 +33,7 @@ export interface NodeAgentServerOptions {
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
   mediaVersions?: MediaVersionServerControl;
+  thumbnails?: ThumbnailServerControl;
   pairingControl?: PairingServerControl;
   allowedWebOrigins?: readonly string[];
   maxRequestBytes?: number;
@@ -52,6 +55,10 @@ export interface MediaVersionServerControl {
   readVersionContent(libraryId: string, assetId: string, versionId: string): Promise<{
     bytes: Buffer; mimeType: 'image/jpeg' | 'image/png' | 'image/webp'; sha256: string; byteSize: number;
   }>;
+}
+
+export interface ThumbnailServerControl {
+  readThumbnail(libraryId: string, assetId: string, profile: string): Promise<ThumbnailContent>;
 }
 
 export interface PairingServerControl {
@@ -88,13 +95,57 @@ export function createNodeAgentServer(options: NodeAgentServerOptions = {}) {
 async function handleRequest(request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string): Promise<void> {
   const url = new URL(request.url ?? '/', `http://${headerValue(request, 'host') ?? 'localhost'}`);
   if (request.method === 'GET' && url.pathname === '/v1/health') {
-    sendJson(response, 200, getHealth(options.mediaVersions ? ['mediaVersions'] : []));
+    const capabilities = [
+      ...(options.mediaVersions ? ['mediaVersions'] : []),
+      ...(options.thumbnails ? ['thumbnails'] : [])
+    ];
+    sendJson(response, 200, getHealth(capabilities));
     return;
   }
 
   if (request.method === 'GET' && url.pathname === '/v1/libraries') {
     if (!await options.authorizeLibraryList?.(bearerToken(request))) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
     sendJson(response, 200, { items: options.gallery?.listLibraries() ?? [] });
+    return;
+  }
+
+  const thumbnailPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/thumbnail$/);
+  if (request.method === 'GET' && thumbnailPath?.[1] && thumbnailPath[2]) {
+    const libraryId = decodePathSegment(thumbnailPath[1]);
+    const assetId = decodePathSegment(thumbnailPath[2]);
+    const profileValues = url.searchParams.getAll('profile');
+    const hasUnknownQuery = [...url.searchParams.keys()].some((key) => key !== 'profile');
+    const profile = profileValues[0] ?? 'timeline-192';
+    if (!libraryId || !assetId || hasUnknownQuery || profileValues.length > 1 || profile !== 'timeline-192') {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const token = bearerToken(request);
+    if (!await options.authorizeLibraryRead?.(token, libraryId)) {
+      sendJson(response, 404, { error: 'not_found', requestId }); return;
+    }
+    const control = options.thumbnails;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    try {
+      const content = await control.readThumbnail(libraryId, assetId, profile);
+      if (!Buffer.isBuffer(content.bytes) || content.mimeType !== 'image/webp' ||
+          content.byteSize !== content.bytes.byteLength || content.byteSize < 1 || content.byteSize > maxThumbnailOutputBytes ||
+          !/^[0-9a-f]{64}$/.test(content.sha256) || digestBytes(content.bytes) !== content.sha256 ||
+          !Number.isSafeInteger(content.width) || !Number.isSafeInteger(content.height) ||
+          content.width < 1 || content.height < 1 || content.width > 192 || content.height > 192) {
+        sendJson(response, 500, { error: 'thumbnail_invalid', requestId }); return;
+      }
+      if (!await options.authorizeLibraryRead?.(token, libraryId)) {
+        sendJson(response, 404, { error: 'not_found', requestId }); return;
+      }
+      response.writeHead(200, {
+        'content-type': 'image/webp', 'content-length': String(content.byteSize),
+        'etag': `"${content.sha256}"`, 'cache-control': 'private, no-store',
+        'x-content-type-options': 'nosniff', 'content-disposition': 'inline', 'vary': 'Authorization'
+      });
+      response.end(content.bytes);
+    } catch (error) {
+      sendThumbnailError(response, error, requestId);
+    }
     return;
   }
 
@@ -465,6 +516,25 @@ function sendMediaVersionError(response: ServerResponse, error: unknown, request
   sendJson(response, mediaVersionErrorStatuses[code]!, { error: code.toLowerCase(), requestId });
 }
 
+function sendThumbnailError(response: ServerResponse, error: unknown, requestId: string): void {
+  const candidate = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+  const code = typeof candidate === 'string' && Object.hasOwn(thumbnailErrorStatuses, candidate) ? candidate : 'PROCESSING_FAILED';
+  if (code === 'QUEUE_FULL') response.setHeader('retry-after', '1');
+  sendJson(response, thumbnailErrorStatuses[code]!, { error: code.toLowerCase(), requestId });
+}
+
+const thumbnailErrorStatuses: Record<string, number> = {
+  INVALID_REQUEST: 400,
+  NOT_FOUND: 404,
+  SOURCE_CHANGED: 409,
+  SOURCE_OFFLINE: 409,
+  TOO_LARGE: 413,
+  UNSUPPORTED_MEDIA: 415,
+  PROCESSING_FAILED: 500,
+  QUEUE_FULL: 429,
+  STORAGE_FAILED: 503
+};
+
 const mediaVersionErrorStatuses: Record<string, number> = {
   INVALID_REQUEST: 400,
   NOT_FOUND: 404,
@@ -596,6 +666,10 @@ function isAllowedLocalOrigin(value: string): boolean {
       (origin.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) ||
       (origin.protocol === 'https:' && origin.hostname === 'tauri.localhost');
   } catch { return false; }
+}
+
+function digestBytes(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {

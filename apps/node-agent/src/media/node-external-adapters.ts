@@ -20,7 +20,7 @@ export class NodeExternalFileSystem implements ExternalFileSystem {
     for await (const chunk of createReadStream(path)) yield chunk as Uint8Array;
   }
 
-  openReadStream(path: string) { return createReadStream(path); }
+  openReadStream(path: string, options?: { signal?: AbortSignal }) { return createReadStream(path, options); }
 }
 
 export class NodeExternalWatcher implements ExternalWatcher {

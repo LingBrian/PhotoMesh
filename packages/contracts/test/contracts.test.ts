@@ -17,6 +17,24 @@ describe('source contracts', () => {
     await expect(SwaggerParser.validate(apiPath)).resolves.toBeDefined();
   });
 
+  it('exposes the optional fixed-profile thumbnail response as derived WebP bytes', async () => {
+    const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
+    const api = parse(await readFile(apiPath, 'utf8')) as { paths: Record<string, unknown> };
+    expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/thumbnail']).toMatchObject({
+      get: {
+        parameters: [
+          { in: 'path', name: 'libraryId' },
+          { in: 'path', name: 'assetId' },
+          { in: 'query', name: 'profile', schema: { enum: ['timeline-192'], default: 'timeline-192' } }
+        ],
+        responses: {
+          '200': { content: { 'image/webp': { schema: { type: 'string', format: 'binary' } } } },
+          '404': {}, '409': {}, '429': {}
+        }
+      }
+    });
+  });
+
   it('validates a JSON Schema component from the OpenAPI source', async () => {
     const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
     const api = parse(await readFile(apiPath, 'utf8')) as {

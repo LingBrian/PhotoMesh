@@ -29,9 +29,9 @@ export class NodeUploadFileSystem implements UploadFileSystem {
     this.root = resolve(rootDirectory);
   }
 
-  async openReadStream(path: string) {
+  async openReadStream(path: string, options?: { signal?: AbortSignal }) {
     const actual = await this.resolveExistingFile(path);
-    return createReadStream(actual);
+    return createReadStream(actual, options);
   }
 
   async writeExclusive(path: string, bytes: Uint8Array): Promise<void> {

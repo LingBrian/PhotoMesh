@@ -3,6 +3,10 @@ import 'package:photomesh_mobile/l10n/app_strings.dart';
 
 void main() {
   test('provides gallery and preview copy in Chinese and English', () {
+    const pickerKeys = [
+      'selectedCount', 'noPhotos', 'loadMorePhotos', 'selectPhotosHint', 'photo',
+      'selected', 'notSelected', 'selectPhotos', 'cancel', 'add', 'scanFailed', 'retry',
+    ];
     const galleryKeys = [
       'remoteGallery',
       'galleryEmpty',
@@ -22,7 +26,7 @@ void main() {
       'close',
     ];
     for (final language in ['zh', 'en']) {
-      for (final key in galleryKeys) {
+      for (final key in [...galleryKeys, ...pickerKeys]) {
         expect(appStrings[language]!.containsKey(key), isTrue,
             reason: '$language:$key');
       }
