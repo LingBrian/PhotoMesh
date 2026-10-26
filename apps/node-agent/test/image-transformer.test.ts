@@ -72,6 +72,14 @@ describe('SharpMediaImageTransformer', () => {
     expect(metadata.orientation).toBeUndefined();
   });
 
+  it('cancels active Sharp metadata work when a thumbnail task aborts', async () => {
+    const input = await sharp({ create: { width: 640, height: 320, channels: 3, background: '#1565c0' } }).webp().toBuffer();
+    const controller = new AbortController();
+    const pending = transformer.createThumbnail(input, controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ code: 'PROCESSING_FAILED' });
+  });
+
   it('rejects thumbnail input bytes and pixel dimensions above the approved limits', async () => {
     await expect(transformer.createThumbnail(Buffer.alloc(16 * 1024 * 1024 + 1)))
       .rejects.toMatchObject({ code: 'TOO_LARGE' });

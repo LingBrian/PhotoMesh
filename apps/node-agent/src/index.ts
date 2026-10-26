@@ -65,11 +65,14 @@ try {
 const managedFileSystem = new NodeUploadFileSystem(join(dataDirectory, 'managed'));
 const externalFileSystem = new NodeExternalFileSystem();
 let externalScan: ExternalScanService | undefined;
-const openOriginalMedia = async (media: Pick<MediaVersionSourceRecord, 'storageRef' | 'originalPath'>) => {
-  if (media.storageRef.startsWith('objects/')) return managedFileSystem.openReadStream(media.storageRef);
+const openOriginalMedia = async (media: Pick<MediaVersionSourceRecord, 'storageRef' | 'originalPath'>, signal?: AbortSignal) => {
+  if (media.storageRef.startsWith('objects/')) {
+    return signal ? managedFileSystem.openReadStream(media.storageRef, { signal }) : managedFileSystem.openReadStream(media.storageRef);
+  }
   if (media.storageRef.startsWith('external:') && media.originalPath) {
     const authorizedPath = await externalScan?.resolveAuthorizedReadPath(media.originalPath);
-    return authorizedPath ? externalFileSystem.openReadStream(authorizedPath) : undefined;
+    if (!authorizedPath || signal?.aborted) return undefined;
+    return signal ? externalFileSystem.openReadStream(authorizedPath, { signal }) : externalFileSystem.openReadStream(authorizedPath);
   }
   return undefined;
 };

@@ -27,7 +27,7 @@ export interface ThumbnailImage {
 }
 
 export interface MediaThumbnailTransformer {
-  createThumbnail(bytes: Buffer): Promise<ThumbnailImage>;
+  createThumbnail(bytes: Buffer, signal?: AbortSignal): Promise<ThumbnailImage>;
 }
 
 export interface MediaImageTransformer {
@@ -118,41 +118,60 @@ export class SharpMediaImageTransformer implements MediaImageTransformer, MediaT
     }
   }
 
-  async createThumbnail(bytes: Buffer): Promise<ThumbnailImage> {
+  async createThumbnail(bytes: Buffer, signal?: AbortSignal): Promise<ThumbnailImage> {
     if (bytes.byteLength > maxThumbnailInputBytes) throw new ImageTransformError('TOO_LARGE');
+    if (signal?.aborted) throw new ImageTransformError('PROCESSING_FAILED');
     let metadata: Awaited<ReturnType<ReturnType<typeof sharp>['metadata']>>;
+    const metadataPipeline = sharp(bytes, { failOn: 'warning', limitInputPixels: maxThumbnailPixels })
+      .timeout({ seconds: thumbnailProcessingTimeoutSeconds });
+    const detachMetadataAbort = abortSharpOnSignal(metadataPipeline, signal);
     try {
-      metadata = await sharp(bytes, { failOn: 'warning', limitInputPixels: maxThumbnailPixels })
-        .timeout({ seconds: thumbnailProcessingTimeoutSeconds }).metadata();
+      metadata = await metadataPipeline.metadata();
     } catch (error) {
+      if (signal?.aborted || isTimeoutError(error)) throw new ImageTransformError('PROCESSING_FAILED');
       if (isPixelLimitError(error)) throw new ImageTransformError('TOO_LARGE');
-      if (isTimeoutError(error)) throw new ImageTransformError('PROCESSING_FAILED');
       throw new ImageTransformError('UNSUPPORTED_MEDIA');
+    } finally {
+      detachMetadataAbort();
     }
+    if (signal?.aborted) throw new ImageTransformError('PROCESSING_FAILED');
     const mimeType = mimeForFormat(metadata.format ?? '');
     const width = metadata.width ?? 0;
     const height = metadata.height ?? 0;
     if (!mimeType || (metadata.pages ?? 1) > 1) throw new ImageTransformError('UNSUPPORTED_MEDIA');
     if (width < 1 || height < 1 || width * height > maxThumbnailPixels) throw new ImageTransformError('TOO_LARGE');
 
+    const outputPipeline = sharp(bytes, { failOn: 'warning', limitInputPixels: maxThumbnailPixels })
+      .timeout({ seconds: thumbnailProcessingTimeoutSeconds })
+      .autoOrient()
+      .resize({ width: thumbnailDimension, height: thumbnailDimension, fit: 'inside', withoutEnlargement: true })
+      .webp({ quality: 75, effort: 3 });
+    const detachOutputAbort = abortSharpOnSignal(outputPipeline, signal);
     try {
-      const output = await sharp(bytes, { failOn: 'warning', limitInputPixels: maxThumbnailPixels })
-        .timeout({ seconds: thumbnailProcessingTimeoutSeconds })
-        .autoOrient()
-        .resize({ width: thumbnailDimension, height: thumbnailDimension, fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: 75, effort: 3 })
-        .toBuffer({ resolveWithObject: true });
+      const output = await outputPipeline.toBuffer({ resolveWithObject: true });
+      if (signal?.aborted) throw new ImageTransformError('PROCESSING_FAILED');
       if (output.data.byteLength < 1 || output.data.byteLength > maxThumbnailOutputBytes ||
         output.info.width < 1 || output.info.height < 1 || output.info.width > thumbnailDimension || output.info.height > thumbnailDimension) {
         throw new ImageTransformError('TOO_LARGE');
       }
       return { bytes: output.data, mimeType: 'image/webp', width: output.info.width, height: output.info.height };
     } catch (error) {
+      if (signal?.aborted) throw new ImageTransformError('PROCESSING_FAILED');
       if (error instanceof ImageTransformError) throw error;
       if (isPixelLimitError(error)) throw new ImageTransformError('TOO_LARGE');
       throw new ImageTransformError('PROCESSING_FAILED');
+    } finally {
+      detachOutputAbort();
     }
   }
+}
+
+function abortSharpOnSignal(pipeline: ReturnType<typeof sharp>, signal?: AbortSignal): () => void {
+  if (!signal) return () => {};
+  const cancel = () => pipeline.destroy();
+  if (signal.aborted) cancel();
+  else signal.addEventListener('abort', cancel, { once: true });
+  return () => signal.removeEventListener('abort', cancel);
 }
 
 function mimeForFormat(format: string): SupportedImageMime | undefined {

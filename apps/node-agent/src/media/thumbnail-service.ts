@@ -3,13 +3,14 @@ import type { Readable } from 'node:stream';
 import type { MediaVersionSourceRecord } from '../db/repository.js';
 import {
   ImageTransformError, maxThumbnailInputBytes, maxThumbnailOutputBytes, maxThumbnailPixels,
-  thumbnailDimension, type MediaThumbnailTransformer, type ThumbnailImage
+  thumbnailDimension, thumbnailProcessingTimeoutSeconds, type MediaThumbnailTransformer, type ThumbnailImage
 } from './image-transformer.js';
 
 export const maxThumbnailCacheBytes = 8 * 1024 * 1024;
 export const maxThumbnailCacheEntries = 128;
 export const maxThumbnailQueuedJobs = 8;
 export const thumbnailProfile = 'timeline-192' as const;
+export const thumbnailTaskTimeoutMs = thumbnailProcessingTimeoutSeconds * 1000;
 const thumbnailTransformerVersion = 'webp-192-v1';
 
 export interface ThumbnailContent extends ThumbnailImage {
@@ -30,8 +31,9 @@ export class MediaThumbnailError extends Error {
 
 export interface MediaThumbnailServiceOptions {
   getSource(libraryId: string, assetId: string): MediaVersionSourceRecord | undefined | Promise<MediaVersionSourceRecord | undefined>;
-  openOriginal(source: MediaVersionSourceRecord): Promise<Readable | undefined> | Readable | undefined;
+  openOriginal(source: MediaVersionSourceRecord, signal?: AbortSignal): Promise<Readable | undefined> | Readable | undefined;
   transformer: MediaThumbnailTransformer;
+  taskTimeoutMs?: number;
   maxInputBytes?: number;
   maxOutputBytes?: number;
   maxPixels?: number;
@@ -46,6 +48,7 @@ export class MediaThumbnailService {
   private readonly getSource: MediaThumbnailServiceOptions['getSource'];
   private readonly openOriginal: MediaThumbnailServiceOptions['openOriginal'];
   private readonly transformer: MediaThumbnailTransformer;
+  private readonly taskTimeoutMs: number;
   private readonly maxInputBytes: number;
   private readonly maxOutputBytes: number;
   private readonly maxPixels: number;
@@ -62,13 +65,14 @@ export class MediaThumbnailService {
     this.getSource = options.getSource;
     this.openOriginal = options.openOriginal;
     this.transformer = options.transformer;
+    this.taskTimeoutMs = options.taskTimeoutMs ?? thumbnailTaskTimeoutMs;
     this.maxInputBytes = options.maxInputBytes ?? maxThumbnailInputBytes;
     this.maxOutputBytes = options.maxOutputBytes ?? maxThumbnailOutputBytes;
     this.maxPixels = options.maxPixels ?? maxThumbnailPixels;
     this.maxCacheBytes = options.maxCacheBytes ?? maxThumbnailCacheBytes;
     this.maxCacheEntries = options.maxCacheEntries ?? maxThumbnailCacheEntries;
     this.maxQueuedJobs = options.maxQueuedJobs ?? maxThumbnailQueuedJobs;
-    if (!isPositiveInteger(this.maxInputBytes) || !isPositiveInteger(this.maxOutputBytes) ||
+    if (!isPositiveInteger(this.taskTimeoutMs) || !isPositiveInteger(this.maxInputBytes) || !isPositiveInteger(this.maxOutputBytes) ||
         !isPositiveInteger(this.maxPixels) || !isPositiveInteger(this.maxCacheBytes) ||
         !isPositiveInteger(this.maxCacheEntries) || !Number.isSafeInteger(this.maxQueuedJobs) || this.maxQueuedJobs < 0) {
       throw new RangeError('Thumbnail resource limits must be positive integers and queue size non-negative');
@@ -87,7 +91,8 @@ export class MediaThumbnailService {
     const existing = this.inFlight.get(key);
     if (existing) return existing;
 
-    const pending = this.enqueue(() => this.generate(source, key, profile));
+    const pending = this.enqueue(() => this.runWithTaskTimeout((signal, registerStream) =>
+      this.generate(source, key, profile, signal, registerStream)));
     this.inFlight.set(key, pending);
     try {
       return await pending;
@@ -142,6 +147,28 @@ export class MediaThumbnailService {
     }
   }
 
+  private runWithTaskTimeout(
+    task: (signal: AbortSignal, registerStream: (stream: Readable) => void) => Promise<ThumbnailContent>
+  ): Promise<ThumbnailContent> {
+    const controller = new AbortController();
+    let activeStream: Readable | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        activeStream?.destroy();
+        reject(new MediaThumbnailError('PROCESSING_FAILED'));
+      }, this.taskTimeoutMs);
+    });
+    const operation = Promise.resolve().then(() => task(controller.signal, (stream) => {
+      activeStream = stream;
+      if (controller.signal.aborted) stream.destroy();
+    }));
+    return Promise.race([operation, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
   private enqueue(task: () => Promise<ThumbnailContent>): Promise<ThumbnailContent> {
     if (!this.active) {
       this.active = true;
@@ -161,25 +188,44 @@ export class MediaThumbnailService {
     else this.active = false;
   }
 
-  private async generate(source: MediaVersionSourceRecord, key: string, profile: string): Promise<ThumbnailContent> {
+  private async generate(
+    source: MediaVersionSourceRecord,
+    key: string,
+    profile: string,
+    signal: AbortSignal,
+    registerStream: (stream: Readable) => void
+  ): Promise<ThumbnailContent> {
     const current = await this.resolveSource(source.libraryId, source.assetId);
     this.assertSourceMetadata(current, source.libraryId, source.assetId);
     if (current.sha256 !== source.sha256 || current.byteSize !== source.byteSize) throw new MediaThumbnailError('SOURCE_CHANGED');
     const cached = this.readCache(key);
     if (cached) return cached;
     if (!['online', 'cached'].includes(current.availability)) throw new MediaThumbnailError('SOURCE_OFFLINE');
+    if (signal.aborted) throw new MediaThumbnailError('PROCESSING_FAILED');
+
+    let opening: Promise<Readable | undefined>;
+    try { opening = Promise.resolve(this.openOriginal(current, signal)); }
+    catch { throw new MediaThumbnailError(signal.aborted ? 'PROCESSING_FAILED' : 'SOURCE_OFFLINE'); }
+    void opening.then((lateStream) => {
+      if (signal.aborted) lateStream?.destroy();
+    }, () => {});
 
     let stream: Readable | undefined;
-    try { stream = await this.openOriginal(current); }
-    catch { throw new MediaThumbnailError('SOURCE_OFFLINE'); }
+    try { stream = await opening; }
+    catch { throw new MediaThumbnailError(signal.aborted ? 'PROCESSING_FAILED' : 'SOURCE_OFFLINE'); }
+    if (signal.aborted) {
+      stream?.destroy();
+      throw new MediaThumbnailError('PROCESSING_FAILED');
+    }
     if (!stream) throw new MediaThumbnailError('SOURCE_OFFLINE');
-    const sourceBytes = await readBoundedSource(stream, this.maxInputBytes);
+    registerStream(stream);
+    const sourceBytes = await readBoundedSource(stream, this.maxInputBytes, signal);
     if (sourceBytes.byteLength !== current.byteSize || sourceBytes.sha256 !== current.sha256) {
       throw new MediaThumbnailError('SOURCE_CHANGED');
     }
 
     let image: ThumbnailImage;
-    try { image = await this.transformer.createThumbnail(sourceBytes.bytes); }
+    try { image = await this.transformer.createThumbnail(sourceBytes.bytes, signal); }
     catch (error) { throw mapTransformError(error); }
     if (image.mimeType !== 'image/webp') throw new MediaThumbnailError('PROCESSING_FAILED');
     if (!Buffer.isBuffer(image.bytes) || image.bytes.byteLength < 1 || image.bytes.byteLength > this.maxOutputBytes) {
@@ -199,12 +245,16 @@ export class MediaThumbnailService {
   }
 }
 
-async function readBoundedSource(stream: Readable, maxBytes: number): Promise<{ bytes: Buffer; byteLength: number; sha256: string }> {
+async function readBoundedSource(stream: Readable, maxBytes: number, signal: AbortSignal): Promise<{ bytes: Buffer; byteLength: number; sha256: string }> {
   const chunks: Buffer[] = [];
   const hash = createHash('sha256');
   let byteLength = 0;
+  const destroyOnAbort = () => stream.destroy();
+  if (signal.aborted) throw new MediaThumbnailError('PROCESSING_FAILED');
+  signal.addEventListener('abort', destroyOnAbort, { once: true });
   try {
     for await (const value of stream) {
+      if (signal.aborted) throw new MediaThumbnailError('PROCESSING_FAILED');
       const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array);
       byteLength += chunk.byteLength;
       if (byteLength > maxBytes) {
@@ -214,9 +264,13 @@ async function readBoundedSource(stream: Readable, maxBytes: number): Promise<{ 
       hash.update(chunk);
       chunks.push(chunk);
     }
+    if (signal.aborted) throw new MediaThumbnailError('PROCESSING_FAILED');
   } catch (error) {
     if (error instanceof MediaThumbnailError) throw error;
+    if (signal.aborted) throw new MediaThumbnailError('PROCESSING_FAILED');
     throw new MediaThumbnailError('SOURCE_OFFLINE');
+  } finally {
+    signal.removeEventListener('abort', destroyOnAbort);
   }
   return { bytes: Buffer.concat(chunks, byteLength), byteLength, sha256: hash.digest('hex') };
 }

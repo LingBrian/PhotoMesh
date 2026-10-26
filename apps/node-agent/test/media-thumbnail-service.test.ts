@@ -183,6 +183,58 @@ describe('MediaThumbnailService', () => {
     expect(transformer.createThumbnail).not.toHaveBeenCalled();
   });
 
+  it('times out a stalled source stream, destroys it, and releases the worker', async () => {
+    const bytes = Buffer.from('source-bytes');
+    const firstSource = sourceFor(bytes);
+    const secondSource = sourceFor(bytes, { assetId: 'second-asset' });
+    const sources = new Map([[firstSource.assetId, firstSource], [secondSource.assetId, secondSource]]);
+    const transformer: MediaThumbnailTransformer = { createThumbnail: vi.fn(async () => thumbnail) };
+    let stalledStream: Readable | undefined;
+    const service = new MediaThumbnailService({
+      getSource: (_libraryId, assetId) => sources.get(assetId),
+      openOriginal: (source) => {
+        if (source.assetId === firstSource.assetId) {
+          stalledStream = new Readable({ read() {} });
+          return stalledStream;
+        }
+        return Readable.from([bytes]);
+      },
+      transformer,
+      taskTimeoutMs: 25,
+      maxQueuedJobs: 1
+    });
+
+    const stalled = service.getThumbnail('library', firstSource.assetId, 'timeline-192');
+    const queued = service.getThumbnail('library', secondSource.assetId, 'timeline-192');
+    await expect(stalled).rejects.toMatchObject({ code: 'PROCESSING_FAILED' });
+    expect(stalledStream?.destroyed).toBe(true);
+    await expect(queued).resolves.toMatchObject({ mimeType: 'image/webp' });
+    expect(transformer.createThumbnail).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts an opening source and destroys a stream that arrives after timeout', async () => {
+    const bytes = Buffer.from('source-bytes');
+    const source = sourceFor(bytes);
+    let resolveOpening: ((stream: Readable | undefined) => void) | undefined;
+    let openSignal: AbortSignal | undefined;
+    const service = new MediaThumbnailService({
+      getSource: () => source,
+      openOriginal: (_source, signal) => {
+        openSignal = signal;
+        return new Promise<Readable | undefined>((resolve) => { resolveOpening = resolve; });
+      },
+      transformer: { createThumbnail: vi.fn(async () => thumbnail) },
+      taskTimeoutMs: 25
+    });
+
+    const pending = service.getThumbnail('library', 'asset', 'timeline-192');
+    await expect(pending).rejects.toMatchObject({ code: 'PROCESSING_FAILED' });
+    expect(openSignal?.aborted).toBe(true);
+    const lateStream = new Readable({ read() {} });
+    resolveOpening?.(lateStream);
+    await vi.waitFor(() => expect(lateStream.destroyed).toBe(true));
+  });
+
   it('maps transformer errors and validates generated image shape and MIME', async () => {
     const bytes = Buffer.from('source-bytes');
     for (const [failure, code] of [
