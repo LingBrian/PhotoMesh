@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { GalleryPreviewError, loadAssetPreview, type GalleryPreviewErrorCode } from './gallery-preview.js';
+import { maxGalleryThumbnailBytes, readGalleryThumbnail } from './gallery-thumbnail.js';
 import { createMediaVersion, getMediaVersion, isTerminalVersionStatus, loadMediaVersions, loadVersionContent, normalizeCrop, type VersionCollection } from './gallery-versions.js';
 import './gallery.css';
 
@@ -66,6 +67,7 @@ const previewUrl = ref('');
 const previewBusy = ref(false);
 const previewErrorCode = ref<GalleryPreviewErrorCode | null>(null);
 const mediaVersionsEnabled = ref(false);
+const thumbnailsEnabled = ref(false);
 const versions = ref<VersionCollection | null>(null);
 const versionsBusy = ref(false);
 const versionError = ref('');
@@ -79,8 +81,14 @@ const versionPreviewUrl = ref('');
 const activeVersionId = ref('');
 const tagInput = ref('');
 const thumbnailUrls = ref<Record<string, string>>({});
+const maxThumbnailMemoryBytes = 8 * 1024 * 1024;
+const maxThumbnailMemoryEntries = 128;
+const thumbnailUrlCache = new Map<string, { url: string; byteSize: number }>();
+const thumbnailRequests = new Map<string, AbortController>();
+let thumbnailMemoryBytes = 0;
 let previewGeneration = 0;
 let previewAbort: AbortController | undefined;
+let previewInvoker: HTMLElement | null = null;
 let imageObserver: IntersectionObserver | undefined;
 let healthTimer: ReturnType<typeof setInterval> | undefined;
 let pageGeneration = 0;
@@ -89,6 +97,10 @@ let metadataGeneration = 0;
 let suppressLibraryReload = false;
 const rowHeight = 164;
 const pageSize = 100;
+const fullDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }));
+const groupDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { dateStyle: 'long' }));
+const dayKeyFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { year: 'numeric', month: '2-digit', day: '2-digit' }));
+const timeFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { timeStyle: 'short' }));
 
 const filteredAssets = computed(() => {
   const needle = search.value.trim().toLocaleLowerCase();
@@ -130,7 +142,7 @@ function clearAuthorizedSession(clearCredentials = false): void {
   tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
   peers.value = []; pendingPeers.value = []; peersError.value = ''; grantLibraryByPeer.value = {}; invitation.value = null;
   tags.value = {}; albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
-  mediaVersionsEnabled.value = false;
+  mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false;
   closePreview(); clearThumbnailUrls();
   if (clearCredentials) { token.value = ''; tokenInput.value = ''; }
 }
@@ -166,8 +178,10 @@ async function connect(preserveSession = false): Promise<void> {
     const health = await fetch(`${apiBase.value}/v1/health`);
     lastHealthCheck.value = new Date();
     if (!health.ok) throw new Error(t('gallery.connectionFailed'));
-    const healthResult = await health.json() as { capabilities?: string[] };
-    mediaVersionsEnabled.value = healthResult.capabilities?.includes('mediaVersions') ?? false;
+    const healthResult = await health.json() as { capabilities?: unknown };
+    const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
+    mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
+    thumbnailsEnabled.value = capabilities.includes('thumbnails');
     const result = await request<{ items: Library[] }>('/v1/libraries');
     libraries.value = result.items;
     suppressLibraryReload = true;
@@ -197,13 +211,18 @@ async function checkHealth(): Promise<void> {
   try {
     const response = await fetch(`${apiBase.value}/v1/health`);
     connected.value = response.ok;
-    if (response.ok) mediaVersionsEnabled.value = ((await response.json()) as { capabilities?: string[] }).capabilities?.includes('mediaVersions') ?? false;
+    if (response.ok) {
+      const healthResult = await response.json() as { capabilities?: unknown };
+      const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
+      mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
+      thumbnailsEnabled.value = capabilities.includes('thumbnails');
+    }
     if (response.ok && !wasConnected && hasSession.value) {
       await loadPage(true, true);
       await loadPeerList();
       if (section.value === 'recycle') await loadRecycleBin();
     }
-  } catch { connected.value = false; mediaVersionsEnabled.value = false; }
+  } catch { connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; }
 }
 async function loadPage(reset = false, preserveOnFailure = false): Promise<boolean> {
   if (!connected.value || !hasSession.value || !libraryId.value || busy.value && !reset) return false;
@@ -264,7 +283,12 @@ function observeImages(): void {
     document.querySelectorAll<HTMLElement>('[data-asset-id]').forEach((element) => imageObserver?.observe(element));
   });
 }
-watch(visibleAssets, observeImages);
+async function loadVisibleThumbnails(): Promise<void> {
+  for (const asset of visibleAssets.value) {
+    if (asset.kind === 'photo') await ensureThumbnail(asset.assetId);
+  }
+}
+watch(visibleAssets, () => { observeImages(); void loadVisibleThumbnails(); });
 function thumbnailCacheKey(asset: Asset): string {
   return JSON.stringify([apiBase.value, asset.libraryId, asset.originNodeId, asset.assetId, asset.version]);
 }
@@ -273,26 +297,114 @@ function localMetadataKey(): string {
 }
 function clearThumbnailUrls(): void {
   cacheGeneration += 1;
-  for (const url of Object.values(thumbnailUrls.value)) URL.revokeObjectURL(url);
+  for (const controller of thumbnailRequests.values()) controller.abort();
+  thumbnailRequests.clear();
+  for (const entry of thumbnailUrlCache.values()) URL.revokeObjectURL(entry.url);
+  thumbnailUrlCache.clear();
+  thumbnailMemoryBytes = 0;
   thumbnailUrls.value = {};
 }
 
+function touchThumbnailUrl(assetId: string): void {
+  const entry = thumbnailUrlCache.get(assetId);
+  if (!entry) return;
+  thumbnailUrlCache.delete(assetId);
+  thumbnailUrlCache.set(assetId, entry);
+}
+
+function removeThumbnailUrl(assetId: string): void {
+  const entry = thumbnailUrlCache.get(assetId);
+  if (!entry) return;
+  thumbnailUrlCache.delete(assetId);
+  thumbnailMemoryBytes -= entry.byteSize;
+  URL.revokeObjectURL(entry.url);
+  const nextUrls = { ...thumbnailUrls.value };
+  delete nextUrls[assetId];
+  thumbnailUrls.value = nextUrls;
+}
+
+function setThumbnailUrl(assetId: string, blob: Blob): void {
+  if (blob.size < 1 || blob.size > maxThumbnailMemoryBytes) return;
+  const previous = thumbnailUrlCache.get(assetId);
+  if (previous) {
+    URL.revokeObjectURL(previous.url);
+    thumbnailMemoryBytes -= previous.byteSize;
+    thumbnailUrlCache.delete(assetId);
+  }
+  const url = URL.createObjectURL(blob);
+  thumbnailUrlCache.set(assetId, { url, byteSize: blob.size });
+  thumbnailMemoryBytes += blob.size;
+  thumbnailUrls.value = { ...thumbnailUrls.value, [assetId]: url };
+  while (thumbnailUrlCache.size > maxThumbnailMemoryEntries || thumbnailMemoryBytes > maxThumbnailMemoryBytes) {
+    const oldest = thumbnailUrlCache.entries().next().value as [string, { url: string; byteSize: number }] | undefined;
+    if (!oldest) break;
+    thumbnailUrlCache.delete(oldest[0]);
+    thumbnailMemoryBytes -= oldest[1].byteSize;
+    URL.revokeObjectURL(oldest[1].url);
+    const nextUrls = { ...thumbnailUrls.value };
+    delete nextUrls[oldest[0]];
+    thumbnailUrls.value = nextUrls;
+  }
+}
+
 async function ensureThumbnail(assetId: string): Promise<void> {
-  if (thumbnailUrls.value[assetId]) return;
+  if (thumbnailUrls.value[assetId]) { touchThumbnailUrl(assetId); return; }
+  if (thumbnailRequests.has(assetId)) return;
   const asset = assets.value.find((item) => item.assetId === assetId);
-  if (!asset) return;
+  if (!asset || asset.kind !== 'photo') return;
   const generation = cacheGeneration;
   const key = thumbnailCacheKey(asset);
+  const controller = new AbortController();
+  thumbnailRequests.set(assetId, controller);
   try {
-    const cached = await idbGet<Blob>('thumbnails', key);
-    if (cached && generation === cacheGeneration && assets.value.some((item) => thumbnailCacheKey(item) === key)) {
-      thumbnailUrls.value = { ...thumbnailUrls.value, [assetId]: URL.createObjectURL(cached) };
+    let cached: Blob | undefined;
+    try { cached = await idbGet<Blob>('thumbnails', key); } catch { /* A cache miss does not trigger original bytes. */ }
+    if (cached && cached.size > 0 && cached.size <= maxThumbnailMemoryBytes &&
+        generation === cacheGeneration && assets.value.some((item) => thumbnailCacheKey(item) === key)) {
+      setThumbnailUrl(assetId, cached);
+      return;
     }
-  } catch { /* A cache miss never triggers an implicit original read. */ }
+    if (!thumbnailsEnabled.value || !connected.value || !token.value.trim()) return;
+    const path = `/v1/libraries/${encodeURIComponent(asset.libraryId)}/assets/${encodeURIComponent(asset.assetId)}/thumbnail?profile=timeline-192`;
+    const response = await fetch(`${apiBase.value}${path}`, {
+      headers: headers(), cache: 'no-store', signal: controller.signal
+    });
+    if (response.status === 401 || response.status === 403) {
+      if (generation === cacheGeneration) {
+        clearAuthorizedSession(true);
+        error.value = t('gallery.authorizationRequired');
+      }
+      return;
+    }
+    if (response.status === 404) {
+      if (generation === cacheGeneration) removeThumbnailUrl(assetId);
+      return;
+    }
+    if (!response.ok) return;
+    if ((response.headers.get('content-type') ?? '').split(';', 1)[0]?.trim().toLowerCase() !== 'image/webp') {
+      try { await response.body?.cancel(); } catch { /* Reject unexpected media types without reading them. */ }
+      return;
+    }
+    const contentLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(contentLength) && contentLength > maxGalleryThumbnailBytes) {
+      try { await response.body?.cancel(); } catch { /* The byte limit remains authoritative. */ }
+      return;
+    }
+    const blob = await readGalleryThumbnail(response);
+    if (!blob || blob.size < 1 || blob.size > maxGalleryThumbnailBytes || generation !== cacheGeneration ||
+        !assets.value.some((item) => thumbnailCacheKey(item) === key)) return;
+    setThumbnailUrl(assetId, blob);
+  } catch {
+    // The grid keeps its placeholder on transport/decoder errors; no original read is attempted.
+  } finally {
+    if (thumbnailRequests.get(assetId) === controller) thumbnailRequests.delete(assetId);
+  }
 }
 
 function clearVersionPreview(): void { versionPreviewRequestId += 1; if (versionPreviewUrl.value) URL.revokeObjectURL(versionPreviewUrl.value); versionPreviewUrl.value = ''; activeVersionId.value = ''; }
-function closePreview(): void {
+function closePreview(restoreFocus = false): void {
+  const invoker = restoreFocus ? previewInvoker : null;
+  previewInvoker = null;
   clearVersionPreview();
   versionGeneration += 1;
   versions.value = null; versionsBusy.value = false; versionError.value = ''; crop.value = { x: 0, y: 0, width: 1, height: 1 }; sourceVersionId.value = ''; rotation.value = 0;
@@ -305,6 +417,7 @@ function closePreview(): void {
   previewBusy.value = false;
   previewErrorCode.value = null;
   isCachedPreview.value = false;
+  if (restoreFocus && invoker?.isConnected) void nextTick(() => invoker.focus());
 }
 
 async function resizeImage(source: Blob, maxWidth: number, maxHeight: number): Promise<Blob> {
@@ -324,7 +437,9 @@ async function resizeImage(source: Blob, maxWidth: number, maxHeight: number): P
 }
 
 async function openPreview(asset: Asset): Promise<void> {
+  const invoker = previewAsset.value ? previewInvoker : document.activeElement instanceof HTMLElement ? document.activeElement : null;
   closePreview();
+  previewInvoker = invoker;
   const generation = ++previewGeneration;
   const controller = new AbortController();
   previewAbort = controller;
@@ -336,8 +451,19 @@ async function openPreview(asset: Asset): Promise<void> {
   if (generation !== previewGeneration) return;
   document.querySelector<HTMLElement>('.preview-dialog')?.focus();
   try {
-    if (!connected.value) {
-      const cached = await idbGet<Blob>('thumbnails', thumbnailCacheKey(asset));
+    if (!connected.value || !['online', 'cached'].includes(asset.availability)) {
+      let cached: Blob | undefined;
+      try { cached = await idbGet<Blob>('thumbnails', thumbnailCacheKey(asset)); } catch { /* Use current-session memory cache if available. */ }
+      if (!cached) {
+        const cachedUrl = thumbnailUrls.value[asset.assetId];
+        if (cachedUrl) {
+          touchThumbnailUrl(asset.assetId);
+          try {
+            const cachedResponse = await fetch(cachedUrl);
+            if (cachedResponse.ok) cached = await cachedResponse.blob();
+          } catch { /* The object URL may have been evicted during navigation. */ }
+        }
+      }
       if (!cached) throw new GalleryPreviewError('source-offline');
       if (generation !== previewGeneration) return;
       previewUrl.value = URL.createObjectURL(cached);
@@ -355,9 +481,7 @@ async function openPreview(asset: Asset): Promise<void> {
       cacheAvailable.value = true;
     } catch { cacheAvailable.value = false; }
     if (generation !== previewGeneration) return;
-    const oldThumbnailUrl = thumbnailUrls.value[asset.assetId];
-    if (oldThumbnailUrl) URL.revokeObjectURL(oldThumbnailUrl);
-    thumbnailUrls.value = { ...thumbnailUrls.value, [asset.assetId]: URL.createObjectURL(thumbnail) };
+    setThumbnailUrl(asset.assetId, thumbnail);
     previewUrl.value = URL.createObjectURL(view);
   } catch (cause) {
     if (generation === previewGeneration && !controller.signal.aborted) {
@@ -371,6 +495,30 @@ async function openPreview(asset: Asset): Promise<void> {
   }
 }
 
+const previewIndex = computed(() => previewAsset.value ? filteredAssets.value.findIndex((item) => item.assetId === previewAsset.value?.assetId) : -1);
+function findPreviewNeighbor(direction: -1 | 1): number {
+  const currentIndex = previewAsset.value ? filteredAssets.value.findIndex((item) => item.assetId === previewAsset.value?.assetId) : -1;
+  for (let index = currentIndex + direction; index >= 0 && index < filteredAssets.value.length; index += direction) {
+    const asset = filteredAssets.value[index];
+    if (asset && asset.kind === 'photo' && ['online', 'cached'].includes(asset.availability)) return index;
+  }
+  return -1;
+}
+const previousPreviewIndex = computed(() => findPreviewNeighbor(-1));
+const nextPreviewIndex = computed(() => findPreviewNeighbor(1));
+function navigatePreview(direction: -1 | 1): void {
+  if (previewBusy.value) return;
+  const targetIndex = direction < 0 ? previousPreviewIndex.value : nextPreviewIndex.value;
+  const target = targetIndex >= 0 ? filteredAssets.value[targetIndex] : undefined;
+  if (target) void openPreview(target);
+}
+function onPreviewKeydown(event: KeyboardEvent): void {
+  if (!previewAsset.value || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  const target = event.target;
+  if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [role="textbox"]'))) return;
+  if (event.key === 'ArrowLeft') { event.preventDefault(); navigatePreview(-1); }
+  else if (event.key === 'ArrowRight') { event.preventDefault(); navigatePreview(1); }
+}
 function previewErrorMessage(code: GalleryPreviewErrorCode): string {
   switch (code) {
     case 'source-offline': return t('gallery.sourceOffline');
@@ -463,6 +611,7 @@ async function clearLocalCache(): Promise<void> {
   try {
     await idbClear('thumbnails');
     clearThumbnailUrls(); cacheAvailable.value = true; error.value = '';
+    if (connected.value && thumbnailsEnabled.value) await loadVisibleThumbnails();
   } catch { cacheAvailable.value = false; error.value = t('gallery.cacheClearFailed'); }
 }
 async function loadRecycleBin(): Promise<void> {
@@ -576,7 +725,36 @@ function errorText(cause: unknown): string {
   if (cause instanceof Error) return cause.message;
   return t('gallery.unknownError');
 }
-function formatDate(value: string | null): string { return value ? new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : t('gallery.unknownDate'); }
+function parsedDate(value: string | null): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+function formatDate(value: string | null): string {
+  const date = parsedDate(value);
+  return date ? fullDateFormatter.value.format(date) : t('gallery.unknownDate');
+}
+function formatDateGroup(value: string | null): string {
+  const date = parsedDate(value);
+  return date ? groupDateFormatter.value.format(date) : t('gallery.unknownDate');
+}
+function formatTime(value: string | null): string {
+  const date = parsedDate(value);
+  return date ? timeFormatter.value.format(date) : t('gallery.unknownDate');
+}
+function dateGroupKey(value: string | null): string {
+  const date = parsedDate(value);
+  return date ? dayKeyFormatter.value.format(date) : 'unknown';
+}
+function dateTimeValue(value: string | null): string | undefined {
+  return parsedDate(value)?.toISOString();
+}
+function isDateGroupStart(asset: Asset, visibleIndex: number): boolean {
+  const absoluteIndex = visibleStart.value + visibleIndex;
+  if (absoluteIndex === 0) return true;
+  const previous = filteredAssets.value[absoluteIndex - 1];
+  return dateGroupKey(previous?.capturedAt ?? null) !== dateGroupKey(asset.capturedAt);
+}
 function versionStatusText(status: string): string {
   switch (status.toLowerCase()) {
     case 'staging': return t('gallery.versionStatus.staging');
@@ -587,8 +765,9 @@ function versionStatusText(status: string): string {
 }
 function formatSize(bytes: number): string { return new Intl.NumberFormat(locale.value, { style: 'unit', unit: 'byte', unitDisplay: 'narrow', notation: bytes > 1_000_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(bytes); }
 function changeSection(value: typeof section.value): void { section.value = value; if (value === 'recycle') void loadRecycleBin(); }
-onMounted(() => { void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value; });
+onMounted(() => { void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value; document.addEventListener('keydown', onPreviewKeydown); });
 onBeforeUnmount(() => {
+  document.removeEventListener('keydown', onPreviewKeydown);
   if (healthTimer) clearInterval(healthTimer); if (searchTimer) clearTimeout(searchTimer);
   closePreview();
   imageObserver?.disconnect(); clearThumbnailUrls();
@@ -821,7 +1000,7 @@ async function idbClear(store: string): Promise<void> {
               aria-hidden="true"
             />
             <article
-              v-for="asset in visibleAssets"
+              v-for="(asset, visibleIndex) in visibleAssets"
               :key="asset.assetId"
               class="asset-row"
               :data-asset-id="asset.assetId"
@@ -856,7 +1035,16 @@ async function idbClear(store: string): Promise<void> {
                     class="availability"
                     :class="asset.availability"
                   >{{ t(`gallery.availability.${asset.availability}`) }}</span>
-                </div><p class="asset-date">{{ formatDate(asset.capturedAt) }} <span>·</span> {{ formatSize(asset.byteSize) }}</p><p class="source-line"><span>⌂ {{ asset.originNodeId }}</span><span v-if="asset.sourcePath">· {{ asset.sourcePath }}</span></p><div class="tag-list">
+                </div>
+                <p class="asset-date">
+                  <time
+                    :class="{ 'timeline-day-heading': isDateGroupStart(asset, visibleIndex) }"
+                    :datetime="dateTimeValue(asset.capturedAt)"
+                    :aria-label="formatDate(asset.capturedAt)"
+                  >{{ isDateGroupStart(asset, visibleIndex) ? formatDateGroup(asset.capturedAt) : formatTime(asset.capturedAt) }}</time>
+                  <span>·</span> {{ formatSize(asset.byteSize) }}
+                </p>
+                <p class="source-line"><span>⌂ {{ asset.originNodeId }}</span><span v-if="asset.sourcePath">· {{ asset.sourcePath }}</span></p><div class="tag-list">
                   <span
                     v-for="tag in tags[asset.assetId] ?? []"
                     :key="tag"
@@ -1215,8 +1403,8 @@ async function idbClear(store: string): Promise<void> {
     <div
       v-if="previewAsset"
       class="modal-backdrop preview-backdrop"
-      @click.self="closePreview"
-      @keydown.esc="closePreview"
+      @click.self="closePreview(true)"
+      @keydown.esc="closePreview(true)"
     >
       <section
         class="preview-dialog"
@@ -1229,11 +1417,60 @@ async function idbClear(store: string): Promise<void> {
           class="dialog-close"
           :aria-label="t('gallery.close')"
           autofocus
-          @click="closePreview"
+          @click="closePreview(true)"
         >
           ×
         </button>
         <h2>{{ previewAsset.filename }}</h2>
+        <nav
+          class="preview-navigation"
+          :aria-label="t('gallery.previewNavigation')"
+        >
+          <button
+            type="button"
+            class="secondary-button"
+            :aria-label="t('gallery.previousPhoto')"
+            :disabled="previousPreviewIndex < 0 || previewBusy"
+            @click="navigatePreview(-1)"
+          >
+            ← {{ t('gallery.previousPhoto') }}
+          </button>
+          <span aria-live="polite">{{ previewIndex + 1 }} / {{ filteredAssets.length }}</span>
+          <button
+            type="button"
+            class="secondary-button"
+            :aria-label="t('gallery.nextPhoto')"
+            :disabled="nextPreviewIndex < 0 || previewBusy"
+            @click="navigatePreview(1)"
+          >
+            {{ t('gallery.nextPhoto') }} →
+          </button>
+        </nav>
+        <dl class="preview-metadata">
+          <div>
+            <dt>{{ t('gallery.captureTime') }}</dt>
+            <dd>{{ formatDate(previewAsset.capturedAt) }}</dd>
+          </div>
+          <div>
+            <dt>{{ t('gallery.originNode') }}</dt>
+            <dd>{{ previewAsset.originNodeId }}</dd>
+          </div>
+          <div>
+            <dt>{{ t('gallery.fileSize') }}</dt>
+            <dd>{{ formatSize(previewAsset.byteSize) }}</dd>
+          </div>
+          <div>
+            <dt>{{ t('gallery.availabilityLabel') }}</dt>
+            <dd>
+              <span
+                class="availability"
+                :class="previewAsset.availability"
+              >
+                {{ t(`gallery.availability.${previewAsset.availability}`) }}
+              </span>
+            </dd>
+          </div>
+        </dl>
         <div
           class="preview-stage"
           :aria-busy="previewBusy"

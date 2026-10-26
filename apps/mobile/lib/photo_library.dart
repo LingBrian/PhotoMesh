@@ -154,9 +154,9 @@ class PhotoLibraryService {
     }
   }
 
-  Future<List<AssetEntity>> latestForSelection({int pageSize = 80}) async {
+  Future<List<AssetEntity>> latestForSelection({int page = 0, int pageSize = 80}) async {
     final permission = await checkPermission();
-    return permission.hasAccess ? _gateway.latest(pageSize: pageSize) : const [];
+    return permission.hasAccess ? _gateway.latest(page: page, pageSize: pageSize) : const [];
   }
 
   Future<UploadJob?> _jobFor(AssetEntity asset) async {

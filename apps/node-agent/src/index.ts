@@ -14,6 +14,7 @@ import { PairingApprovalQueue } from './auth/pairing-approval-queue.js';
 import { LanPairingNode } from './auth/lan-node.js';
 import type { PairingServerControl } from './server.js';
 import type { MediaVersionService } from './media/media-version-service.js';
+import type { MediaThumbnailService } from './media/thumbnail-service.js';
 import type { MediaVersionSourceRecord } from './db/repository.js';
 import { timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
@@ -73,15 +74,22 @@ const openOriginalMedia = async (media: Pick<MediaVersionSourceRecord, 'storageR
   return undefined;
 };
 let mediaVersionService: MediaVersionService | undefined;
+let mediaThumbnailService: MediaThumbnailService | undefined;
 try {
-  const [{ MediaVersionService }, { SharpMediaImageTransformer }] = await Promise.all([
-    import('./media/media-version-service.js'), import('./media/image-transformer.js')
+  const [{ MediaVersionService }, { MediaThumbnailService }, { SharpMediaImageTransformer }] = await Promise.all([
+    import('./media/media-version-service.js'), import('./media/thumbnail-service.js'), import('./media/image-transformer.js')
   ]);
+  const transformer = new SharpMediaImageTransformer();
   mediaVersionService = new MediaVersionService({
-    repository, fileSystem: managedFileSystem, transformer: new SharpMediaImageTransformer(), openOriginal: openOriginalMedia
+    repository, fileSystem: managedFileSystem, transformer, openOriginal: openOriginalMedia
+  });
+  mediaThumbnailService = new MediaThumbnailService({
+    getSource: (libraryId, assetId) => repository.getMediaVersionSource(libraryId, assetId, null),
+    openOriginal: openOriginalMedia,
+    transformer
   });
 } catch {
-  process.stderr.write('PhotoMesh media versioning unavailable; CPU image processing could not be loaded\n');
+  process.stderr.write('PhotoMesh media processing unavailable; CPU image processing could not be loaded\n');
 }
 const uploadService = new UploadService({
   repository,
@@ -145,6 +153,10 @@ const server = createNodeAgentServer({
       () => restoreTombstoneOperation(libraryId, eventId, syncService, (id) => repository.listActiveTombstones(id)))
   },
   ...(mediaVersionService ? { mediaVersions: mediaVersionService } : {}),
+  ...(mediaThumbnailService ? { thumbnails: {
+    readThumbnail: (libraryId: string, assetId: string, profile: string) =>
+      mediaThumbnailService!.getThumbnail(libraryId, assetId, profile)
+  } } : {}),
   ...(pairingControl ? { pairingControl } : {})
 });
 server.listen(port, host, () => process.stdout.write(`PhotoMesh node-agent listening on ${host}:${port}\n`));

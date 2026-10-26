@@ -3,6 +3,16 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:photomesh_mobile/main.dart';
 
 void main() {
+  test('returns selected photos in the same order as selection badges', () {
+    final assets = [
+      (id: 'a', title: 'first'),
+      (id: 'b', title: 'second'),
+      (id: 'c', title: 'third'),
+    ];
+    final ordered = orderBySelection(assets, (asset) => asset.id, {'c', 'a'});
+    expect(ordered.map((asset) => asset.id), ['c', 'a']);
+  });
+
   test('retains skipped manual selections alongside queue preflight errors', () {
     const summary = '2 added; 1 skipped';
     expect(

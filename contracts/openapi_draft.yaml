@@ -84,6 +84,44 @@ paths:
               schema: {type: string, format: binary}
         '404': {description: Asset is absent or not authorized}
         '409': {description: Source location is offline}
+  /v1/libraries/{libraryId}/assets/{assetId}/thumbnail:
+    get:
+      summary: 每次请求校验图库 ACL 后读取固定尺寸的 WebP 缩略图
+      description: Cache hits are also ACL-protected. Never falls back to returning original bytes.
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+        - in: path
+          name: assetId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+        - in: query
+          name: profile
+          required: false
+          schema: {type: string, enum: [timeline-192], default: timeline-192}
+      responses:
+        '200':
+          description: Bounded derived WebP thumbnail; no EXIF/GPS metadata
+          headers:
+            ETag: {schema: {type: string}}
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Content-Type-Options: {schema: {type: string, const: nosniff}}
+          content:
+            image/webp:
+              schema: {type: string, format: binary}
+        '400': {description: Invalid path or profile}
+        '404': {description: Asset is absent or not authorized}
+        '409': {description: Source changed or offline and no matching derived cache exists}
+        '413': {description: Source or generated thumbnail exceeds configured byte limit}
+        '415': {description: Unsupported or multi-page source image}
+        '500': {description: Thumbnail processing failed}
+        '429':
+          description: Bounded thumbnail queue is full
+          headers:
+            Retry-After: {schema: {type: string, const: '1'}}
+        '503': {description: Thumbnail processing capability unavailable}
   /v1/libraries/{libraryId}/assets/{assetId}/versions:
     parameters:
       - in: path

@@ -1,6 +1,10 @@
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Readable } from 'node:stream';
 import { createNodeAgentServer, type MediaVersionServerControl, type NodeAgentServerOptions, type PairingServerControl } from '../src/server.js';
+import { MediaThumbnailService } from '../src/media/thumbnail-service.js';
+import type { MediaThumbnailTransformer } from '../src/media/image-transformer.js';
+import type { MediaVersionSourceRecord } from '../src/db/repository.js';
 
 const servers: ReturnType<typeof createNodeAgentServer>[] = [];
 
@@ -31,6 +35,119 @@ describe('node-agent health endpoint', () => {
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ error: 'not_found' });
     expect(response.headers.get('x-request-id')).toBeTruthy();
+  });
+});
+
+describe('authorized thumbnail endpoint', () => {
+  it('checks library ACL before invoking thumbnail service and returns bounded private WebP bytes', async () => {
+    const bytes = Buffer.from('derived-webp');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const authorizeLibraryRead = vi.fn((token: string | undefined, libraryId: string) =>
+      token === 'reader' && libraryId === 'library' ? 'reader-1' : undefined);
+    const readThumbnail = vi.fn(async () => ({
+      bytes, sha256, byteSize: bytes.byteLength, width: 192, height: 96, mimeType: 'image/webp' as const
+    }));
+    const options = { authorizeLibraryRead, thumbnails: { readThumbnail } } as NodeAgentServerOptions;
+    const path = '/v1/libraries/library/assets/asset/thumbnail?profile=timeline-192';
+
+    const denied = await request(path, options);
+    expect(denied.status).toBe(404);
+    expect(await denied.json()).toMatchObject({ error: 'not_found' });
+    expect(readThumbnail).not.toHaveBeenCalled();
+
+    const unauthorizedLibrary = await request('/v1/libraries/other-library/assets/asset/thumbnail?profile=timeline-192', options, {
+      headers: { authorization: 'Bearer reader' }
+    });
+    expect(unauthorizedLibrary.status).toBe(404);
+    expect(readThumbnail).not.toHaveBeenCalled();
+
+    const response = await request(path, options, { headers: { authorization: 'Bearer reader' } });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('image/webp');
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('etag')).toBe(`"${sha256}"`);
+    expect(response.headers.get('content-length')).toBe(String(bytes.byteLength));
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+    expect(authorizeLibraryRead).toHaveBeenCalledWith('reader', 'library');
+    expect(readThumbnail).toHaveBeenCalledWith('library', 'asset', 'timeline-192');
+
+    const cacheHitResponse = await request(path, options, { headers: { authorization: 'Bearer reader' } });
+    expect(cacheHitResponse.status).toBe(200);
+    expect((await cacheHitResponse.arrayBuffer()).byteLength).toBe(bytes.byteLength);
+    expect(readThumbnail).toHaveBeenCalledTimes(2);
+    expect(authorizeLibraryRead).toHaveBeenCalledTimes(6);
+
+    const invalidProfile = await request('/v1/libraries/library/assets/asset/thumbnail?profile=original', options, {
+      headers: { authorization: 'Bearer reader' }
+    });
+    expect(invalidProfile.status).toBe(400);
+    expect(readThumbnail).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a warm derived cache inaccessible after ACL revocation', async () => {
+    const originalBytes = Buffer.from('private-original-bytes');
+    const derivedBytes = Buffer.from('derived-webp-only');
+    const source: MediaVersionSourceRecord = {
+      libraryId: 'library', assetId: 'asset', sourceVersionId: null, kind: 'photo', filename: 'private.jpg',
+      sha256: createHash('sha256').update(originalBytes).digest('hex'), byteSize: originalBytes.byteLength,
+      storageRef: 'objects/asset/original.blob', originalPath: null, availability: 'online', mimeType: null
+    };
+    const getSource = vi.fn(() => source);
+    const openOriginal = vi.fn(async () => Readable.from([originalBytes]));
+    const transformer: MediaThumbnailTransformer = {
+      createThumbnail: vi.fn(async () => ({ bytes: derivedBytes, mimeType: 'image/webp' as const, width: 1, height: 1 }))
+    };
+    const thumbnailService = new MediaThumbnailService({ getSource, openOriginal, transformer });
+    let allowed = true;
+    const options: NodeAgentServerOptions = {
+      authorizeLibraryRead: (_token, libraryId) => allowed && libraryId === 'library' ? 'reader' : undefined,
+      thumbnails: { readThumbnail: (libraryId, assetId, profile) => thumbnailService.getThumbnail(libraryId, assetId, profile) }
+    };
+    const path = '/v1/libraries/library/assets/asset/thumbnail?profile=timeline-192';
+    const headers = { authorization: 'Bearer reader' };
+
+    const first = await request(path, options, { headers });
+    expect(first.status).toBe(200);
+    const firstBody = Buffer.from(await first.arrayBuffer());
+    expect(firstBody).toEqual(derivedBytes);
+    expect(firstBody).not.toEqual(originalBytes);
+    expect(getSource).toHaveBeenCalledTimes(2);
+    expect(openOriginal).toHaveBeenCalledTimes(1);
+
+    allowed = false;
+    const revoked = await request(path, options, { headers });
+    expect(revoked.status).toBe(404);
+    expect(getSource).toHaveBeenCalledTimes(2);
+    expect(openOriginal).toHaveBeenCalledTimes(1);
+
+    allowed = true;
+    const cached = await request(path, options, { headers });
+    expect(cached.status).toBe(200);
+    expect(Buffer.from(await cached.arrayBuffer())).toEqual(derivedBytes);
+    expect(getSource).toHaveBeenCalledTimes(3);
+    expect(openOriginal).toHaveBeenCalledTimes(1);
+  });
+
+  it('advertises the optional thumbnail capability only when configured', async () => {
+    const response = await request('/v1/health', {
+      thumbnails: { readThumbnail: async () => ({ bytes: Buffer.from('x'), sha256: 'c'.repeat(64), byteSize: 1, width: 1, height: 1, mimeType: 'image/webp' }) }
+    } as NodeAgentServerOptions);
+    expect((await response.json() as { capabilities: string[] }).capabilities).toContain('thumbnails');
+  });
+
+  it('maps queue saturation to a bounded retry response without exposing internal details', async () => {
+    const response = await request('/v1/libraries/library/assets/asset/thumbnail', {
+      authorizeLibraryRead: (token, libraryId) => token === 'reader' && libraryId === 'library' ? 'reader' : undefined,
+      thumbnails: {
+        readThumbnail: async () => { throw Object.assign(new Error('private file path'), { code: 'QUEUE_FULL' }); }
+      }
+    }, { headers: { authorization: 'Bearer reader' } });
+    expect(response.status).toBe(429);
+    expect(response.headers.get('retry-after')).toBe('1');
+    const body = await response.text();
+    expect(body).toContain('queue_full');
+    expect(body).not.toContain('private file path');
   });
 });
 

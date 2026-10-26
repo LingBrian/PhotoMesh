@@ -58,8 +58,30 @@ describe('SharpMediaImageTransformer', () => {
       .rejects.toMatchObject({ code: 'TOO_LARGE' });
   });
 
-  it('rejects malformed, animated, and over-pixel-limit inputs', async () => {
+  it('creates a bounded 192px WebP thumbnail and strips source metadata', async () => {
+    const input = await sharp({ create: { width: 640, height: 320, channels: 3, background: '#1565c0' } })
+      .webp().withMetadata({ orientation: 6 }).toBuffer();
+    const output = await transformer.createThumbnail(input);
+    const metadata = await sharp(output.bytes).metadata();
+    expect(output.mimeType).toBe('image/webp');
+    expect(output.width).toBeLessThanOrEqual(192);
+    expect(output.height).toBeLessThanOrEqual(192);
+    expect(output.bytes.byteLength).toBeLessThanOrEqual(256 * 1024);
+    expect(metadata.format).toBe('webp');
+    expect(metadata.exif).toBeUndefined();
+    expect(metadata.orientation).toBeUndefined();
+  });
+
+  it('rejects thumbnail input bytes and pixel dimensions above the approved limits', async () => {
+    await expect(transformer.createThumbnail(Buffer.alloc(16 * 1024 * 1024 + 1)))
+      .rejects.toMatchObject({ code: 'TOO_LARGE' });
+    const large = await sharp({ create: { width: 3700, height: 3500, channels: 3, background: '#fff' } }).png().toBuffer();
+    await expect(transformer.createThumbnail(large)).rejects.toMatchObject({ code: 'TOO_LARGE' });
+  });
+
+  it('rejects malformed and over-pixel-limit inputs', async () => {
     await expect(transformer.inspect(Buffer.from('not an image'))).rejects.toMatchObject({ code: 'UNSUPPORTED_MEDIA' });
+    await expect(transformer.createThumbnail(Buffer.from('not an image'))).rejects.toMatchObject({ code: 'UNSUPPORTED_MEDIA' });
     const large = await sharp({ create: { width: 5001, height: 5000, channels: 3, background: '#fff' } }).png().toBuffer();
     await expect(transformer.inspect(large)).rejects.toMatchObject({ code: 'TOO_LARGE' });
     await expect(transformer.transform(Buffer.from('bad'), { crop: fullCrop, rotation: 0 }))

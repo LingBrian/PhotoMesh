@@ -35,6 +35,7 @@ class _MemoryFiles implements UploadFileAccess {
 
 class _PermissionGateway implements PhotoLibraryGateway {
   PermissionState state = PermissionState.denied;
+  final requestedPages = <int>[];
 
   @override
   Future<PermissionState> currentPermission() async => state;
@@ -43,7 +44,10 @@ class _PermissionGateway implements PhotoLibraryGateway {
   @override
   Future<AssetEntity?> byId(String assetId) async => null;
   @override
-  Future<List<AssetEntity>> latest({int page = 0, int pageSize = 80}) async => const [];
+  Future<List<AssetEntity>> latest({int page = 0, int pageSize = 80}) async {
+    requestedPages.add(page);
+    return const [];
+  }
 }
 
 UploadJob _job(List<int> bytes) {
@@ -70,6 +74,28 @@ void main() {
   tearDown(() async {
     await queue.close();
     await tempDirectory.delete(recursive: true);
+  });
+
+  test('manual selection requests the requested page only while permission is granted', () async {
+    final gateway = _PermissionGateway()..state = PermissionState.limited;
+    final photos = PhotoLibraryService(queue: queue, gateway: gateway);
+    expect(await photos.latestForSelection(page: 2, pageSize: 80), isEmpty);
+    expect(gateway.requestedPages, [2]);
+    gateway.state = PermissionState.denied;
+    expect(await photos.latestForSelection(page: 3, pageSize: 80), isEmpty);
+    expect(gateway.requestedPages, [2]);
+  });
+
+  test('manual submission queues only selected assets in selection order', () async {
+    final submitted = <int>[];
+    final selected = [4, 2];
+    final result = await queueSelectedPhotos<int>(selected, (id) async {
+      submitted.add(id);
+      return _job([id]);
+    });
+    expect(submitted, [4, 2]);
+    expect(result.queued, 2);
+    expect(result.skipped, 0);
   });
 
   test('continues manual selection after gallery access failures and reports skipped items', () async {
