@@ -24,6 +24,36 @@ async function connectFixture(page: Page): Promise<void> {
   await expect(page.getByRole('button', { name: 'Preview offline-fixture.png' })).toBeVisible();
 }
 
+test('places preview metadata and version controls in a responsive sidebar', async ({ page }) => {
+  await connectFixture(page);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.getByRole('button', { name: 'Preview offline-fixture.png' }).click();
+
+  const dialog = page.getByRole('dialog', { name: 'Preview offline-fixture.png' });
+  const main = dialog.locator('.preview-main');
+  const sidebar = dialog.locator('.preview-sidebar');
+  await expect(sidebar).toBeVisible();
+  await expect(dialog.locator('.preview-stage img')).toBeVisible();
+  await expect(sidebar.getByText('Captured')).toBeVisible();
+  await expect(sidebar.locator('.version-editor')).toBeVisible();
+  const mainBox = await main.boundingBox();
+  const sidebarBox = await sidebar.boundingBox();
+  expect(mainBox).not.toBeNull();
+  expect(sidebarBox).not.toBeNull();
+  expect(sidebarBox!.x).toBeGreaterThanOrEqual(mainBox!.x + mainBox!.width - 1);
+
+  if (process.env.PHOTOMESH_PREVIEW_SIDEBAR_SCREENSHOT_PATH) {
+    await page.screenshot({ path: process.env.PHOTOMESH_PREVIEW_SIDEBAR_SCREENSHOT_PATH, fullPage: false });
+  }
+
+  await page.setViewportSize({ width: 680, height: 800 });
+  const narrowMain = await main.boundingBox();
+  const narrowSidebar = await sidebar.boundingBox();
+  expect(narrowMain).not.toBeNull();
+  expect(narrowSidebar).not.toBeNull();
+  expect(narrowSidebar!.y).toBeGreaterThanOrEqual(narrowMain!.y + narrowMain!.height - 1);
+});
+
 test('keeps the authorized session timeline available offline and previews only cached thumbnails', async ({ page }) => {
   let nodeOnline = true;
   let originalReads = 0;

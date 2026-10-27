@@ -1455,252 +1455,264 @@ async function idbClear(store: string): Promise<void> {
         tabindex="-1"
         :aria-label="t('gallery.previewAsset', { filename: previewAsset.filename })"
       >
-        <button
-          class="dialog-close"
-          :aria-label="t('gallery.close')"
-          autofocus
-          @click="closePreview(true)"
-        >
-          ×
-        </button>
-        <h2>{{ previewAsset.filename }}</h2>
-        <nav
-          class="preview-navigation"
-          :aria-label="t('gallery.previewNavigation')"
-        >
-          <button
-            type="button"
-            class="secondary-button"
-            :aria-label="t('gallery.previousPhoto')"
-            :disabled="previousPreviewIndex < 0 || previewBusy"
-            @click="navigatePreview(-1)"
-          >
-            ← {{ t('gallery.previousPhoto') }}
-          </button>
-          <span aria-live="polite">{{ previewIndex + 1 }} / {{ filteredAssets.length }}</span>
-          <button
-            type="button"
-            class="secondary-button"
-            :aria-label="t('gallery.nextPhoto')"
-            :disabled="nextPreviewIndex < 0 || previewBusy"
-            @click="navigatePreview(1)"
-          >
-            {{ t('gallery.nextPhoto') }} →
-          </button>
-        </nav>
-        <dl class="preview-metadata">
-          <div>
-            <dt>{{ t('gallery.captureTime') }}</dt>
-            <dd>{{ formatDate(previewAsset.capturedAt) }}</dd>
-          </div>
-          <div>
-            <dt>{{ t('gallery.originNode') }}</dt>
-            <dd>{{ previewAsset.originNodeId }}</dd>
-          </div>
-          <div>
-            <dt>{{ t('gallery.fileSize') }}</dt>
-            <dd>{{ formatSize(previewAsset.byteSize) }}</dd>
-          </div>
-          <div>
-            <dt>{{ t('gallery.availabilityLabel') }}</dt>
-            <dd>
-              <span
-                class="availability"
-                :class="previewAsset.availability"
-              >
-                {{ t(`gallery.availability.${previewAsset.availability}`) }}
-              </span>
-            </dd>
-          </div>
-        </dl>
-        <div
-          class="preview-stage"
-          :aria-busy="previewBusy"
-        >
-          <p
-            v-if="previewBusy"
-            role="status"
-          >
-            {{ t('gallery.previewLoading') }}
-          </p>
-          <p
-            v-else-if="previewErrorCode"
-            class="notice error-notice"
-            role="alert"
-          >
-            {{ previewErrorMessage(previewErrorCode) }}
-          </p>
-          <div
-            v-else-if="previewUrl"
-            class="preview-content"
-          >
-            <p
-              v-if="isCachedPreview"
-              class="muted cached-preview-note"
-              role="status"
-            >
-              {{ t('gallery.cachedPreviewNote') }}
-            </p>
-            <p
-              v-if="!cacheAvailable"
-              class="muted cached-preview-note"
-              role="status"
-            >
-              {{ t('gallery.cacheUnavailable') }}
-            </p>
-            <img
-              class="preview-image"
-              :src="previewUrl"
-              :alt="previewAsset.filename"
-            >
-          </div>
-        </div>
         <section
-          class="version-editor"
-          :aria-label="t('gallery.editorTitle')"
+          class="preview-main"
+          :aria-label="t('gallery.preview')"
         >
-          <h3>{{ t('gallery.editorTitle') }}</h3>
-          <p
-            v-if="!mediaVersionsEnabled"
-            class="muted"
+          <nav
+            class="preview-navigation"
+            :aria-label="t('gallery.previewNavigation')"
           >
-            {{ t('gallery.editorUnavailable') }}
-          </p>
-          <template v-else>
-            <div
-              v-if="versionsBusy && !versions"
+            <button
+              type="button"
+              class="secondary-button"
+              :aria-label="t('gallery.previousPhoto')"
+              :disabled="previousPreviewIndex < 0 || previewBusy"
+              @click="navigatePreview(-1)"
+            >
+              ← {{ t('gallery.previousPhoto') }}
+            </button>
+            <span aria-live="polite">{{ previewIndex + 1 }} / {{ filteredAssets.length }}</span>
+            <button
+              type="button"
+              class="secondary-button"
+              :aria-label="t('gallery.nextPhoto')"
+              :disabled="nextPreviewIndex < 0 || previewBusy"
+              @click="navigatePreview(1)"
+            >
+              {{ t('gallery.nextPhoto') }} →
+            </button>
+          </nav>
+          <div
+            class="preview-stage"
+            :aria-busy="previewBusy"
+          >
+            <p
+              v-if="previewBusy"
               role="status"
             >
-              {{ t('gallery.versionsLoading') }}
-            </div>
+              {{ t('gallery.previewLoading') }}
+            </p>
+            <p
+              v-else-if="previewErrorCode"
+              class="notice error-notice"
+              role="alert"
+            >
+              {{ previewErrorMessage(previewErrorCode) }}
+            </p>
             <div
-              v-else-if="versions?.original"
-              class="editor-controls"
+              v-else-if="previewUrl"
+              class="preview-content"
             >
-              <p class="muted">
-                {{ t('gallery.originalReadOnly') }} · {{ versions.original.filename }}
-              </p>
-              <label>
-                {{ t('gallery.versionSource') }}
-                <select
-                  v-model="sourceVersionId"
-                  @change="handleVersionSourceChange"
-                >
-                  <option value="">{{ t('gallery.originalSource') }}</option>
-                  <option
-                    v-for="item in versions.items.filter((item) => item.status.toLowerCase() === 'ready' && item.outputSha256)"
-                    :key="item.versionId"
-                    :value="item.versionId"
-                  >
-                    {{ t('gallery.derivedSource', { id: item.versionId }) }}
-                  </option>
-                </select>
-              </label>
-              <div
-                class="crop-controls"
-                role="group"
-                :aria-label="t('gallery.cropControls')"
-              >
-                <label>
-                  {{ t('gallery.cropX') }}
-                  <input
-                    v-model.number="crop.x"
-                    type="number"
-                    min="0"
-                    max="1"
-                    step="0.01"
-                  >
-                </label>
-                <label>
-                  {{ t('gallery.cropY') }}
-                  <input
-                    v-model.number="crop.y"
-                    type="number"
-                    min="0"
-                    max="1"
-                    step="0.01"
-                  >
-                </label>
-                <label>
-                  {{ t('gallery.cropWidth') }}
-                  <input
-                    v-model.number="crop.width"
-                    type="number"
-                    min="0.01"
-                    max="1"
-                    step="0.01"
-                  >
-                </label>
-                <label>
-                  {{ t('gallery.cropHeight') }}
-                  <input
-                    v-model.number="crop.height"
-                    type="number"
-                    min="0.01"
-                    max="1"
-                    step="0.01"
-                  >
-                </label>
-              </div>
-              <label>
-                {{ t('gallery.rotation') }}
-                <select v-model.number="rotation">
-                  <option :value="0">0°</option>
-                  <option :value="90">90°</option>
-                  <option :value="180">180°</option>
-                  <option :value="270">270°</option>
-                </select>
-              </label>
-              <button
-                class="primary-button small-primary"
-                :disabled="versionsBusy || !crop.width || !crop.height"
-                @click="createVersion"
-              >
-                {{ versionsBusy ? t('gallery.versionSaving') : t('gallery.saveVersion') }}
-              </button>
               <p
-                v-if="versionError"
-                class="notice error-notice"
-                role="alert"
+                v-if="isCachedPreview"
+                class="muted cached-preview-note"
+                role="status"
               >
-                {{ versionError }}
+                {{ t('gallery.cachedPreviewNote') }}
               </p>
-              <ul class="version-list">
-                <li
-                  v-for="item in versions.items"
-                  :key="item.versionId"
-                >
-                  <span>{{ item.versionId.slice(0, 8) }} · {{ versionStatusText(item.status) }} · {{ formatDate(item.createdAt) }}</span>
-                  <button
-                    v-if="item.status.toLowerCase() === 'ready'"
-                    class="secondary-button"
-                    @click="previewVersion(item.versionId)"
-                  >
-                    {{ t('gallery.previewVersion') }}
-                  </button>
-                </li>
-              </ul>
-              <div
-                v-if="activeVersionId && versionPreviewUrl"
-                class="version-output"
+              <p
+                v-if="!cacheAvailable"
+                class="muted cached-preview-note"
+                role="status"
               >
-                <p>{{ t('gallery.derivedPreview') }}</p>
-                <img
-                  :src="versionPreviewUrl"
-                  :alt="t('gallery.versionPreviewAlt')"
-                >
-              </div>
+                {{ t('gallery.cacheUnavailable') }}
+              </p>
+              <img
+                class="preview-image"
+                :src="previewUrl"
+                :alt="previewAsset.filename"
+              >
             </div>
-            <button
-              v-else
-              class="secondary-button"
-              :disabled="versionsBusy"
-              @click="loadVersions"
-            >
-              {{ t('gallery.loadVersions') }}
-            </button>
-          </template>
+          </div>
         </section>
+        <aside
+          class="preview-sidebar"
+          :aria-label="t('gallery.previewDetails')"
+        >
+          <header class="preview-sidebar-header">
+            <button
+              class="dialog-close"
+              :aria-label="t('gallery.close')"
+              autofocus
+              @click="closePreview(true)"
+            >
+              ×
+            </button>
+            <h2>{{ previewAsset.filename }}</h2>
+          </header>
+          <dl class="preview-metadata">
+            <div>
+              <dt>{{ t('gallery.captureTime') }}</dt>
+              <dd>{{ formatDate(previewAsset.capturedAt) }}</dd>
+            </div>
+            <div>
+              <dt>{{ t('gallery.originNode') }}</dt>
+              <dd>{{ previewAsset.originNodeId }}</dd>
+            </div>
+            <div>
+              <dt>{{ t('gallery.fileSize') }}</dt>
+              <dd>{{ formatSize(previewAsset.byteSize) }}</dd>
+            </div>
+            <div>
+              <dt>{{ t('gallery.availabilityLabel') }}</dt>
+              <dd>
+                <span
+                  class="availability"
+                  :class="previewAsset.availability"
+                >
+                  {{ t(`gallery.availability.${previewAsset.availability}`) }}
+                </span>
+              </dd>
+            </div>
+          </dl>
+          <section
+            class="version-editor"
+            :aria-label="t('gallery.editorTitle')"
+          >
+            <h3>{{ t('gallery.editorTitle') }}</h3>
+            <p
+              v-if="!mediaVersionsEnabled"
+              class="muted"
+            >
+              {{ t('gallery.editorUnavailable') }}
+            </p>
+            <template v-else>
+              <div
+                v-if="versionsBusy && !versions"
+                role="status"
+              >
+                {{ t('gallery.versionsLoading') }}
+              </div>
+              <div
+                v-else-if="versions?.original"
+                class="editor-controls"
+              >
+                <p class="muted">
+                  {{ t('gallery.originalReadOnly') }} · {{ versions.original.filename }}
+                </p>
+                <label>
+                  {{ t('gallery.versionSource') }}
+                  <select
+                    v-model="sourceVersionId"
+                    @change="handleVersionSourceChange"
+                  >
+                    <option value="">{{ t('gallery.originalSource') }}</option>
+                    <option
+                      v-for="item in versions.items.filter((item) => item.status.toLowerCase() === 'ready' && item.outputSha256)"
+                      :key="item.versionId"
+                      :value="item.versionId"
+                    >
+                      {{ t('gallery.derivedSource', { id: item.versionId }) }}
+                    </option>
+                  </select>
+                </label>
+                <div
+                  class="crop-controls"
+                  role="group"
+                  :aria-label="t('gallery.cropControls')"
+                >
+                  <label>
+                    {{ t('gallery.cropX') }}
+                    <input
+                      v-model.number="crop.x"
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                    >
+                  </label>
+                  <label>
+                    {{ t('gallery.cropY') }}
+                    <input
+                      v-model.number="crop.y"
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                    >
+                  </label>
+                  <label>
+                    {{ t('gallery.cropWidth') }}
+                    <input
+                      v-model.number="crop.width"
+                      type="number"
+                      min="0.01"
+                      max="1"
+                      step="0.01"
+                    >
+                  </label>
+                  <label>
+                    {{ t('gallery.cropHeight') }}
+                    <input
+                      v-model.number="crop.height"
+                      type="number"
+                      min="0.01"
+                      max="1"
+                      step="0.01"
+                    >
+                  </label>
+                </div>
+                <label>
+                  {{ t('gallery.rotation') }}
+                  <select v-model.number="rotation">
+                    <option :value="0">0°</option>
+                    <option :value="90">90°</option>
+                    <option :value="180">180°</option>
+                    <option :value="270">270°</option>
+                  </select>
+                </label>
+                <button
+                  class="primary-button small-primary"
+                  :disabled="versionsBusy || !crop.width || !crop.height"
+                  @click="createVersion"
+                >
+                  {{ versionsBusy ? t('gallery.versionSaving') : t('gallery.saveVersion') }}
+                </button>
+                <p
+                  v-if="versionError"
+                  class="notice error-notice"
+                  role="alert"
+                >
+                  {{ versionError }}
+                </p>
+                <ul class="version-list">
+                  <li
+                    v-for="item in versions.items"
+                    :key="item.versionId"
+                  >
+                    <span>{{ item.versionId.slice(0, 8) }} · {{ versionStatusText(item.status) }} · {{ formatDate(item.createdAt) }}</span>
+                    <button
+                      v-if="item.status.toLowerCase() === 'ready'"
+                      class="secondary-button"
+                      @click="previewVersion(item.versionId)"
+                    >
+                      {{ t('gallery.previewVersion') }}
+                    </button>
+                  </li>
+                </ul>
+                <div
+                  v-if="activeVersionId && versionPreviewUrl"
+                  class="version-output"
+                >
+                  <p>{{ t('gallery.derivedPreview') }}</p>
+                  <img
+                    :src="versionPreviewUrl"
+                    :alt="t('gallery.versionPreviewAlt')"
+                  >
+                </div>
+              </div>
+              <button
+                v-else
+                class="secondary-button"
+                :disabled="versionsBusy"
+                @click="loadVersions"
+              >
+                {{ t('gallery.loadVersions') }}
+              </button>
+            </template>
+          </section>
+        </aside>
       </section>
     </div>
     <div
