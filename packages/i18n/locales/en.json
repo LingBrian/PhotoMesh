@@ -29,7 +29,7 @@
     "tokenPlaceholder": "Enter the node admin token",
     "connecting": "Connecting…",
     "connect": "Connect node",
-    "credentialNote": "The token stays in page memory and must be re-entered after closing or refreshing this page.",
+    "credentialNote": "Save the token in a password manager. This page keeps it in memory only; refresh requires re-entry. If it is lost, explicitly rotate it at the node's local console, then reconnect trusted clients.",
     "libraryLabel": "Your library",
     "timelineDescription": "Originals stay on their source nodes; this view shows the authorized index and availability.",
     "chooseLibrary": "Choose library",

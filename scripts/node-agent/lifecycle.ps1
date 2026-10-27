@@ -88,7 +88,7 @@ function Test-PhotoMeshNodeAgentPackage {
   if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "Node Agent package root does not exist: $root" }
   Assert-PhotoMeshTreeHasNoReparsePoint -Path $root
   $requiredFiles = @('package.json', 'runtime\node.exe', 'dist\index.js', 'start.ps1', 'start.bat', 'external-roots.ps1', 'node_modules\better-sqlite3\package.json')
-  if (-not $AllowLegacy) { $requiredFiles += @('lifecycle.ps1', 'uninstall.ps1', 'uninstall.bat') }
+  if (-not $AllowLegacy) { $requiredFiles += @('lifecycle.ps1', 'admin-credential.ps1', 'uninstall.ps1', 'uninstall.bat') }
   foreach ($relative in $requiredFiles) {
     $path = Join-Path $root $relative
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Node Agent package file is missing: $relative" }

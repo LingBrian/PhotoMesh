@@ -16,7 +16,7 @@ import type { PairingServerControl } from './server.js';
 import type { MediaVersionService } from './media/media-version-service.js';
 import type { MediaThumbnailService } from './media/thumbnail-service.js';
 import type { MediaVersionSourceRecord } from './db/repository.js';
-import { timingSafeEqual } from 'node:crypto';
+import { createAdminTokenAuthorizer } from './auth/admin-token.js';
 import { isIP } from 'node:net';
 import { SyncRepository } from './sync/sync-repository.js';
 import { SyncService } from './sync/sync-service.js';
@@ -130,14 +130,8 @@ const pairingControl: PairingServerControl | undefined = pairing ? {
 } : undefined;
 
 const restoreCoordinator = new TombstoneRestoreCoordinator();
-const configuredAdminToken = process.env.PHOTOMESH_ADMIN_TOKEN;
+const authorizePairingAdmin = createAdminTokenAuthorizer(process.env.PHOTOMESH_ADMIN_TOKEN);
 repository.markExternalLocationsOffline(nodeId);
-const authorizePairingAdmin = (token: string | undefined): boolean => {
-  if (!configuredAdminToken || !token) return false;
-  const expected = Buffer.from(configuredAdminToken);
-  const provided = Buffer.from(token);
-  return expected.byteLength === provided.byteLength && timingSafeEqual(expected, provided);
-};
 const host = process.env.PHOTOMESH_API_BIND_ADDRESS ?? '127.0.0.1';
 if (!isSafeServiceBind(host)) throw new Error('PHOTOMESH_API_BIND_ADDRESS must be loopback or an explicit private LAN IP');
 const server = createNodeAgentServer({

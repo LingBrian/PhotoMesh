@@ -67,6 +67,7 @@ function Write-FixturePackage {
   Set-Content -LiteralPath (Join-Path $Path 'start.bat') -Value '@echo off' -Encoding UTF8
   Set-Content -LiteralPath (Join-Path $Path 'external-roots.ps1') -Value '# fixture roots' -Encoding UTF8
   Copy-Item -LiteralPath $script:lifecyclePath -Destination (Join-Path $Path 'lifecycle.ps1')
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'node-agent\admin-credential.ps1') -Destination (Join-Path $Path 'admin-credential.ps1')
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'node-agent\uninstall.ps1') -Destination (Join-Path $Path 'uninstall.ps1')
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'node-agent\uninstall.bat') -Destination (Join-Path $Path 'uninstall.bat')
   Set-Content -LiteralPath (Join-Path $Path 'node_modules\better-sqlite3\package.json') -Value '{"name":"better-sqlite3"}' -Encoding UTF8

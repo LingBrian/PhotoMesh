@@ -29,7 +29,7 @@
     "tokenPlaceholder": "输入节点管理员令牌",
     "connecting": "正在连接…",
     "connect": "连接节点",
-    "credentialNote": "令牌仅保留在此页面内存；关闭或刷新页面后需重新输入。",
+    "credentialNote": "请把令牌保存在密码管理器；页面仅在内存中保留，刷新后需重输。令牌遗失时，在节点本机显式轮换，再让受信任客户端重新连接。",
     "libraryLabel": "你的图库",
     "timelineDescription": "原图保留在来源节点；此处显示已授权的索引和可用状态。",
     "chooseLibrary": "选择图库",

@@ -24,7 +24,7 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 普通使用者下载已构建的节点软件包即可，无需在目标设备安装 Node.js 或编译源码。在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 选择对应版本的 Windows 或 Linux 节点包。
 
 1. **下载与解压。** Windows 下载 `PhotoMesh-<版本>-node-agent-windows-x64.zip`；Linux 下载 `PhotoMesh-<版本>-node-agent-linux-x64.tar.gz`，将其解压到你选择的目录。
-2. **Windows 解压并启动。** 在文件资源管理器右键 ZIP，选择“全部解压缩”。进入解压目录，双击 `start.bat`。首次运行会提示管理员令牌；留空会生成一次性令牌并显示，请保存到密码管理器。
+2. **Windows 解压并启动。** 在文件资源管理器右键 ZIP，选择“全部解压缩”。进入解压目录，双击 `start.bat`。首次设置时令牌提示留空后，必须键入 `ROTATE` 才会生成新令牌；令牌仅显示一次，请保存到密码管理器并键入 `SAVED` 后才启动。重启时输入已保存令牌；不要留空以免误操作。
 3. **Linux 解压并启动。** 假设下载目录为当前目录，执行：
    ```sh
    mkdir -p "$HOME/.local/opt/photomesh/node-agent/<版本>"
@@ -35,7 +35,7 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
    首次运行按提示设置管理员令牌；留空会生成一次性令牌并显示，请安全保存。
 4. **可选来源目录。** 启动器可填写一个外部照片目录供只读扫描；留空则不扫描。不要把 PhotoMesh 数据目录放在外部来源目录内。
 5. **确认服务启动。** Agent 在前台运行，关闭窗口或按 Ctrl+C 会停止。服务默认只监听本机 `127.0.0.1:8443`。在另一终端检查：Windows 运行 `Invoke-RestMethod http://127.0.0.1:8443/v1/health`；Linux 运行 `curl http://127.0.0.1:8443/v1/health`。
-6. Windows 数据目录默认为 `%LOCALAPPDATA%\PhotoMesh\data`；Linux 默认是 `~/.local/share/photomesh`。重启后需输入相同管理员令牌。Linux 节点身份密钥依赖 Secret Service；未配置时，安全配对/P2P 会关闭。
+6. Windows 数据目录默认为 `%LOCALAPPDATA%\PhotoMesh\data`；Linux 默认是 `~/.local/share/photomesh`。PhotoMesh 不在本地保存管理员令牌；重启后需输入同一令牌。若遗失，先在前台按 `Ctrl+C` 停止 Agent，再运行 `start.bat -RotateAdminToken`，键入 `ROTATE` 并保存新令牌；轮换后旧令牌立即失效，所有受信任客户端需重新连接。Linux 节点身份密钥依赖 Secret Service；未配置时，安全配对/P2P 会关闭。
 7. 当前节点包仅支持 x64/amd64；没有 ARM64 NAS 包。先用合成照片验证，预览版不要作为唯一原图副本。
 ### Linux Docker 镜像（可选）
 
@@ -46,9 +46,9 @@ PhotoMesh 是一款自托管、去中心化的跨平台相册。各节点独立�
 先在 [GitHub Releases](https://github.com/LingBrian/PhotoMesh/releases) 下载最新 Windows x64 桌面安装包（`PhotoMesh-<版本>-windows-x64-unsigned.exe`）。该安装包尚未进行代码签名，Windows 可能显示未知发布者或 SmartScreen 警告；只在测试电脑上安装。还没有发布资产时，用上面的源码下载和本地开发步骤启动 Web 客户端。
 
 1. **打开客户端。** 在节点电脑启动 Agent；再从开始菜单打开 PhotoMesh，或在仓库根目录另开 PowerShell 运行 `pnpm --filter @photomesh/web dev`，并打开终端打印的本地地址。
-2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把节点运行时的 `PHOTOMESH_ADMIN_TOKEN` 填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。
+2. **填写节点地址和令牌。** 打开 **设置 → 节点设置**，本机输入 `http://127.0.0.1:8443`；节点在另一台电脑时，填节点的私有 LAN IP（例如 `http://192.168.1.20:8443`），但只有在已配置可信 TLS 反向代理后才可跨设备开放 HTTP API。把在节点本机首次设置时显示并保存到密码管理器的管理员令牌填入令牌框，点 **保存并连接**，返回时间线确认状态为在线、图库列表可读取。令牌只给受信任的管理员设备。
 3. **创建邀请。** 在 **设置 → 配对** 点击 **创建邀请**。页面会显示二维码和一段 JSON 邀请文本，有效期约 2 分钟，只能使用一次。客户端目前没有摄像头扫码器：在接入节点的另一端打开其客户端设置，把邀请 JSON 复制粘贴到“扫描邀请”文本框，再点击加入。
-4. **批准对端。** 邀请发起端运行节点的本机 API 需要管理员批准新身份。当前界面可创建/加入邀请和查看/撤销可信节点，尚无批准按钮；在该节点电脑本机 PowerShell 读取待批准列表：`Invoke-RestMethod http://127.0.0.1:8443/v1/pairing/peers -Headers @{ Authorization = "Bearer $env:PHOTOMESH_ADMIN_TOKEN" }`。核对 `pending` 中的 Peer ID 后，按 [LAN 配对指南](docs/operations/LAN安全配对.md) 调用批准接口，只授予确实需要的图库只读权限。
+4. **批准对端。** 邀请发起端运行节点的本机 API 需要管理员批准新身份。当前界面可创建/加入邀请和查看/撤销可信节点，尚无批准按钮；在该节点电脑本机 PowerShell 读取待批准列表。打包版令牌只存在 Agent 子进程，不能从另开的 PowerShell 环境变量取得；请使用 [LAN 配对指南](docs/operations/LAN安全配对.md) 中的 SecureString 请求示例，不要把令牌明文写入命令历史。核对 `pending` 中的 Peer ID 后，调用批准接口，只授予确实需要的图库只读权限。
 5. **验证和撤销。** 两端在配对页确认可信节点状态。完成验证后，撤销设备并确认它不再能读取图库索引；撤销不会远程删除对端此前缓存的数据。Android 上传目前使用管理员令牌，不能把它交给不受信任设备；详见 [Android 客户端说明](docs/modules/apps/mobile/README.md)。
 
 先在同一台电脑验证连接，再考虑跨设备网络。不要把 `8443` 管理 API 映射到公网或不可信 LAN。P2P 配对只保护节点间通道，不为管理 HTTP API 提供 TLS。

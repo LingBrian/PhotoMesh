@@ -161,6 +161,7 @@ jobs:
           Copy-Item -LiteralPath 'scripts/node-agent/external-roots.ps1' -Destination (Join-Path $stage 'external-roots.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/start.bat' -Destination (Join-Path $stage 'start.bat')
           Copy-Item -LiteralPath 'scripts/node-agent/lifecycle.ps1' -Destination (Join-Path $stage 'lifecycle.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/admin-credential.ps1' -Destination (Join-Path $stage 'admin-credential.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/uninstall.ps1' -Destination (Join-Path $stage 'uninstall.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/uninstall.bat' -Destination (Join-Path $stage 'uninstall.bat')
           $out = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
@@ -188,6 +189,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows Node Agent ZIP smoke test failed.' }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-lifecycle.ps1' -PackageRoot $smoke -PackageArchive $archive
           if ($LASTEXITCODE -ne 0) { throw 'Windows Node Agent lifecycle tests failed.' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-admin-credential.ps1'
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Node Agent admin credential tests failed.' }
       - name: Package Linux x64 Node Agent
         if: matrix.platform == 'linux-x64'
         env:
