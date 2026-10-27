@@ -1,14 +1,14 @@
 openapi: 3.1.0
 info:
-  title: PhotoMesh Node API (Design Draft)
+  title: PhotoMesh Node HTTP API
   version: 0.1.0
-  description: |
-    草案：用于最初合约讨论，不可直接作为已实现服务。
-    P2P 内部事件通道、端到端加密流程与会话身份另有协议安全设计。
+  description: |-
+    Contract for HTTP operations currently implemented by the Node Agent. The listener is plain HTTP; this document advertises only its default loopback URL. A private-LAN bind is not TLS: do not expose it off-host or send credentials over direct HTTP; use a separately configured trusted HTTPS-terminating proxy. P2P protocol messages are not HTTP routes. Generic CORS OPTIONS preflight returns 204 and is transport behavior, not a business operation. Every HTTP response includes X-Request-ID; JSON errors also echo it as requestId.
 servers:
-  - url: https://localhost:8443
+  - url: http://127.0.0.1:8443
+    description: Default loopback HTTP listener; do not use direct HTTP for off-host access.
 security:
-  - deviceBearer: []
+  - nodeAdminBearer: []
 paths:
   /v1/health:
     get:
@@ -29,6 +29,18 @@ paths:
                   capabilities:
                     type: array
                     items: {type: string}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/diagnostics:
     get:
       summary: 管理员查看节点组件健康状态与能力
@@ -41,7 +53,26 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/NodeDiagnostics'}
-        '403': {description: Forbidden}
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403':
+          description: Forbidden
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries:
     get:
       summary: 当前主体有权查看的照片库
@@ -51,8 +82,19 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/LibraryPage'}
-        '401': {description: Unauthorized}
-        '403': {description: Forbidden}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Forbidden, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/assets:
     get:
       summary: 授权范围内的游标分页时间线
@@ -76,8 +118,20 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AssetPage'}
-        '403': {description: Library access denied}
-        '400': {description: Invalid cursor or query}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: Invalid cursor or query, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/assets/{assetId}/original:
     get:
       summary: 在每次请求校验图库 ACL 后流式读取不可变原图
@@ -92,11 +146,25 @@ paths:
           headers:
             ETag: {schema: {type: string}}
             Content-Disposition: {schema: {type: string}}
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Content-Type-Options: {schema: {type: string, const: nosniff}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             application/octet-stream:
               schema: {type: string, format: binary}
-        '404': {description: Asset is absent or not authorized}
-        '409': {description: Source location is offline}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Source location is offline, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Original stream failed before response headers were sent, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/thumbnail:
     get:
       summary: 每次请求校验图库 ACL 后读取固定尺寸的 WebP 缩略图
@@ -121,20 +189,39 @@ paths:
             ETag: {schema: {type: string}}
             Cache-Control: {schema: {type: string, const: 'private, no-store'}}
             X-Content-Type-Options: {schema: {type: string, const: nosniff}}
+            Content-Disposition: {schema: {type: string, const: inline}}
+            Vary: {schema: {type: string, const: Authorization}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             image/webp:
               schema: {type: string, format: binary}
-        '400': {description: Invalid path or profile}
-        '404': {description: Asset is absent or not authorized}
-        '409': {description: Source changed or offline and no matching derived cache exists}
-        '413': {description: Source or generated thumbnail exceeds configured byte limit}
-        '415': {description: Unsupported or multi-page source image}
-        '500': {description: Thumbnail processing failed}
+        '400': {description: Invalid path or profile, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Source changed or offline and no matching derived cache exists, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Source or generated thumbnail exceeds configured byte limit, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '415': {description: Unsupported or multi-page source image, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Thumbnail processing failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '429':
           description: Bounded thumbnail queue is full
           headers:
             Retry-After: {schema: {type: string, const: '1'}}
-        '503': {description: Thumbnail processing capability unavailable}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503': {description: Thumbnail processing capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/versions:
     parameters:
       - in: path
@@ -153,9 +240,22 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MediaVersionPage'}
-        '403': {description: Admin authorization required}
-        '404': {description: Asset is absent or not authorized}
-        '503': {description: Media-version capability unavailable}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid path parameters, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Media-version capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       summary: 排队创建裁剪/旋转派生版本，不修改原件
       description: Requires the mediaVersions capability and a currently online, hash-matching source.
@@ -170,14 +270,26 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MediaVersionOperation'}
-        '400': {description: Invalid transform or request}
-        '403': {description: Admin authorization required}
-        '404': {description: Asset is absent or not authorized}
-        '409': {description: 'Source changed or idempotency key conflict'}
-        '413': {description: 'Input-size or pixel limit exceeded before the asynchronous operation is accepted'}
-        '415': {description: Unsupported media format}
-        '500': {description: Internal transform or database error}
-        '503': {description: 'Source or storage unavailable, or temporary media-version capacity limit reached; retry later'}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid transform or request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: 'Source changed or idempotency key conflict', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: 'Input-size or pixel limit exceeded before the asynchronous operation is accepted', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '415': {description: Unsupported media format, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Media transform processing failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: 'Source or storage unavailable, or temporary media-version capacity limit reached; retry later', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}:
     parameters:
       - in: path
@@ -200,9 +312,22 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MediaVersion'}
-        '403': {description: Admin authorization required}
-        '404': {description: Version is absent or not authorized}
-        '503': {description: Media-version capability unavailable}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid path parameters, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Version is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Media-version capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}/content:
     parameters:
       - in: path
@@ -225,14 +350,28 @@ paths:
           headers:
             ETag: {schema: {type: string}}
             Cache-Control: {schema: {type: string, const: no-store}}
+            X-Content-Type-Options: {schema: {type: string, const: nosniff}}
+            Content-Disposition: {schema: {type: string, const: inline}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             image/jpeg: {schema: {type: string, format: binary}}
             image/png: {schema: {type: string, format: binary}}
             image/webp: {schema: {type: string, format: binary}}
-        '403': {description: Admin authorization required}
-        '404': {description: Version is absent or not authorized}
-        '409': {description: Version is not ready or failed}
-        '503': {description: 'Media-version capability unavailable, storage unavailable, or integrity verification failed'}
+        '400': {description: Invalid path parameters, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Version is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Version is not ready or failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: 'Media-version capability unavailable, storage unavailable, or integrity verification failed', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/recycle-bin:
     get:
       summary: Read visible deletion tombstones without deleting source originals
@@ -251,7 +390,19 @@ paths:
                 required: [items]
                 properties:
                   items: {type: array, items: {$ref: '#/components/schemas/Tombstone'}}
-        '403': {description: Library access denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/recycle-bin/restore:
     post:
       summary: Restore an active tombstone by appending a signed asset.restored event
@@ -279,11 +430,23 @@ paths:
                   status: {type: string, const: restored}
                   tombstoneEventId: {type: string, format: uuid, description: Tombstone event ID targeted by this request}
                   restoreEventId: {type: string, format: uuid, description: Newly signed or previously recorded asset.restored event ID}
-        '400': {description: Invalid request}
-        '403': {description: Admin authorization or library read authorization denied}
-        '404': {description: Tombstone not found in the specified library}
-        '409': {description: "Tombstone is inactive without a recorded restore event, or causal frontier cannot be represented"}
-        '503': {description: Sync capability unavailable}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization or library read authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Tombstone not found in the specified library, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: "Tombstone is inactive without a recorded restore event, or causal frontier cannot be represented", headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/invitations:
     post:
       summary: 创建短期一次性 LAN 配对邀请（返回供客户端编码为二维码的载荷）
@@ -293,7 +456,19 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/PairingInvite'}
-        '403': {description: Pairing administration denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/join:
     post:
       summary: 扫描邀请二维码后，以本地节点身份通过 Noise 通道加入对端
@@ -312,8 +487,20 @@ paths:
                 required: [hostPeerId]
                 properties:
                   hostPeerId: {type: string}
-        '400': {description: Invalid request}
-        '403': {description: 'Invite expired, replayed, declined, or identity mismatch'}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: 'Administrator authorization denied, or invite expired, replayed, declined, or identity mismatch', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers:
     get:
       summary: 列出可信、已撤销节点和待审批设备
@@ -328,7 +515,19 @@ paths:
                 properties:
                   peers: {type: array, items: {$ref: '#/components/schemas/TrustedPeer'}}
                   pending: {type: array, items: {$ref: '#/components/schemas/PendingPeerApproval'}}
-        '403': {description: Pairing administration denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers/{peerId}/approval:
     post:
       summary: 本地用户确认或拒绝经过 Noise 身份验证的配对请求
@@ -343,9 +542,19 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/PairingApproval'}
       responses:
-        '200': {description: Approval recorded}
-        '403': {description: Pairing administration denied}
-        '404': {description: Pending request not found}
+        '200': {description: Approval recorded, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid approval request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Pending request not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers/{peerId}:
     delete:
       summary: 撤销节点并关闭现存 P2P 连接
@@ -355,9 +564,18 @@ paths:
           required: true
           schema: {type: string}
       responses:
-        '200': {description: Peer revoked}
-        '403': {description: Pairing administration denied}
-        '404': {description: Peer not found}
+        '200': {description: Peer revoked, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers/{peerId}/libraries/{libraryId}:
     put:
       summary: 明确授予可信节点对单个图库的只读权限
@@ -371,9 +589,18 @@ paths:
           required: true
           schema: {type: string}
       responses:
-        '204': {description: Read grant recorded}
-        '403': {description: Pairing administration denied}
-        '409': {description: Peer is not trusted}
+        '204': {description: Read grant recorded, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/discovered:
     get:
       summary: 获取 mDNS 发现的未信任节点地址（发现不代表信任）
@@ -394,7 +621,19 @@ paths:
                       properties:
                         peerId: {type: string}
                         addresses: {type: array, items: {type: string}}
-        '403': {description: Pairing administration denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/manual-discovery:
     post:
       summary: 通过明确私有 LAN IP 建立 Noise 身份验证连接
@@ -410,9 +649,19 @@ paths:
                 port: {type: integer, minimum: 1, maximum: 65535}
                 peerId: {type: string}
       responses:
-        '200': {description: Authenticated peer address}
-        '400': {description: Invalid address}
-        '403': {description: Pairing administration denied}
+        '200': {description: Authenticated peer address, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid address, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '502': {description: Peer could not be reached, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads:
     post:
       summary: 创建有期限的分块上传会话
@@ -432,10 +681,23 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
-        '400': {description: Invalid request}
-        '403': {description: Denied}
-        '409': {description: Idempotency key reused for a different request}
-        '413': {description: Upload exceeds configured limits}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency key reused for a different request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Upload exceeds configured limits, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Upload session creation failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads/{sessionId}:
     get:
       summary: 查询允许续传的偏移位置
@@ -450,9 +712,22 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
-        '403': {description: Denied}
-        '404': {description: Session not found}
-        '410': {description: Session expired}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Session not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: Session expired, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Upload session lookup failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads/{sessionId}/chunks/{chunkIndex}:
     put:
       summary: Write one immutable, resumable upload chunk
@@ -484,11 +759,27 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
-        '403': {description: Denied}
-        '409': {description: Offset or chunk idempotency conflict}
-        '413': {description: Chunk exceeds configured limits}
-        '422': {description: Chunk checksum mismatch}
-        '507': {description: Managed storage has insufficient capacity}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: Invalid offset or request body, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Upload session not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: Upload session expired, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Offset or chunk idempotency conflict, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Chunk exceeds configured limits, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '422': {description: Chunk checksum mismatch, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Chunk write failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '507': {description: Managed storage has insufficient capacity, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads/{sessionId}/complete:
     post:
       summary: Verify complete SHA-256 and atomically commit immutable original
@@ -503,43 +794,28 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadComplete'}
-        '403': {description: Denied}
-        '409': {description: Upload incomplete or session not writable}
-        '410': {description: Session expired}
-        '422': {description: Complete file checksum mismatch}
-        '507': {description: Managed storage has insufficient capacity}
-  /v1/sync/hello:
-    post:
-      summary: 受信任节点 P2P 版本协商（仅内部受认证通道）
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [nodeId, protocolMin, protocolMax, nonce]
-              properties:
-                nodeId: {type: string}
-                protocolMin: {type: integer}
-                protocolMax: {type: integer}
-                nonce: {type: string}
-      responses:
-        '200':
-          description: Negotiated
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Upload session not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Upload incomplete or session not writable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: Session expired, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Upload exceeds configured limits, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '422': {description: Complete file checksum mismatch, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Upload completion failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '507': {description: Managed storage has insufficient capacity, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             application/json:
               schema:
-                type: object
-                required: [agreedProtocol]
-                properties:
-                  agreedProtocol: {type: integer}
-        '403': {description: Node not paired or invalid signature}
+                $ref: '#/components/schemas/ApiError'
 components:
   securitySchemes:
-    deviceBearer:
-      type: http
-      scheme: bearer
-      bearerFormat: device-bound-token
     nodeAdminBearer:
       type: http
       scheme: bearer
@@ -778,3 +1054,26 @@ components:
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         byteLength: {type: integer, minimum: 0}
         storageRef: {type: string}
+    ApiError:
+      type: object
+      description: Open error envelope. Clients must tolerate unknown error codes and additional fields.
+      required:
+        - error
+        - requestId
+      properties:
+        error:
+          type: string
+          minLength: 1
+          description: Stable machine-readable error code; unknown values are possible. This example list is not closed.
+          examples: [invalid_request, forbidden, not_found, capability_unavailable, thumbnail_invalid, source_offline, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
+        requestId:
+          type: string
+          minLength: 1
+          description: Matches the X-Request-ID response header.
+  headers:
+    XRequestId:
+      description: Correlation ID echoed from the request X-Request-ID header or generated by the Node Agent.
+      required: true
+      schema:
+        type: string
+        minLength: 1

@@ -19,7 +19,7 @@ The HTTP service supports:
 
 Chunk writes are ordered and bounded to 8 MiB by default; the default file limit is 100 GiB. Configure limits by constructing `UploadService` with explicit limits. A retry with identical bytes is idempotent. Conflicting keys, offsets, or chunks return a conflict. Insufficient capacity returns `507` and does not advance the session offset. Full-file checksum mismatch returns `422` and cannot mark the session complete.
 
-Every upload route calls `authorizeUpload`. The server denies access when no authorizer is configured. The authorizer must validate the bearer token and the caller's library/session ACL for each action; an opaque session ID is not authorization. The starter executable intentionally has no default user credentials, so upload routes remain denied until an authentication/ACL provider is wired in.
+Every upload route calls `authorizeUpload`. A bare `createNodeAgentServer` denies access when no authorizer is configured. The starter executable wires upload, library, media-version and pairing authorization to the configured local administrator Bearer token; route callbacks still enforce the relevant library/session ACL, and an opaque session ID is not authorization. `/v1/health` is public; other operations require their documented authorization.
 
 ## Crash recovery and tests
 

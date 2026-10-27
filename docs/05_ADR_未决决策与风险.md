@@ -126,3 +126,13 @@
 - **隐私边界：** 不返回异常详情、绝对路径、Peer ID、记录数、文件名、原图信息或任何密钥；仅允许 OpenAPI 枚举状态/能力，未知能力被丢弃，响应不缓存。未授权请求在运行探针前即拒绝。
 - **兼容性与数据影响：** 仅为 `/v1` 增加可选接口与 schema；不修改现有 `/v1/health`、P2P 协议或数据库 schema，无迁移。旧客户端不受影响。
 - **验证限制：** `SELECT 1` 不等同于 SQLite 完整性检查；目录访问检查不写入文件，不能发现磁盘已满等写入故障。该接口是低开销状态提示，不替代维护诊断、DB integrity 或实际存储写入测试。
+
+## ADR-014：PM-040 已实现 Node HTTP API 契约对齐
+
+- **状态：** 用户已批准实施；只描述当前 Node Agent HTTP 服务已实现的行为，不新增 HTTP 能力，也不修改服务端运行时路由、授权判定、状态码、错误体或数据格式。
+- **契约范围：** OpenAPI 作为已实现 Node HTTP API 的唯一契约来源。移除尚无 HTTP 路由实现的 `/v1/sync/hello`；P2P 版本协商仍经已认证的内部 libp2p 通道，不伪装成 REST 接口。架构文档把其余未实现的规划接口标为规划项。
+- **错误与兼容：** 用开放式 `{ error: string, requestId: string }` 描述实际 JSON 错误体，允许将来出现未知错误码/附加字段；逐路由记录当前真实 HTTP 状态码，不把当前只返回 403 的授权拒绝改写成 401，也保留用于避免资源枚举的 404。此工作不改变旧客户端实际观察到的行为；删除的 OpenAPI 路由当前服务本来就返回 404，仓库 Web 客户端未调用它。外部生成 SDK 如曾依草案生成该未实现方法，需要重新生成契约客户端。
+- **授权与响应头：** 文档化当前启动配置下的 Node 管理员 Bearer 授权、公开 health 例外、错误中的 requestId，以及实际存在的 `X-Request-ID`、ETag、Cache-Control、Content-Disposition、X-Content-Type-Options、Retry-After 等逐响应头；不声明未实现的头或能力。
+- **迁移与回滚：** 不修改数据库、P2P wire protocol 或 HTTP runtime，无数据迁移、生产数据影响或服务端升级步骤。可通过回退 OpenAPI、契约测试和本文档恢复原草案；已生成的外部客户端按契约重生成即可。
+- **传输安全限制：** Node Agent 使用 `node:http`，进程本身不终止 TLS；默认 API 绑定 loopback。虽然配置允许指定私有 LAN 地址，但绑定私网不提供加密。PM-040 不改变此行为，也不把明文远端连接称为安全通过；远端须经独立可信 HTTPS 终止代理。PM-033 的远端 HTTPS 实机验收仍需单独核验。
+- **验证：** OpenAPI schema 验证；以实际 `createNodeAgentServer` 发送请求、逐一覆盖契约列出的 HTTP 操作及代表性授权错误，核对实际状态码、错误 schema、Request-ID 和路由安全头；再执行 Node Agent 单测、根 lint/typecheck/test/contracts/build。测试说明替代不了外部客户端升级验证。
