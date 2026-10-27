@@ -71,6 +71,36 @@ describe('local node identity and LAN pairing', () => {
     expect(missingSecretStore.values.size).toBe(0);
   });
 
+  it('does not persist a new identity when native secure storage is denied', async () => {
+    const repository = await createRepository();
+    const deniedRead = new SystemSecretStore(() => ({
+      getPassword: () => { throw new Error('Access is denied'); },
+      setPassword: () => undefined
+    }));
+    await expect(loadOrCreateLocalIdentity(repository, deniedRead))
+      .rejects.toThrow('platform secure storage is unavailable');
+    expect(repository.getLocalIdentity()).toBeUndefined();
+
+    const deniedWrite = new SystemSecretStore(() => ({
+      getPassword: () => null,
+      setPassword: () => { throw new Error('Access is denied'); }
+    }));
+    await expect(loadOrCreateLocalIdentity(repository, deniedWrite))
+      .rejects.toThrow('platform secure storage is unavailable');
+    expect(repository.getLocalIdentity()).toBeUndefined();
+  });
+
+  it('does not commit an identity unless the native credential can be read back', async () => {
+    const repository = await createRepository();
+    const noPersistence = new SystemSecretStore(() => ({
+      getPassword: () => null,
+      setPassword: () => undefined
+    }));
+    await expect(loadOrCreateLocalIdentity(repository, noPersistence))
+      .rejects.toThrow('platform secure storage is unavailable');
+    expect(repository.getLocalIdentity()).toBeUndefined();
+  });
+
   it('creates a short-lived invite, requires host approval, trusts both identities, and rejects replay', async () => {
     const hostApproval = vi.fn(async () => ({ approved: true, label: 'NAS', libraryIds: ['library-a', '', 'x'.repeat(129), 'library-a'] }));
     const host = await createNode(hostApproval);

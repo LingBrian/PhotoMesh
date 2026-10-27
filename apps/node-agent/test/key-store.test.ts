@@ -28,4 +28,22 @@ describe('fixture and system secret stores', () => {
     expect(() => store.get('identity')).toThrow('platform secure storage is unavailable');
     expect(() => store.set('identity', 'secret')).toThrow('platform secure storage is unavailable');
   });
+
+  it('fails closed if a stored credential cannot be read back after writing', () => {
+    const store = new SystemSecretStore(() => ({
+      getPassword: () => null,
+      setPassword: () => undefined
+    }));
+    expect(() => store.set('identity', 'private-key-test-only'))
+      .toThrow('platform secure storage is unavailable');
+  });
+
+  it('normalizes access-denied failures without exposing native details', () => {
+    const store = new SystemSecretStore(() => ({
+      getPassword: () => { throw new Error('ERROR_ACCESS_DENIED: sample detail'); },
+      setPassword: () => { throw new Error('ERROR_ACCESS_DENIED: sample detail'); }
+    }));
+    expect(() => store.get('identity')).toThrow('platform secure storage is unavailable');
+    expect(() => store.set('identity', 'private-key-test-only')).toThrow('platform secure storage is unavailable');
+  });
 });

@@ -13,10 +13,10 @@ interface KeyringEntry {
   setPassword(value: string): void;
 }
 
+export const systemSecretStoreService = 'PhotoMesh.NodeAgent';
+
 /** Uses Windows Credential Manager or Linux Secret Service. Linux does not fall back to kernel memory. */
 export class SystemSecretStore implements SecretStore {
-  private readonly service = 'PhotoMesh.NodeAgent';
-
   constructor(private readonly createEntry: (service: string, secretName: string) => KeyringEntry =
     (service, secretName) => new Entry(service, secretName, { linux: { store: 'secret-service' } })) {}
 
@@ -30,14 +30,16 @@ export class SystemSecretStore implements SecretStore {
 
   set(secretName: string, value: string): void {
     try {
-      this.entry(secretName).setPassword(value);
+      const entry = this.entry(secretName);
+      entry.setPassword(value);
+      if (entry.getPassword() !== value) throw new Error('credential write could not be verified');
     } catch (error) {
       throw new Error('platform secure storage is unavailable', { cause: error });
     }
   }
 
   private entry(secretName: string): KeyringEntry {
-    return this.createEntry(this.service, secretName);
+    return this.createEntry(systemSecretStoreService, secretName);
   }
 }
 
