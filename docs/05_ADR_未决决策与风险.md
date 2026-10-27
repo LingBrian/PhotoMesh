@@ -136,3 +136,10 @@
 - **迁移与回滚：** 不修改数据库、P2P wire protocol 或 HTTP runtime，无数据迁移、生产数据影响或服务端升级步骤。可通过回退 OpenAPI、契约测试和本文档恢复原草案；已生成的外部客户端按契约重生成即可。
 - **传输安全限制：** Node Agent 使用 `node:http`，进程本身不终止 TLS；默认 API 绑定 loopback。虽然配置允许指定私有 LAN 地址，但绑定私网不提供加密。PM-040 不改变此行为，也不把明文远端连接称为安全通过；远端须经独立可信 HTTPS 终止代理。PM-033 的远端 HTTPS 实机验收仍需单独核验。
 - **验证：** OpenAPI schema 验证；以实际 `createNodeAgentServer` 发送请求、逐一覆盖契约列出的 HTTP 操作及代表性授权错误，核对实际状态码、错误 schema、Request-ID 和路由安全头；再执行 Node Agent 单测、根 lint/typecheck/test/contracts/build。测试说明替代不了外部客户端升级验证。
+
+## ADR-015：Node 服务端标签持久化与 SQLite 迁移（PM-041）
+
+- **状态：** 用户已批准设计；批准仅覆盖隔离分支 PM-041 的 API/schema 实现与测试，不授权生产数据库迁移、push、merge 或 release。详细决策见 [`docs/adr/ADR-015-server-tag-persistence.md`](adr/ADR-015-server-tag-persistence.md)。
+- **接口：** 为 `GET /v1/assets` 增加每资产 `tags` 数组；逐标签 `PUT`/`DELETE /v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}`，按当前 Node 管理员 Bearer 和图库 ACL 授权。元素操作幂等；大小写敏感，仅 trim；暂定单标签 UTF-8 ≤128 字节、每资产 ≤64 标签。
+- **数据与迁移：** 追加 `0005_asset_tags`，不改既有 migration checksum；为本地资产及活动同步投影持久化，tombstone 隐藏但不删除标签。迁移为空表、已有非空 DB 需启动器先备份；不导入浏览器 IndexedDB，也不产生 P2P 事件。PM-042 负责跨节点事件，PM-043 负责 Web 接入及旧本地标签的幂等合并。
+- **回滚限制：** 旧版 Node Agent 拒绝数据库中的未知 migration ID；回滚需恢复迁移前数据库备份，且会丢失迁移后新增标签。此分支不执行用户数据库迁移；生产迁移须另行审批、备份校验和恢复演练。

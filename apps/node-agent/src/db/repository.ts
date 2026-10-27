@@ -1,6 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { migrations, type Migration } from './migrations.js';
+import { maxAssetTagsPerAsset } from '../asset-tag-limits.js';
 import { SyncRepository } from '../sync/sync-repository.js';
 import type { EventDraftFactory } from '../sync/event-envelope.js';
 
@@ -106,8 +107,10 @@ export interface GalleryAssetRecord extends LibraryIndexAsset {
   sourceKind: SourceKind;
   byteSize: number;
   version: string;
+  tags: string[];
 }
 
+export type AssetTagMutationResult = 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'limit_reached';
 export interface GalleryMediaRecord {
   libraryId: string;
   filename: string;
@@ -481,6 +484,53 @@ export class SqliteRepository implements UploadRepository {
     return rows.map((row) => ({ libraryId: row.library_id, title: row.library_id }));
   }
 
+  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string): AssetTagMutationResult {
+    const write = this.db.transaction((): AssetTagMutationResult => {
+      if (!this.hasVisibleGalleryAsset(libraryId, assetId)) return 'not_found';
+      if (this.db.prepare('SELECT 1 FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
+        .get(libraryId, assetId, tag)) return 'already_present';
+      const count = this.db.prepare('SELECT COUNT(*) AS count FROM asset_tags WHERE library_id = ? AND asset_id = ?')
+        .get(libraryId, assetId) as { count: number };
+      if (count.count >= maxAssetTagsPerAsset) return 'limit_reached';
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO asset_tags (library_id, asset_id, tag, created_at)
+        VALUES (?, ?, ?, ?)`).run(libraryId, assetId, tag, createdAt);
+      return inserted.changes === 1 ? 'added' : 'already_present';
+    });
+    return write.immediate();
+  }
+
+  removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult {
+    const write = this.db.transaction((): AssetTagMutationResult => {
+      if (!this.hasVisibleGalleryAsset(libraryId, assetId)) return 'not_found';
+      const removed = this.db.prepare('DELETE FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
+        .run(libraryId, assetId, tag);
+      return removed.changes === 1 ? 'removed' : 'unchanged';
+    });
+    return write.immediate();
+  }
+
+  private hasVisibleGalleryAsset(libraryId: string, assetId: string): boolean {
+    const row = this.db.prepare(`SELECT EXISTS (
+      SELECT 1 FROM assets a WHERE a.library_id = ? AND a.asset_id = ?
+        AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id
+          AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+      UNION ALL
+      SELECT 1 FROM sync_asset_projection p WHERE p.library_id = ? AND p.asset_id = ? AND p.tombstone_event_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+    ) AS visible`).get(libraryId, assetId, libraryId, assetId) as { visible: number };
+    return row.visible === 1;
+  }
+
+  private listAssetTags(libraryId: string, assetIds: string[]): Map<string, string[]> {
+    const result = new Map(assetIds.map((assetId) => [assetId, [] as string[]]));
+    if (assetIds.length === 0) return result;
+    const placeholders = assetIds.map(() => '?').join(', ');
+    const rows = this.db.prepare(`SELECT asset_id, tag FROM asset_tags WHERE library_id = ? AND asset_id IN (${placeholders})
+      ORDER BY asset_id COLLATE BINARY, tag COLLATE BINARY`).all(libraryId, ...assetIds) as Array<{ asset_id: string; tag: string }>;
+    for (const row of rows) result.get(row.asset_id)?.push(row.tag);
+    return result;
+  }
+
   listGalleryAssets(libraryId: string, cursor: string | undefined, limit: number, query = ''): { items: GalleryAssetRecord[]; nextCursor: string | null } {
     const position = cursor ? decodeGalleryCursor(cursor) : undefined;
     const localCursorSql = !position ? '' : position.capturedAt === null
@@ -525,7 +575,11 @@ export class SqliteRepository implements UploadRepository {
     const hasMore = records.length > limit;
     const page = records.slice(0, limit);
     const last = page.at(-1);
-    return { items: page, nextCursor: hasMore && last ? encodeGalleryCursor(last.capturedAt, last.assetId) : null };
+    const tagsByAsset = this.listAssetTags(libraryId, page.map((asset) => asset.assetId));
+    return {
+      items: page.map((asset) => ({ ...asset, tags: tagsByAsset.get(asset.assetId) ?? [] })),
+      nextCursor: hasMore && last ? encodeGalleryCursor(last.capturedAt, last.assetId) : null
+    };
   }
 
   getGalleryMedia(assetId: string): GalleryMediaRecord | undefined {
@@ -838,7 +892,7 @@ function toGalleryAsset(row: GalleryAssetSqlRow): GalleryAssetRecord {
     filename: typeof row.filename === 'string' ? row.filename : row.asset_id,
     capturedAt, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
     sourceKind: row.source_kind === 'upload' ? 'upload' : 'import',
-    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id
+    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id, tags: []
   };
 }
 

@@ -159,6 +159,22 @@ describe('source contracts', () => {
     expect(approval({ approved: true, libraryIds: ['x'.repeat(129)] })).toBe(false);
   });
 
+  it('documents persistent asset tags as a bounded additive API', async () => {
+    const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
+    const api = parse(await readFile(apiPath, 'utf8')) as {
+      components: { schemas: Record<string, unknown> };
+      paths: Record<string, unknown>;
+    };
+    expect(api.components.schemas.Asset).toMatchObject({
+      required: expect.arrayContaining(['tags']),
+      properties: { tags: { type: 'array', maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 128 } } }
+    });
+    expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}']).toMatchObject({
+      put: { responses: { '204': { headers: { 'X-Request-ID': { $ref: '#/components/headers/XRequestId' } } }, '400': {}, '403': {}, '404': {}, '503': {} } },
+      delete: { responses: { '204': { headers: { 'X-Request-ID': { $ref: '#/components/headers/XRequestId' } } }, '400': {}, '403': {}, '404': {}, '503': {} } }
+    });
+  });
+
   it('documents the implemented security headers and non-success status codes', async () => {
     const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
     type ContractResponse = { headers?: Record<string, { schema?: Record<string, unknown> }> };

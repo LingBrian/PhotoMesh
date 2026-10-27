@@ -132,6 +132,63 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: tag
+        required: true
+        description: URL-encoded UTF-8 tag text; leading/trailing whitespace is trimmed; case is preserved; server limit is 128 UTF-8 bytes.
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: Idempotently add a tag to an authorized asset
+      responses:
+        '204':
+          description: Tag is present after the operation; repeating the request has no additional effect.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Empty/oversized tag or per-asset tag limit reached, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Node administrator or library authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Asset is absent, tombstoned, or not visible in this library', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag persistence capability is unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+    delete:
+      summary: Idempotently remove a tag from an authorized asset
+      responses:
+        '204':
+          description: Tag is absent after the operation; repeating the request has no additional effect.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Empty/oversized tag, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Node administrator or library authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Asset is absent, tombstoned, or not visible in this library', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag persistence capability is unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/assets/{assetId}/original:
     get:
       summary: 在每次请求校验图库 ACL 后流式读取不可变原图
@@ -923,7 +980,7 @@ components:
         items: {type: array, items: {$ref: '#/components/schemas/Library'}}
     Asset:
       type: object
-      required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version]
+      required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version, tags]
       properties:
         assetId: {type: string}
         libraryId: {type: string}
@@ -937,6 +994,15 @@ components:
         sourceKind: {type: string, enum: [upload, import]}
         byteSize: {type: integer, minimum: 0}
         version: {type: string}
+        tags:
+          type: array
+          maxItems: 64
+          description: Current per-asset tag membership on this Node; sorted, empty when unset, not yet P2P-synchronized.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            description: Trimmed, case-sensitive tag text with a maximum of 128 UTF-8 bytes.
     AssetPage:
       type: object
       required: [items]

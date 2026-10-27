@@ -174,6 +174,10 @@ const server = createNodeAgentServer({
     restoreTombstone: (libraryId, eventId) => restoreCoordinator.run(libraryId, eventId,
       () => restoreTombstoneOperation(libraryId, eventId, syncService, (id) => repository.listActiveTombstones(id)))
   },
+  assetTags: {
+    addAssetTag: (libraryId, assetId, tag, createdAt) => repository.addAssetTag(libraryId, assetId, tag, createdAt),
+    removeAssetTag: (libraryId, assetId, tag) => repository.removeAssetTag(libraryId, assetId, tag)
+  },
   ...(mediaVersionService ? { mediaVersions: mediaVersionService } : {}),
   ...(mediaThumbnailService ? { thumbnails: {
     readThumbnail: (libraryId: string, assetId: string, profile: string) =>

@@ -345,5 +345,33 @@ export const migrations: readonly Migration[] = [
       CREATE TRIGGER media_versions_no_delete BEFORE DELETE ON media_versions
       BEGIN SELECT RAISE(ABORT, 'media version deletion is disabled'); END;
     `
+  },
+  {
+    id: '0005_asset_tags',
+    sql: `
+      CREATE TABLE asset_tags (
+        library_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        tag TEXT NOT NULL CHECK (length(CAST(tag AS BLOB)) BETWEEN 1 AND 128 AND tag = trim(tag)),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (library_id, asset_id, tag)
+      );
+      CREATE INDEX asset_tags_library_tag_idx ON asset_tags (library_id, tag, asset_id);
+      CREATE TRIGGER asset_tags_insert_guard BEFORE INSERT ON asset_tags
+      WHEN NOT (
+        EXISTS (
+          SELECT 1 FROM assets a WHERE a.library_id = NEW.library_id AND a.asset_id = NEW.asset_id
+            AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id
+              AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+        ) OR EXISTS (
+          SELECT 1 FROM sync_asset_projection p WHERE p.library_id = NEW.library_id AND p.asset_id = NEW.asset_id
+            AND p.tombstone_event_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+        )
+      )
+      BEGIN SELECT RAISE(ABORT, 'asset tag target is not visible'); END;
+      CREATE TRIGGER asset_tags_no_update BEFORE UPDATE ON asset_tags
+      BEGIN SELECT RAISE(ABORT, 'asset tags are immutable; use delete and insert'); END;
+    `
   }
 ];

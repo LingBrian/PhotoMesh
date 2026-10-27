@@ -6,7 +6,8 @@ import { getDiagnostics, getHealth, type HealthDiagnosticsSource } from './healt
 import { UploadError, UploadService, type CreateUploadRequest } from './uploads/service.js';
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
-import type { TrustedPeerRecord } from './db/repository.js';
+import type { AssetTagMutationResult, TrustedPeerRecord } from './db/repository.js';
+import { maxAssetTagUtf8Bytes } from './asset-tag-limits.js';
 import type { Readable } from 'node:stream';
 import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage, MediaVersionView } from './media/media-version-service.js';
 import type { ThumbnailContent } from './media/thumbnail-service.js';
@@ -33,6 +34,7 @@ export interface NodeAgentServerOptions {
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
+  assetTags?: AssetTagServerControl;
   mediaVersions?: MediaVersionServerControl;
   thumbnails?: ThumbnailServerControl;
   pairingControl?: PairingServerControl;
@@ -68,6 +70,11 @@ export interface MediaVersionServerControl {
 
 export interface ThumbnailServerControl {
   readThumbnail(libraryId: string, assetId: string, profile: string): Promise<ThumbnailContent>;
+}
+
+export interface AssetTagServerControl {
+  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string): AssetTagMutationResult;
+  removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult;
 }
 
 export interface PairingServerControl {
@@ -312,8 +319,39 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     }
     const items = peerId && libraryId ? options.pairingControl?.readLibraryIndex(peerId, libraryId) : undefined;
     if (!items) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
-    const page = items.slice(rawOffset, rawOffset + rawLimit);
+    const page = items.slice(rawOffset, rawOffset + rawLimit).map((item) =>
+      isPlainRecord(item) ? { ...item, tags: [] } : item
+    );
     sendJson(response, 200, { items: page, nextCursor: rawOffset + rawLimit < items.length ? String(rawOffset + rawLimit) : null });
+    return;
+  }
+
+  const assetTagPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/tags\/([^/]+)$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && assetTagPath?.[1] && assetTagPath[2] && assetTagPath[3]) {
+    const libraryId = decodePathSegment(assetTagPath[1]);
+    const assetId = decodePathSegment(assetTagPath[2]);
+    const rawTag = decodeTagSegment(assetTagPath[3]);
+    if (!libraryId || !assetId || rawTag === undefined) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return;
+    }
+    const principalId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!principalId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    const tag = normalizeAssetTag(rawTag);
+    if (!tag) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const control = options.assetTags;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const result = request.method === 'PUT'
+      ? control.addAssetTag(libraryId, assetId, tag, new Date().toISOString())
+      : control.removeAssetTag(libraryId, assetId, tag);
+    if (result === 'not_found') { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    if (result === 'limit_reached') { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const successful = request.method === 'PUT'
+      ? result === 'added' || result === 'already_present'
+      : result === 'removed' || result === 'unchanged';
+    if (!successful) throw new Error('Asset tag operation failed');
+    response.writeHead(204);
+    response.end();
     return;
   }
 
@@ -496,6 +534,15 @@ function decodePathSegment(value: string | undefined): string | undefined {
     const decoded = decodeURIComponent(value);
     return decoded.length > 0 && decoded.length <= 128 && !/[\\/\0]/.test(decoded) ? decoded : undefined;
   } catch { return undefined; }
+}
+
+function decodeTagSegment(value: string): string | undefined {
+  try { return decodeURIComponent(value); } catch { return undefined; }
+}
+
+function normalizeAssetTag(value: string): string | undefined {
+  const tag = value.trim();
+  return tag.length > 0 && !tag.includes('\0') && Buffer.byteLength(tag, 'utf8') <= maxAssetTagUtf8Bytes ? tag : undefined;
 }
 
 function isRestoreTombstoneRequest(value: unknown): value is { libraryId: string; eventId: string } {

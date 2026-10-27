@@ -22,6 +22,11 @@ interface RouteCase {
   body?: unknown;
   headers?: Record<string, string>;
   authorization?: string;
+  expectedTags?: string[];
+}
+
+interface ContractAssetPage {
+  items: Array<{ assetId: string; tags: string[] }>;
 }
 
 interface ContractResponse {
@@ -84,12 +89,28 @@ const routes: RouteCase[] = [
   { template: '/v1/uploads', method: 'post', path: '/v1/uploads', status: 400, error: 'invalid_request', body: {} },
   { template: '/v1/uploads/{sessionId}', method: 'get', path: '/v1/uploads/session', status: 403, error: 'forbidden' },
   { template: '/v1/uploads/{sessionId}/chunks/{chunkIndex}', method: 'put', path: '/v1/uploads/session/chunks/0', status: 403, error: 'forbidden' },
-  { template: '/v1/uploads/{sessionId}/complete', method: 'post', path: '/v1/uploads/session/complete', status: 403, error: 'forbidden' }
+  { template: '/v1/uploads/{sessionId}/complete', method: 'post', path: '/v1/uploads/session/complete', status: 403, error: 'forbidden' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 403, error: 'forbidden' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/%20summer%20', status: 204, authorization: 'Bearer contract-admin' },
+  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', expectedTags: ['Summer', 'summer'] },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/%20%20', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: `/v1/libraries/lib/assets/asset/tags/${encodeURIComponent('图'.repeat(43))}`, status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/missing/tags/Hidden', status: 404, error: 'not_found', authorization: 'Bearer contract-admin' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'delete', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'delete', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
+  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', expectedTags: ['summer'] },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'delete', path: '/v1/libraries/lib/assets/asset/tags/%20summer%20', status: 204, authorization: 'Bearer contract-admin' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'delete', path: '/v1/libraries/lib/assets/asset/tags/summer', status: 204, authorization: 'Bearer contract-admin' },
+  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', expectedTags: [] }
 ];
 
+const tagKey = 'lib:asset';
+const visibleAssetTags = new Map<string, Set<string>>([[tagKey, new Set<string>()]]);
 const server = createNodeAgentServer({
   authorizePairingAdmin: (token) => token === 'contract-admin',
-  authorizeLibraryRead: () => undefined,
+  authorizeLibraryRead: (token, libraryId) => token === 'contract-admin' && libraryId === 'lib' ? 'local-admin' : undefined,
   authorizeLibraryList: () => false,
   authorizeUpload: () => undefined,
   diagnostics: {
@@ -101,7 +122,28 @@ const server = createNodeAgentServer({
   },
   pairingControl: { dialManualIp: async () => { throw new Error('peer unavailable'); } } as unknown as PairingServerControl,
   uploadService: {} as unknown as UploadService,
-  gallery: { getOriginal: async () => undefined } as unknown as GalleryServerControl
+  gallery: {
+    listAssets: (libraryId: string) => ({
+      items: [{ assetId: 'asset', libraryId, tags: [...(visibleAssetTags.get(`${libraryId}:asset`) ?? [])].sort() }], nextCursor: null
+    }),
+    getOriginal: async () => undefined
+  } as unknown as GalleryServerControl,
+  assetTags: {
+    addAssetTag: (libraryId: string, assetId: string, tag: string) => {
+      const key = `${libraryId}:${assetId}`;
+      if (!visibleAssetTags.has(key)) return 'not_found';
+      const tags = visibleAssetTags.get(key)!;
+      if (tags.has(tag)) return 'already_present';
+      if (tags.size >= 64) return 'limit_reached';
+      tags.add(tag);
+      return 'added';
+    },
+    removeAssetTag: (libraryId: string, assetId: string, tag: string) => {
+      const key = `${libraryId}:${assetId}`;
+      if (!visibleAssetTags.has(key)) return 'not_found';
+      return visibleAssetTags.get(key)!.delete(tag) ? 'removed' : 'unchanged';
+    }
+  }
 });
 
 afterAll(async () => {
@@ -180,6 +222,10 @@ describe('implemented Node HTTP API contract', () => {
         expect(errorValidator(body)).toBe(true);
         expect(contract.components.schemas.ApiError!.properties.error.examples).toContain(route.error);
         expect(body).toMatchObject({ error: route.error, requestId });
+      }
+      if (route.expectedTags) {
+        const body: ContractAssetPage = await response.json() as ContractAssetPage;
+        expect(body.items.find(({ assetId }) => assetId === 'asset')?.tags).toEqual(route.expectedTags);
       }
     }
   });
