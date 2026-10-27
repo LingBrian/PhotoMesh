@@ -143,3 +143,10 @@
 - **接口：** 为 `GET /v1/assets` 增加每资产 `tags` 数组；逐标签 `PUT`/`DELETE /v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}`，按当前 Node 管理员 Bearer 和图库 ACL 授权。元素操作幂等；大小写敏感，仅 trim；暂定单标签 UTF-8 ≤128 字节、每资产 ≤64 标签。
 - **数据与迁移：** 追加 `0005_asset_tags`，不改既有 migration checksum；为本地资产及活动同步投影持久化，tombstone 隐藏但不删除标签。迁移为空表、已有非空 DB 需启动器先备份；不导入浏览器 IndexedDB，也不产生 P2P 事件。PM-042 负责跨节点事件，PM-043 负责 Web 接入及旧本地标签的幂等合并。
 - **回滚限制：** 旧版 Node Agent 拒绝数据库中的未知 migration ID；回滚需恢复迁移前数据库备份，且会丢失迁移后新增标签。此分支不执行用户数据库迁移；生产迁移须另行审批、备份校验和恢复演练。
+
+## ADR-016：PM-042 标签 OR-Set 事件同步、授权与兼容性
+
+- **状态：** 草案，待用户明确批准；在批准前不修改 P2P 协议、ACL 或数据库 schema。完整方案见 [`ADR-016`](adr/ADR-016-pm042-asset-tag-sync.md)。
+- **核心提案：** 标签采用 observed-remove set；add 的事件 ID 是唯一操作 ID，remove 只移除已观察到的 add ID，未观察的并发 add 保留。现有 `asset_tags` 保持为物化视图，PM-041 既有标签经本地签名事件幂等引导。
+- **安全/版本提案：** 维持现有 read grant 只读含义，新增默认拒绝的逐图库 tag-write 授权；使用独立 `asset-tags-v1` 事件流，避免旧 N-1 节点因未知事件阻塞既有元数据同步。
+- **待批准事项：** 独立 tag stream/N-1 行为、显式写权限及其用户可见管理入口、OR-Set 与现存标签 bootstrap 语义。
