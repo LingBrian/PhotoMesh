@@ -2,8 +2,9 @@ import { constants as fsConstants } from 'node:fs';
 import { access, mkdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import Database from 'better-sqlite3';
-import { SqliteRepository } from './db/repository.js';
+import { SqliteRepository, verifySqliteIntegrity } from './db/repository.js';
 import { createNodeAgentServer } from './server.js';
+import { createShutdownHandler } from './lifecycle.js';
 import { NodeUploadFileSystem } from './uploads/file-system.js';
 import { UploadService } from './uploads/service.js';
 import { ExternalScanService, type AuthorizedExternalRoot } from './media/external-scan.js';
@@ -30,12 +31,19 @@ const dataDirectory = resolve(process.env.PHOTOMESH_DATA_DIR ?? './data');
 await mkdir(dataDirectory, { recursive: true });
 const databasePath = join(dataDirectory, 'photomesh.sqlite');
 const database = new Database(databasePath);
+try {
+  verifySqliteIntegrity(database);
+} catch {
+  try { database.close(); } catch { /* The database may be too damaged to close cleanly. */ }
+  throw new Error('database integrity check failed');
+}
 const repository = new SqliteRepository(database, {
   backupBeforeMigration: async () => {
     await database.backup(`${databasePath}.backup-${new Date().toISOString().replaceAll(':', '-')}`);
   }
 });
 await repository.migrate();
+repository.recoverInterruptedJobs(new Date().toISOString());
 const pairingApprovals = new PairingApprovalQueue();
 let pairing: PairingService | undefined;
 let lanNode: LanPairingNode | undefined;
@@ -174,6 +182,7 @@ const server = createNodeAgentServer({
   ...(pairingControl ? { pairingControl } : {})
 });
 server.listen(port, host, () => process.stdout.write(`PhotoMesh node-agent listening on ${host}:${port}\n`));
+void uploadService.resumePending().catch(() => process.stderr.write('Upload recovery could not be completed; pending uploads remain resumable\n'));
 const resumeMediaVersions = (): void => {
   void mediaVersionService?.resumePending().catch(() => process.stderr.write('Media-version recovery could not be completed; pending records remain resumable\n'));
 };
@@ -205,13 +214,16 @@ if (rootsJson) {
   resumeMediaVersions();
 }
 
+const shutdownAgent = createShutdownHandler({
+  server,
+  ...(externalScan ? { externalScan } : {}),
+  ...(lanNode ? { lanNode } : {}),
+  ...(mediaVersionService ? { mediaVersionService } : {}),
+  uploadService,
+  closeDatabase: () => database.close()
+});
 const shutdown = (): void => {
-  externalScan?.stop();
-  void lanNode?.stop();
-  server.close(() => {
-    if (mediaVersionService) void mediaVersionService.stop().finally(() => database.close());
-    else database.close();
-  });
+  void shutdownAgent().catch(() => process.stderr.write('PhotoMesh shutdown encountered a resource cleanup failure\n'));
 };
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);

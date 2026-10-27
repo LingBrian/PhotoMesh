@@ -32,6 +32,8 @@ export class LanPairingNode implements SyncTransport {
   private readonly discovered = new Map<string, Set<string>>();
   private readonly syncTasks = new Map<string, Promise<{ rounds: number; received: number; sent: number }>>();
   private syncTimer: ReturnType<typeof setInterval> | undefined;
+  private stopping = false;
+  private stopPromise: Promise<void> | undefined;
 
   private constructor(private readonly node: Libp2p, private readonly pairing: PairingService, private readonly publicKey: Uint8Array, private readonly syncService?: SyncService) {}
 
@@ -70,7 +72,7 @@ export class LanPairingNode implements SyncTransport {
           inviteId: message.inviteId, secret: message.secret, proposedLabel: message.label,
           authenticatedRemote: { peerId: authenticatedPeerId, publicKey: publicKeyBytes }
         });
-        if (options.syncService) void options.syncService.syncWithPeer(authenticatedPeerId, lan).catch(() => undefined);
+        if (options.syncService) void lan.syncWithPeer(authenticatedPeerId).catch(() => undefined);
         await writeFrame(stream, { ok: true, peerId: result.peerId, grantedLibraryIds: result.grantedLibraryIds });
       } catch {
         await writeFrame(stream, { ok: false, error: 'pairing_rejected' }).catch(() => undefined);
@@ -146,7 +148,7 @@ export class LanPairingNode implements SyncTransport {
           throw new PairingRejectedError('host identity could not be verified');
         }
         this.pairing.trustScannedHost(invite.hostPeerId, publicKeyToProtobuf(authenticatedHost.publicKey), 'Paired PhotoMesh node');
-        if (this.syncService) void this.syncService.syncWithPeer(invite.hostPeerId, this).catch(() => undefined);
+        if (this.syncService) void this.syncWithPeer(invite.hostPeerId).catch(() => undefined);
         return { hostPeerId: invite.hostPeerId };
       } catch (error) { lastError = error; }
     }
@@ -170,6 +172,7 @@ export class LanPairingNode implements SyncTransport {
   }
 
   async syncWithPeer(peerId: string): Promise<{ rounds: number; received: number; sent: number }> {
+    if (this.stopping) throw new Error('LAN node is stopping');
     if (!this.syncService) throw new Error('event sync is not configured');
     const running = this.syncTasks.get(peerId);
     if (running) return running;
@@ -191,10 +194,20 @@ export class LanPairingNode implements SyncTransport {
     return revoked;
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    this.stopPromise ??= this.stopInternal();
+    return this.stopPromise;
+  }
+
+  private async stopInternal(): Promise<void> {
+    this.stopping = true;
     if (this.syncTimer) clearInterval(this.syncTimer);
     this.syncTimer = undefined;
-    await this.node.stop();
+    try {
+      await this.node.stop();
+    } finally {
+      await Promise.allSettled([...this.syncTasks.values()]);
+    }
   }
 }
 

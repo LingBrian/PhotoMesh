@@ -301,7 +301,7 @@ describe('external read-only directory scanning', () => {
     const [result] = await service.start();
 
     expect(result!.issues.map(({ code }) => code)).toContain('symlink_cycle');
-    service.stop();
+    await service.stop();
   });
 
   it('coalesces concurrent requests and runs one follow-up scan', async () => {
@@ -329,6 +329,34 @@ describe('external read-only directory scanning', () => {
     expect(concurrentResult).toEqual(firstResult);
   });
 
+  it('drains an in-flight scan and prevents watchers from reopening during shutdown', async () => {
+    const fs = new VirtualExternalFileSystem(); fs.addDirectory('/photos'); fs.addFile('/photos/a.jpg', 'a');
+    const originalReaddir = fs.readdir.bind(fs);
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    let blocked = false;
+    fs.readdir = async (path: string) => {
+      if (!blocked) { blocked = true; enter(); await gate; }
+      return originalReaddir(path);
+    };
+    let watchCount = 0;
+    const watcher: ExternalWatcher = { watch: () => { watchCount += 1; return { close: vi.fn() }; } };
+    const { service } = setup(root(), fs, new FakeRepository(), watcher);
+    const starting = service.start();
+    await entered;
+    const stopping = service.stop();
+    let stopped = false;
+    void stopping.then(() => { stopped = true; });
+    expect(stopped).toBe(false);
+    release();
+    await Promise.all([starting, stopping]);
+    expect(stopped).toBe(true);
+    expect(watchCount).toBe(0);
+    await expect(service.scanAll()).resolves.toEqual([]);
+  });
+
   it('refreshes scans from watcher hints and closes handles on stop', async () => {
     vi.useFakeTimers();
     try {
@@ -348,7 +376,7 @@ describe('external read-only directory scanning', () => {
       fs.addFile('/photos/b.jpg', 'two'); changed?.();
       await vi.advanceTimersByTimeAsync(10);
       expect((await service.scanAll())[0]?.indexed).toBe(2);
-      service.stop();
+      await service.stop();
       expect(closed).toBe(2);
     } finally { vi.useRealTimers(); }
   });

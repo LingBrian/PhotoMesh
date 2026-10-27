@@ -172,6 +172,7 @@ export interface CreateMediaVersionRecord {
 
 export interface UploadRepository {
   getUploadSession(sessionId: string): UploadSessionRecord | undefined;
+  listRecoverableUploadSessionIds(now: string): string[];
   getUploadSessionByIdempotency(scope: string, key: string): UploadSessionRecord | undefined;
   createUploadSession(record: CreateUploadSessionRecord): void;
   getUploadChunk(sessionId: string, chunkIndex: number): UploadChunkRecord | undefined;
@@ -259,11 +260,49 @@ interface MediaVersionSqlRow {
   updated_at: string;
 }
 
+export function assertQuickCheckResults(results: unknown): void {
+  if (!Array.isArray(results) || results.length !== 1) throw new Error('database integrity check failed');
+  const row: unknown = results[0];
+  if (typeof row !== 'object' || row === null || !('quick_check' in row) || row.quick_check !== 'ok') {
+    throw new Error('database integrity check failed');
+  }
+}
+
+export function verifySqliteIntegrity(database: Database.Database): void {
+  try {
+    assertQuickCheckResults(database.prepare('PRAGMA quick_check').all());
+  } catch {
+    throw new Error('database integrity check failed');
+  }
+}
+
 export class SqliteRepository implements UploadRepository {
   constructor(private readonly db: Database.Database, private readonly faults: RepositoryFaults = {}) {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('journal_mode = WAL');
+  }
+
+  verifyIntegrity(): void {
+    verifySqliteIntegrity(this.db);
+  }
+
+  recoverInterruptedJobs(now: string): number {
+    const recover = this.db.transaction(() => {
+      this.db.prepare(`UPDATE upload_sessions SET state = 'failed', updated_at = ?
+        WHERE state IN ('created', 'uploading', 'verifying') AND expires_at <= ?`).run(now, now);
+      const expired = this.db.prepare(`UPDATE jobs SET state = 'failed', lease_until = NULL, updated_at = ?
+        WHERE job_type = 'upload' AND state IN ('queued', 'running')
+          AND EXISTS (SELECT 1 FROM upload_sessions s
+            WHERE s.session_id = jobs.job_id AND s.state = 'failed' AND s.expires_at <= ?)`).run(now, now);
+      const requeued = this.db.prepare(`UPDATE jobs SET state = 'queued', lease_until = NULL, updated_at = ?
+        WHERE job_type = 'upload' AND state = 'running'
+          AND EXISTS (SELECT 1 FROM upload_sessions s
+            WHERE s.session_id = jobs.job_id AND s.state IN ('created', 'uploading', 'verifying') AND s.expires_at > ?)`)
+        .run(now, now);
+      return expired.changes + requeued.changes;
+    });
+    return recover.immediate();
   }
 
   async migrate(orderedMigrations: readonly Migration[] = migrations): Promise<void> {
@@ -615,6 +654,16 @@ export class SqliteRepository implements UploadRepository {
   getUploadSession(sessionId: string): UploadSessionRecord | undefined {
     const row = this.db.prepare('SELECT * FROM upload_sessions WHERE session_id = ?').get(sessionId) as SessionRow | undefined;
     return row ? toSessionRecord(row) : undefined;
+  }
+
+  listRecoverableUploadSessionIds(now: string): string[] {
+    const rows = this.db.prepare(`SELECT s.session_id FROM upload_sessions s
+      JOIN jobs j ON j.job_id = s.session_id
+      WHERE j.job_type = 'upload' AND j.state IN ('queued', 'running')
+        AND s.state IN ('created', 'uploading', 'verifying')
+        AND s.offset_bytes = s.total_bytes AND s.expires_at > ?
+      ORDER BY s.created_at, s.session_id`).all(now) as Array<{ session_id: string }>;
+    return rows.map((row) => row.session_id);
   }
 
   getUploadSessionByIdempotency(scope: string, key: string): UploadSessionRecord | undefined {

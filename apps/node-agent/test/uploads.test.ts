@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { SqliteRepository } from '../src/db/repository.js';
 import { UploadError, UploadService, type CreateUploadRequest } from '../src/uploads/service.js';
+import { NodeUploadFileSystem } from '../src/uploads/file-system.js';
 import { loadOrCreateLocalIdentity } from '../src/auth/local-identity.js';
 import { SyncRepository } from '../src/sync/sync-repository.js';
 import { makeUnsignedEvent, signEvent } from '../src/sync/event-envelope.js';
@@ -185,6 +189,79 @@ describe('immutable resumable upload pipeline', () => {
     const result = await service.recoverAndComplete(session.sessionId);
     expect(repository.getUploadSession(session.sessionId)?.state).toBe('completed');
     expect(fileSystem.read(result.storageRef)).toEqual(sourceBytes);
+    db.close();
+  });
+
+  it('recovers an upload job after reopening SQLite and verifies the committed object SHA-256', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'photomesh-restart-'));
+    const databasePath = join(directory, 'photomesh.sqlite');
+    const storageRoot = join(directory, 'managed');
+    let db = new Database(databasePath);
+    try {
+      const firstRepository = new SqliteRepository(db);
+      firstRepository.verifyIntegrity();
+      await firstRepository.migrate();
+      const firstService = new UploadService({
+        repository: firstRepository, fileSystem: new NodeUploadFileSystem(storageRoot), nodeId: 'node-local',
+        now: () => '2026-10-27T00:00:00.000Z'
+      });
+      const session = await firstService.createSession('restart-idempotency-012345', request);
+      const firstChunk = sourceBytes.slice(0, chunkSize);
+      await firstService.putChunk(session.sessionId, 0, 0, firstChunk, sha256(firstChunk));
+      const jobBeforeRestart = db.prepare('SELECT checkpoint_json FROM jobs WHERE job_id = ?').get(session.sessionId) as { checkpoint_json: string };
+      expect(db.prepare('SELECT state FROM jobs WHERE job_id = ?').get(session.sessionId)).toEqual({ state: 'running' });
+
+      db.close();
+      db = new Database(databasePath);
+      const recoveredRepository = new SqliteRepository(db);
+      recoveredRepository.verifyIntegrity();
+      await recoveredRepository.migrate();
+      expect(recoveredRepository.recoverInterruptedJobs('2026-10-27T00:00:01.000Z')).toBe(1);
+      expect(db.prepare('SELECT state, checkpoint_json FROM jobs WHERE job_id = ?').get(session.sessionId)).toEqual({
+        state: 'queued', checkpoint_json: jobBeforeRestart.checkpoint_json
+      });
+      expect(recoveredRepository.getUploadSession(session.sessionId)).toMatchObject({ state: 'uploading', offset: firstChunk.byteLength });
+
+      const resumedService = new UploadService({
+        repository: recoveredRepository, fileSystem: new NodeUploadFileSystem(storageRoot), nodeId: 'node-local',
+        now: () => '2026-10-27T00:00:02.000Z'
+      });
+      let offset = firstChunk.byteLength;
+      let chunkIndex = 1;
+      while (offset < sourceBytes.byteLength) {
+        const chunk = sourceBytes.slice(offset, offset + chunkSize);
+        await resumedService.putChunk(session.sessionId, chunkIndex, offset, chunk, sha256(chunk));
+        offset += chunk.byteLength;
+        chunkIndex += 1;
+      }
+      const completed = await resumedService.complete(session.sessionId);
+      expect(await new NodeUploadFileSystem(storageRoot).hashFile(completed.storageRef)).toEqual({
+        byteLength: sourceBytes.byteLength, sha256: sha256(sourceBytes)
+      });
+      expect(recoveredRepository.getUploadSession(session.sessionId)?.state).toBe('completed');
+      expect(db.prepare('SELECT state FROM jobs WHERE job_id = ?').get(session.sessionId)).toEqual({ state: 'succeeded' });
+      recoveredRepository.verifyIntegrity();
+    } finally {
+      if (db.open) db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('automatically retries a fully staged upload after restart recovery', async () => {
+    const { db, repository, fileSystem, service } = await fixture();
+    const session = await service.createSession('persistent-retry-012345', request);
+    await service.putChunk(session.sessionId, 0, 0, sourceBytes, sha256(sourceBytes));
+    expect(repository.getUploadSession(session.sessionId)?.state).toBe('uploading');
+    expect(repository.recoverInterruptedJobs('2026-10-21T00:00:01.000Z')).toBe(1);
+
+    await service.resumePending();
+
+    expect(repository.getUploadSession(session.sessionId)?.state).toBe('completed');
+    expect(db.prepare('SELECT state FROM jobs WHERE job_id = ?').get(session.sessionId)).toEqual({ state: 'succeeded' });
+    expect(await fileSystem.hashFile(`objects/${session.sessionId}/original.blob`)).toEqual({
+      byteLength: sourceBytes.byteLength, sha256: sha256(sourceBytes)
+    });
+    await service.stop();
     db.close();
   });
 

@@ -119,11 +119,13 @@ export class ExternalScanService {
   private debounce: ReturnType<typeof setTimeout> | undefined;
   private running: Promise<ExternalScanResult[]> | undefined;
   private rerun = false;
+  private stopping = false;
   private readonly watches = new Map<string, { close(): void }>();
 
   constructor(private readonly options: ExternalScanOptions) {}
 
   async scanAll(): Promise<ExternalScanResult[]> {
+    if (this.stopping) return [];
     if (this.running) {
       this.rerun = true;
       return this.running;
@@ -139,8 +141,8 @@ export class ExternalScanService {
             rootId: root.rootId, complete: false, indexed: 0, missing: 0, offline: 0, directories: [], issues: [{ code: 'invalid_root' }]
           } : await this.scanRoot(root));
         }
-        this.refreshWatches(results.flatMap((result) => result.directories));
-      } while (this.rerun);
+        if (!this.stopping) this.refreshWatches(results.flatMap((result) => result.directories));
+      } while (this.rerun && !this.stopping);
       await this.options.signPendingEvents?.();
       return results;
     })();
@@ -173,18 +175,22 @@ export class ExternalScanService {
   }
 
   async start(): Promise<ExternalScanResult[]> {
+    if (this.stopping) throw new Error('external scan service has stopped');
     const results = await this.scanAll();
-    if (!this.timer) this.timer = setInterval(() => { void this.scanAll().catch(() => undefined); }, this.options.intervalMs ?? 15 * 60_000);
+    if (!this.stopping && !this.timer) this.timer = setInterval(() => { void this.scanAll().catch(() => undefined); }, this.options.intervalMs ?? 15 * 60_000);
     return results;
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     if (this.debounce) clearTimeout(this.debounce);
     this.timer = undefined;
     this.debounce = undefined;
+    this.rerun = false;
     for (const watch of this.watches.values()) watch.close();
     this.watches.clear();
+    await this.running?.catch(() => undefined);
   }
 
   private refreshWatches(directories: string[]): void {
@@ -211,6 +217,7 @@ export class ExternalScanService {
   }
 
   private scheduleScan(): void {
+    if (this.stopping) return;
     if (this.debounce) clearTimeout(this.debounce);
     this.debounce = setTimeout(() => { void this.scanAll().catch(() => undefined); }, this.options.debounceMs ?? 250);
   }

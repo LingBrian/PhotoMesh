@@ -1,9 +1,17 @@
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
-import { MigrationError, RepositoryConflictError, SqliteRepository } from '../src/db/repository.js';
+import { assertQuickCheckResults, MigrationError, RepositoryConflictError, SqliteRepository, verifySqliteIntegrity } from '../src/db/repository.js';
 import { migrations } from '../src/db/migrations.js';
 
 describe('SQLite repository and migrations', () => {
+  it('fails closed on corrupt or ambiguous SQLite quick-check results without exposing details', () => {
+    expect(() => assertQuickCheckResults([{ quick_check: 'database disk image is malformed at /private/data.sqlite' }]))
+      .toThrow('database integrity check failed');
+    expect(() => assertQuickCheckResults([])).toThrow('database integrity check failed');
+    expect(() => assertQuickCheckResults([{ quick_check: 'ok' }, { quick_check: 'unexpected row' }]))
+      .toThrow('database integrity check failed');
+  });
+
   it('serves cursor pages in capture order and applies filename search before paging', async () => {
     const db = new Database(':memory:');
     const repository = new SqliteRepository(db);
@@ -48,6 +56,16 @@ describe('SQLite repository and migrations', () => {
     db.close();
   });
 
+  it('runs a SQLite quick check before and after migrations', async () => {
+    const db = new Database(':memory:');
+    expect(() => verifySqliteIntegrity(db)).not.toThrow();
+    const repository = new SqliteRepository(db);
+    expect(() => repository.verifyIntegrity()).not.toThrow();
+    await repository.migrate();
+    expect(() => repository.verifyIntegrity()).not.toThrow();
+    db.close();
+  });
+
   it('applies checksummed migrations and persists upload and core records', async () => {
     const db = new Database(':memory:');
     const repository = new SqliteRepository(db);
@@ -66,7 +84,7 @@ describe('SQLite repository and migrations', () => {
       kind: 'photo',
       totalBytes: 4,
       expectedSha256: 'b'.repeat(64),
-      expiresAt: '2026-10-22T00:00:00.000Z',
+      expiresAt: '2026-10-28T00:00:00.000Z',
       finalStorageRef: 'objects/session-1/original.blob',
       now: '2026-10-21T00:00:00.000Z'
     });
@@ -79,6 +97,15 @@ describe('SQLite repository and migrations', () => {
     expect(repository.getUploadChunks('session-1')).toHaveLength(1);
     expect(repository.getLocationForSession('session-1')).toBeUndefined();
     expect(db.prepare("SELECT state FROM jobs WHERE job_id = 'session-1'").get()).toEqual({ state: 'running' });
+    const jobBeforeRestart = db.prepare("SELECT state, attempts, checkpoint_json FROM jobs WHERE job_id = 'session-1'").get() as {
+      state: string; attempts: number; checkpoint_json: string;
+    };
+    expect(repository.recoverInterruptedJobs('2026-10-27T00:00:00.000Z')).toBe(1);
+    expect(db.prepare("SELECT state, attempts, checkpoint_json, updated_at FROM jobs WHERE job_id = 'session-1'").get()).toEqual({
+      ...jobBeforeRestart, state: 'queued', updated_at: '2026-10-27T00:00:00.000Z'
+    });
+    expect(repository.getUploadSession('session-1')?.state).toBe('uploading');
+    expect(repository.recoverInterruptedJobs('2026-10-27T00:00:01.000Z')).toBe(0);
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()).toEqual(
       expect.arrayContaining([
         { name: 'assets' }, { name: 'asset_files' }, { name: 'file_locations' },
@@ -98,6 +125,24 @@ describe('SQLite repository and migrations', () => {
       .rejects.toBeInstanceOf(MigrationError);
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='changed'").get()).toBeUndefined();
 
+    db.close();
+  });
+
+  it('marks expired upload jobs failed instead of requeueing unusable sessions', async () => {
+    const db = new Database(':memory:');
+    const repository = new SqliteRepository(db);
+    await repository.migrate();
+    repository.createUploadSession({
+      sessionId: 'expired-session', idempotencyScope: 'device', idempotencyKey: 'expired-key-012345',
+      requestFingerprint: 'a'.repeat(64), libraryId: 'library', filename: 'expired.jpg', sourceKind: 'upload',
+      sourcePath: null, sourceNodeId: null, kind: 'photo', totalBytes: 1, expectedSha256: 'b'.repeat(64),
+      expiresAt: '2026-10-20T00:00:00.000Z', finalStorageRef: 'objects/expired-session/original.blob',
+      now: '2026-10-19T00:00:00.000Z'
+    });
+
+    expect(repository.recoverInterruptedJobs('2026-10-21T00:00:00.000Z')).toBe(1);
+    expect(repository.getUploadSession('expired-session')?.state).toBe('failed');
+    expect(db.prepare("SELECT state FROM jobs WHERE job_id = 'expired-session'").get()).toEqual({ state: 'failed' });
     db.close();
   });
 

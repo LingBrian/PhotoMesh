@@ -66,6 +66,9 @@ export class UploadService {
   private readonly createEventDraft: ((session: UploadSessionRecord, assetId: string) => EventDraftFactory) | undefined;
   private readonly signPendingEvents: (() => Promise<void>) | undefined;
   private readonly locks = new Map<string, Promise<void>>();
+  private recoveryPromise: Promise<void> | undefined;
+  private stopPromise: Promise<void> | undefined;
+  private stopping = false;
 
   constructor(options: UploadServiceOptions) {
     this.repository = options.repository;
@@ -130,6 +133,19 @@ export class UploadService {
 
   getSession(sessionId: string): UploadSessionResponse {
     return toSessionResponse(this.requireSession(sessionId));
+  }
+
+  resumePending(): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    if (this.recoveryPromise) return this.recoveryPromise;
+    this.recoveryPromise = this.resumeRecoverableUploads().finally(() => { this.recoveryPromise = undefined; });
+    return this.recoveryPromise;
+  }
+
+  stop(): Promise<void> {
+    this.stopping = true;
+    this.stopPromise ??= this.recoveryPromise?.then(() => undefined) ?? Promise.resolve();
+    return this.stopPromise;
   }
 
   async putChunk(sessionId: string, chunkIndex: number, offset: number, bytes: Uint8Array, expectedSha256: string): Promise<UploadSessionResponse> {
@@ -297,6 +313,19 @@ export class UploadService {
     } catch {
       // Successful objects and metadata are durable; failed staging cleanup can be retried on completion replay.
     }
+  }
+
+  private async resumeRecoverableUploads(): Promise<void> {
+    let failed = false;
+    for (const sessionId of this.repository.listRecoverableUploadSessionIds(this.now())) {
+      if (this.stopping) break;
+      try {
+        await this.recoverAndComplete(sessionId);
+      } catch {
+        failed = true;
+      }
+    }
+    if (failed) throw new Error('one or more pending uploads could not be resumed');
   }
 
   private async withSessionLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {

@@ -7,6 +7,7 @@ import { SystemSecretStore, type SecretStore } from '../src/auth/key-store.js';
 import { PairingRejectedError, PairingService } from '../src/auth/pairing-service.js';
 import { PairingApprovalQueue } from '../src/auth/pairing-approval-queue.js';
 import { LanPairingNode } from '../src/auth/lan-node.js';
+import type { SyncService } from '../src/sync/sync-service.js';
 
 const lanNodes: LanPairingNode[] = [];
 const databases: Database.Database[] = [];
@@ -146,6 +147,30 @@ describe('local node identity and LAN pairing', () => {
     await expect(joining.node.pairWithInvite(host.node.createInvite(), 'Same key')).rejects.toBeInstanceOf(PairingRejectedError);
     await expect(host.node.dialManualIp('8.8.8.8', 9000, joining.identity.peerId)).rejects.toThrow('private LAN IP');
     await expect(host.node.dialManualIp('192.168.1.8', 0, joining.identity.peerId)).rejects.toThrow('invalid manual peer address');
+  });
+
+  it('waits for in-flight peer sync before stopping the LAN listener', async () => {
+    const repository = await createRepository();
+    const identity = await loadOrCreateLocalIdentity(repository, new MemorySecretStore());
+    const pairing = new PairingService(repository, identity.peerId, async () => ({ approved: false }));
+    let finishSync!: (result: { rounds: number; received: number; sent: number }) => void;
+    const syncResult = new Promise<{ rounds: number; received: number; sent: number }>((resolve) => { finishSync = resolve; });
+    const syncService = { syncWithPeer: vi.fn(() => syncResult) } as unknown as SyncService;
+    const node = await LanPairingNode.start({
+      identity, pairing, listenAddresses: ['127.0.0.1'], listenPort: 0, syncService
+    });
+    lanNodes.push(node);
+    const syncing = node.syncWithPeer('not-a-real-peer');
+    const stopping = node.stop();
+    let stopped = false;
+    void stopping.then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    finishSync({ rounds: 1, received: 0, sent: 0 });
+    await syncing;
+    await stopping;
+    expect(stopped).toBe(true);
+    await expect(node.syncWithPeer('later-peer')).rejects.toThrow('LAN node is stopping');
   });
 
   it('rejects non-private listener and manual IP addresses before opening sockets', async () => {
