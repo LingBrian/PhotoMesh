@@ -1,9 +1,16 @@
 $ErrorActionPreference = 'Stop'
 $AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$InstallRoot = Split-Path -Parent $AppRoot
 $Node = Join-Path $AppRoot 'runtime\node.exe'
 $Entry = Join-Path $AppRoot 'dist\index.js'
 $ExternalRootsScript = Join-Path $AppRoot 'external-roots.ps1'
-if (-not (Test-Path -LiteralPath $Node) -or -not (Test-Path -LiteralPath $Entry) -or -not (Test-Path -LiteralPath $ExternalRootsScript)) { throw 'PhotoMesh node package is incomplete.' }
+$LifecycleScript = Join-Path $AppRoot 'lifecycle.ps1'
+if (-not (Test-Path -LiteralPath $Node -PathType Leaf) -or -not (Test-Path -LiteralPath $Entry -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $ExternalRootsScript -PathType Leaf) -or -not (Test-Path -LiteralPath $LifecycleScript -PathType Leaf)) {
+  throw 'PhotoMesh Node Agent package is incomplete.'
+}
+. $LifecycleScript
+Assert-PhotoMeshNodeAgentNotRunning -InstallRoot $InstallRoot
 . $ExternalRootsScript
 $DataDir = Join-Path $env:LOCALAPPDATA 'PhotoMesh\data'
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null

@@ -132,12 +132,17 @@ jobs:
           Copy-Item -LiteralPath 'scripts/node-agent/start.ps1' -Destination (Join-Path $stage 'start.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/external-roots.ps1' -Destination (Join-Path $stage 'external-roots.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/start.bat' -Destination (Join-Path $stage 'start.bat')
+          Copy-Item -LiteralPath 'scripts/node-agent/lifecycle.ps1' -Destination (Join-Path $stage 'lifecycle.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/uninstall.ps1' -Destination (Join-Path $stage 'uninstall.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/uninstall.bat' -Destination (Join-Path $stage 'uninstall.bat')
           $archive = "$stage.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive
           $smoke = "$stage-extracted"
           Expand-Archive -LiteralPath $archive -DestinationPath $smoke
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-package.ps1' -PackageRoot $smoke
           if ($LASTEXITCODE -ne 0) { throw 'Windows Node Agent ZIP smoke test failed.' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-lifecycle.ps1' -PackageRoot $smoke -PackageArchive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Node Agent lifecycle tests failed.' }
       - run: pnpm --filter @photomesh/desktop build
       - run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
 

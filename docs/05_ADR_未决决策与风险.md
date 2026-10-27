@@ -97,3 +97,12 @@
 - **CSP/CORS：** Desktop CSP 允许 `https:` API 源，但不开放通用明文 HTTP；Node Agent 默认 CORS 精确支持平台 Tauri 本地源（Windows 生产 `http://tauri.localhost` 仅默认端口、Unix `tauri://localhost`）和 loopback 开发源。其他浏览器 Web 源仍需显式配置为精确 HTTPS origin。CORS 不是授权边界；所有受保护读取继续执行 bearer-token 与后端 ACL 校验。
 - **部署边界：** Node Agent 的 HTTP 监听默认保持 loopback；需要远端访问时应使用受控 HTTPS 反向代理（可额外经 VPN 暴露网络可达性），不能将明文管理 API 公开到不可信互联网。无需改变 API/schema/P2P 协议或数据库。
 - **验证与回滚：** 覆盖 HTTPS 成功、远端 HTTP 拒绝、未确认目标不发请求、恶意/非默认端口 CORS 来源拒绝及本机回环连接；若证书、CORS 或 CSP 验证失败，可回滚桌面 HTTPS 开放而保留本机修复。远端硬件/TLS 代理未提供时不得宣称真实远端节点验收通过。
+
+## ADR-011：Windows Node Agent 用户级生命周期
+
+- **状态：** PM-034 先采用显式用户级前台生命周期；不引入后台 Windows 服务、登录自启、计划任务、防火墙规则或远端监听。Desktop 与 Node Agent 仍为独立安装单元。
+- **启动/停止：** 用户显式运行安装器或版本目录中的 `start.bat`；Agent 在可见前台窗口运行，默认只绑定 `127.0.0.1:8443`，按 `Ctrl+C` 停止。启动前检查同一 Node Agent 安装根下的运行时进程，避免重复实例/端口冲突。管理员令牌仍由用户每次输入或首次生成并当次展示，不落盘、不传命令行、不写日志；重启需重新输入已有令牌。
+- **安装/升级：** 以 SemVer 版本目录并排安装；下载包先校验 SHA-256，再对 ZIP 路径、扩展大小/条目数、重复/非法条目及链接属性做校验，解压到 install-root 下新建 `.stage-*`，检查所需文件和包版本后原子移动到版本目录。拒绝覆盖已安装版本；升级保留旧版本供手动回滚。若检测到旧版仍运行，安装新版本但不启动第二个监听实例。
+- **卸载/数据保留：** `uninstall.bat`/`uninstall.ps1` 只删除用户确认的一个版本目录；新版本脚本可用 `-Version <version>` 明确选择旧版。若该版本的打包 `runtime\node.exe` 仍在运行则拒绝卸载，提示在前台按 `Ctrl+C`。目标必须是 `%LOCALAPPDATA%\Programs\PhotoMesh\NodeAgent` 的版本子目录；安装链/待删树遇到 reparse point 则失败关闭，并校验 Node Agent 包名与 `package.json` 版本和目录版本一致（兼容旧包）。始终保留 `%LOCALAPPDATA%\PhotoMesh\data`、管理员凭据、外部照片路径与防火墙状态；不清理其他版本。
+- **依赖与边界：** 登录自启/服务式优雅停止需要可靠的停止通道和 Windows Credential Manager 方案，留给 PM-035/037；不得将管理员令牌持久化到普通配置/环境文件。此 ADR 不改变 Node API、数据库、schema 或 P2P 协议。
+- **验证：** Windows CI 对恶意 ZIP 路径/链接、阶段目录、进程身份、重复版本、失败升级回滚、`-WhatIf`、显式确认与数据留存运行 hermetic 测试；该测试不替代干净 Windows 用户账户下的真实安装/重启/卸载 E2E，未完成前不得宣称 PM-034 全部验收。

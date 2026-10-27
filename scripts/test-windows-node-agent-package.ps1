@@ -15,6 +15,9 @@ $manifestPath = Join-Path $resolvedRoot 'package.json'
 $nodePath = Join-Path $resolvedRoot 'runtime\node.exe'
 $entryPath = Join-Path $resolvedRoot 'dist\index.js'
 $externalRootsPath = Join-Path $resolvedRoot 'external-roots.ps1'
+$lifecyclePath = Join-Path $resolvedRoot 'lifecycle.ps1'
+$uninstallScriptPath = Join-Path $resolvedRoot 'uninstall.ps1'
+$uninstallBatchPath = Join-Path $resolvedRoot 'uninstall.bat'
 $nodeModules = Join-Path $resolvedRoot 'node_modules'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
   throw "Windows Node Agent package manifest is missing: $manifestPath"
@@ -28,6 +31,15 @@ if (-not (Test-Path -LiteralPath $entryPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $externalRootsPath -PathType Leaf)) {
   throw "External-root startup helper is missing: $externalRootsPath"
 }
+if (-not (Test-Path -LiteralPath $lifecyclePath -PathType Leaf)) {
+  throw "Windows Node Agent lifecycle helper is missing: $lifecyclePath"
+}
+if (-not (Test-Path -LiteralPath $uninstallScriptPath -PathType Leaf)) {
+  throw "Windows Node Agent uninstaller is missing: $uninstallScriptPath"
+}
+if (-not (Test-Path -LiteralPath $uninstallBatchPath -PathType Leaf)) {
+  throw "Windows Node Agent uninstall launcher is missing: $uninstallBatchPath"
+}
 if (-not (Test-Path -LiteralPath $nodeModules -PathType Container)) {
   throw "Windows Node Agent production dependencies are missing: $nodeModules"
 }
@@ -38,6 +50,8 @@ if ($manifest.name -ne '@photomesh/node-agent') {
 }
 
 . $externalRootsPath
+. $lifecyclePath
+Test-PhotoMeshNodeAgentPackage -PackageRoot $resolvedRoot | Out-Null
 $testRootPath = Join-Path $env:TEMP ('photomesh-node-agent-external-roots-' + [guid]::NewGuid().ToString('N'))
 $testRootCreated = $false
 $previousExternalRoots = $env:PHOTOMESH_EXTERNAL_ROOTS
