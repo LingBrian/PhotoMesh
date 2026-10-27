@@ -436,12 +436,25 @@ describe('pairing and library authorization endpoints', () => {
     expect(await response.json()).toMatchObject({ error: 'capability_unavailable' });
   });
 
-  it('adds CORS only for local web and Tauri origins by default', async () => {
+  it('adds CORS only for loopback web and platform-specific Tauri origins by default', async () => {
     const allowed = await request('/v1/health', {}, { headers: { origin: 'http://localhost:5173' } });
     expect(allowed.headers.get('access-control-allow-origin')).toBe('http://localhost:5173');
-    const preflight = await request('/v1/libraries', {}, { method: 'OPTIONS', headers: { origin: 'tauri://localhost' } });
-    expect(preflight.status).toBe(204);
-    expect(preflight.headers.get('access-control-allow-origin')).toBe('tauri://localhost');
+
+    const linuxTauri = await request('/v1/libraries', {}, { method: 'OPTIONS', headers: { origin: 'tauri://localhost' } });
+    expect(linuxTauri.status).toBe(204);
+    expect(linuxTauri.headers.get('access-control-allow-origin')).toBe('tauri://localhost');
+    const httpsTauri = await request('/v1/health', {}, { headers: { origin: 'https://tauri.localhost' } });
+    expect(httpsTauri.headers.get('access-control-allow-origin')).toBe('https://tauri.localhost');
+
+    const windowsTauri = await request('/v1/libraries', {}, { method: 'OPTIONS', headers: { origin: 'http://tauri.localhost', 'access-control-request-method': 'GET', 'access-control-request-headers': 'authorization' } });
+    expect(windowsTauri.status).toBe(204);
+    expect(windowsTauri.headers.get('access-control-allow-origin')).toBe('http://tauri.localhost');
+    expect(windowsTauri.headers.get('access-control-allow-headers')).toContain('Authorization');
+    const nonDefaultTauriPort = await request('/v1/health', {}, { headers: { origin: 'http://tauri.localhost:5173' } });
+    expect(nonDefaultTauriPort.headers.get('access-control-allow-origin')).toBeNull();
+
+    const spoofedTauri = await request('/v1/health', {}, { headers: { origin: 'http://tauri.localhost.evil.example' } });
+    expect(spoofedTauri.headers.get('access-control-allow-origin')).toBeNull();
     const denied = await request('/v1/health', {}, { headers: { origin: 'https://attacker.example' } });
     expect(denied.headers.get('access-control-allow-origin')).toBeNull();
   });

@@ -28,6 +28,7 @@ const endpoint = ref('http://127.0.0.1:8443');
 const endpointInput = ref(endpoint.value);
 const token = ref('');
 const tokenInput = ref('');
+const remoteEndpointAcknowledged = ref(false);
 const connected = ref(false);
 const hasSession = ref(false);
 const lastHealthCheck = ref<Date | null>(null);
@@ -119,6 +120,14 @@ const visibleAssets = computed(() => filteredAssets.value.slice(visibleStart.val
 const topSpacer = computed(() => visibleStart.value * rowHeight);
 const bottomSpacer = computed(() => Math.max(0, (filteredAssets.value.length - visibleEnd.value) * rowHeight));
 const apiBase = computed(() => endpoint.value.trim().replace(/\/+$/, ''));
+const desktopRemoteEndpoint = computed(() => {
+  if (!isDesktopRuntime) return '';
+  try {
+    const normalized = normalizeEndpoint(endpointInput.value);
+    return new URL(normalized).protocol === 'https:' && !isLoopbackEndpoint(normalized) ? normalized : '';
+  } catch { return ''; }
+});
+watch(endpointInput, () => { remoteEndpointAcknowledged.value = false; });
 
 function normalizeEndpoint(value: string): string {
   const parsed = new URL(value.trim());
@@ -162,11 +171,11 @@ async function connect(preserveSession = false): Promise<void> {
   let requestedEndpoint: string;
   try { requestedEndpoint = normalizeEndpoint(endpointInput.value); }
   catch (cause) { error.value = errorText(cause); return; }
-  if (isDesktopRuntime && !isLoopbackEndpoint(requestedEndpoint)) {
-    error.value = t('gallery.desktopRemoteNodeUnsupported'); return;
-  }
   if (new URL(requestedEndpoint).protocol === 'http:' && !isLoopbackEndpoint(requestedEndpoint)) {
     error.value = t('gallery.insecureRemoteNode'); return;
+  }
+  if (isDesktopRuntime && !isLoopbackEndpoint(requestedEndpoint) && !remoteEndpointAcknowledged.value) {
+    error.value = t('gallery.remoteNodeTrustRequired'); return;
   }
   const requestedToken = tokenInput.value.trim();
   const sameSession = hasSession.value && requestedEndpoint === endpoint.value && requestedToken === token.value;
@@ -202,6 +211,7 @@ async function connect(preserveSession = false): Promise<void> {
 function disconnectSession(): void {
   clearAuthorizedSession(true);
   endpointInput.value = endpoint.value;
+  remoteEndpointAcknowledged.value = false;
   error.value = '';
   section.value = 'timeline';
 }
@@ -910,6 +920,21 @@ async function idbClear(store: string): Promise<void> {
               autocomplete="off"
               :placeholder="t('gallery.tokenPlaceholder')"
             ></label>
+            <label
+              v-if="desktopRemoteEndpoint"
+              class="remote-node-trust"
+            >
+              <input
+                v-model="remoteEndpointAcknowledged"
+                type="checkbox"
+              ><span>{{ t('gallery.remoteNodeTrustAcknowledgement', { endpoint: desktopRemoteEndpoint }) }}</span>
+            </label>
+            <p
+              v-if="desktopRemoteEndpoint"
+              class="remote-node-warning"
+            >
+              {{ t('gallery.remoteNodeTrustWarning') }}
+            </p>
             <button
               class="primary-button"
               :disabled="busy"
@@ -1238,7 +1263,24 @@ async function idbClear(store: string): Promise<void> {
               v-model="tokenInput"
               type="password"
               autocomplete="off"
-            ></label><button
+            ></label>
+            <label
+              v-if="desktopRemoteEndpoint"
+              class="remote-node-trust"
+            >
+              <input
+                v-model="remoteEndpointAcknowledged"
+                type="checkbox"
+              >
+              <span>{{ t('gallery.remoteNodeTrustAcknowledgement', { endpoint: desktopRemoteEndpoint }) }}</span>
+            </label>
+            <p
+              v-if="desktopRemoteEndpoint"
+              class="remote-node-warning"
+            >
+              {{ t('gallery.remoteNodeTrustWarning') }}
+            </p>
+            <button
               class="primary-button small-primary"
               :disabled="busy"
               @click="connect()"
