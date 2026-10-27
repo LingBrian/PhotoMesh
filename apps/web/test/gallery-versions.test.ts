@@ -17,6 +17,17 @@ describe('media versions API', () => {
     await expect(loadMediaVersions(base, 'secret', ...ids, fetcher)).resolves.toEqual(body);
     expect(fetcher).toHaveBeenCalledWith(`${base}/v1/libraries/lib%2F1/assets/asset%202/versions`, expect.objectContaining({ headers: { authorization: 'Bearer secret' } }));
   });
+  it('passes session cancellation signals through and preserves authorization status', async () => {
+    const body = { original: { sourceVersionId: null, sha256: 'hash', mimeType: 'image/jpeg', byteSize: 10, filename: 'a.jpg', availability: 'online' }, items: [] };
+    const controller = new AbortController();
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json(body));
+    await loadMediaVersions(base, 'secret', ...ids, fetcher, controller.signal);
+    expect(fetcher.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+
+    fetcher.mockImplementation(async () => new Response(null, { status: 403 }));
+    await expect(loadMediaVersions(base, 'secret', ...ids, fetcher, controller.signal))
+      .rejects.toMatchObject({ operation: 'versions', status: 403, message: 'versions:403' });
+  });
   it('creates a version, polls, and reads exact response bytes', async () => {
     const fetcher = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(Response.json({ operationId: 'op', versionId: 'v1', status: 'queued' }, { status: 202 }))

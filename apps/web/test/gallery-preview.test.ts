@@ -80,7 +80,7 @@ describe('loadAssetPreview', () => {
     expect(cancelled).toBe(true);
   });
 
-  it('maps offline and missing/denied responses without exposing resource details', async () => {
+  it('maps offline and missing responses without exposing resource details', async () => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 409 }));
     const input = { apiBase: 'https://node.example', token: 'test-token', asset: baseAsset, fetcher };
     await expect(loadAssetPreview(input)).rejects.toBeInstanceOf(GalleryPreviewError);
@@ -88,5 +88,13 @@ describe('loadAssetPreview', () => {
 
     fetcher.mockImplementation(async () => new Response(null, { status: 404 }));
     await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'asset-unavailable' });
+  });
+
+  it('treats both 401 and 403 as invalid authorization so the session can be cleared', async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 401 }));
+    const input = { apiBase: 'https://node.example', token: 'test-token', asset: baseAsset, fetcher };
+    await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'unauthorized' });
+    fetcher.mockImplementation(async () => new Response(null, { status: 403 }));
+    await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'unauthorized' });
   });
 });

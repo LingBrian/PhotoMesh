@@ -72,11 +72,11 @@ export async function loadAssetPreview({
     await discardResponseBody(response);
     throw new GalleryPreviewError('source-offline');
   }
-  if (response.status === 401) {
+  if (response.status === 401 || response.status === 403) {
     await discardResponseBody(response);
     throw new GalleryPreviewError('unauthorized');
   }
-  if (response.status === 403 || response.status === 404) {
+  if (response.status === 404) {
     await discardResponseBody(response);
     throw new GalleryPreviewError('asset-unavailable');
   }

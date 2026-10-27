@@ -3,7 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n';
 import { GalleryPreviewError, loadAssetPreview, type GalleryPreviewErrorCode } from './gallery-preview.js';
 import { maxGalleryThumbnailBytes, readGalleryThumbnail } from './gallery-thumbnail.js';
-import { createMediaVersion, getMediaVersion, isTerminalVersionStatus, loadMediaVersions, loadVersionContent, normalizeCrop, type VersionCollection } from './gallery-versions.js';
+import { createMediaVersion, GalleryVersionError, getMediaVersion, isTerminalVersionStatus, loadMediaVersions, loadVersionContent, normalizeCrop, type VersionCollection } from './gallery-versions.js';
+import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
 import './gallery.css';
 
 type Library = { libraryId: string; title: string };
@@ -96,6 +97,14 @@ let pageGeneration = 0;
 let cacheGeneration = 0;
 let metadataGeneration = 0;
 let suppressLibraryReload = false;
+let sessionRevision = 0;
+let connectionGeneration = 0;
+let healthGeneration = 0;
+let healthAbort: AbortController | undefined;
+let connectAbort: AbortController | undefined;
+let requestedLibraryAfterReconnect: string | undefined;
+let endpointSwitchNeedsFreshToken = false;
+const sessionRequests = new SessionRequestScope();
 const rowHeight = 164;
 const pageSize = 100;
 const fullDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }));
@@ -127,7 +136,23 @@ const desktopRemoteEndpoint = computed(() => {
     return new URL(normalized).protocol === 'https:' && !isLoopbackEndpoint(normalized) ? normalized : '';
   } catch { return ''; }
 });
-watch(endpointInput, () => { remoteEndpointAcknowledged.value = false; });
+watch(endpointInput, (value, previous) => {
+  remoteEndpointAcknowledged.value = false;
+  const normalizeForComparison = (candidate: string): string => {
+    try { return normalizeEndpoint(candidate); } catch { return candidate.trim(); }
+  };
+  if (normalizeForComparison(value) === normalizeForComparison(previous)) return;
+  if (!hasSession.value && !token.value.trim() && !tokenInput.value.trim()) return;
+  endpointSwitchNeedsFreshToken = true;
+  requestedLibraryAfterReconnect = undefined;
+  search.value = '';
+  clearAuthorizedSession(true);
+  section.value = 'settings';
+  error.value = t('gallery.nodeSessionChanged');
+});
+watch(tokenInput, (value) => {
+  if (value.trim()) endpointSwitchNeedsFreshToken = false;
+});
 
 function normalizeEndpoint(value: string): string {
   const parsed = new URL(value.trim());
@@ -143,29 +168,58 @@ function isLoopbackEndpoint(value: string): boolean {
   } catch { return false; }
 }
 function clearAuthorizedSession(clearCredentials = false): void {
+  sessionRevision += 1;
+  sessionRequests.invalidate();
+  connectionGeneration += 1;
+  connectAbort?.abort(); connectAbort = undefined;
+  healthGeneration += 1;
+  healthAbort?.abort(); healthAbort = undefined;
   pageGeneration += 1; metadataGeneration += 1;
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = undefined; }
   busy.value = false; tombstonesBusy.value = false; peersBusy.value = false;
   if (healthTimer) { clearInterval(healthTimer); healthTimer = undefined; }
   hasSession.value = false; connected.value = false; lastHealthCheck.value = null;
   libraries.value = []; libraryId.value = ''; assets.value = []; cursor.value = null;
   tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
-  peers.value = []; pendingPeers.value = []; peersError.value = ''; grantLibraryByPeer.value = {}; invitation.value = null;
+  peers.value = []; pendingPeers.value = []; peersError.value = ''; grantLibraryByPeer.value = {}; invitation.value = null; scannedInvite.value = '';
   tags.value = {}; albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
+  tagInput.value = ''; pendingIdempotencyKeys.clear();
   mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false;
   closePreview(); clearThumbnailUrls();
   if (clearCredentials) { token.value = ''; tokenInput.value = ''; }
 }
+function invalidateAuthorizationSession(): void {
+  if (libraryId.value) requestedLibraryAfterReconnect = libraryId.value;
+  clearAuthorizedSession(true);
+  section.value = 'settings';
+  error.value = t('gallery.authorizationRequired');
+}
 function headers() { return { authorization: `Bearer ${token.value.trim()}` }; }
+async function discardResponseBody(response: Response): Promise<void> {
+  try { await response.body?.cancel(); } catch { /* Do not retain rejected response streams. */ }
+}
 async function request<T>(path: string, init: NonNullable<Parameters<typeof fetch>[1]> = {}): Promise<T> {
-  const response = await fetch(`${apiBase.value}${path}`, { ...init, headers: { ...headers(), ...init.headers } });
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      clearAuthorizedSession(true);
-      error.value = t('gallery.authorizationRequired');
+  const revision = sessionRevision;
+  const lease = sessionRequests.begin(init.signal);
+  try {
+    const response = await fetch(`${apiBase.value}${path}`, {
+      ...init,
+      headers: { ...headers(), ...init.headers },
+      signal: lease.signal,
+    });
+    if (!response.ok) {
+      if (!lease.isCurrent() || revision !== sessionRevision) {
+        await discardResponseBody(response);
+        throw new DOMException('Session invalidated', 'AbortError');
+      }
+      if (isAuthorizationFailure(response.status)) invalidateAuthorizationSession();
+      await discardResponseBody(response);
+      throw new NodeApiError(response.status);
     }
-    throw new NodeApiError(response.status);
-  }
-  return response.status === 204 ? undefined as T : await response.json() as T;
+    const result = response.status === 204 ? undefined as T : await response.json() as T;
+    if (!lease.isCurrent() || revision !== sessionRevision) throw new DOMException('Session invalidated', 'AbortError');
+    return result;
+  } finally { lease.release(); }
 }
 async function connect(preserveSession = false): Promise<void> {
   let requestedEndpoint: string;
@@ -177,38 +231,56 @@ async function connect(preserveSession = false): Promise<void> {
   if (isDesktopRuntime && !isLoopbackEndpoint(requestedEndpoint) && !remoteEndpointAcknowledged.value) {
     error.value = t('gallery.remoteNodeTrustRequired'); return;
   }
+  if (endpointSwitchNeedsFreshToken) {
+    error.value = t('gallery.nodeSessionChanged'); section.value = 'settings'; return;
+  }
+  if (!tokenInput.value.trim()) { error.value = t('gallery.tokenRequired'); return; }
   const requestedToken = tokenInput.value.trim();
   const sameSession = hasSession.value && requestedEndpoint === endpoint.value && requestedToken === token.value;
   const previousLibraryId = libraryId.value;
+  const preferredLibraryId = requestedLibraryAfterReconnect ?? (requestedEndpoint === endpoint.value ? previousLibraryId : undefined);
   if (!preserveSession || !sameSession) clearAuthorizedSession();
+  connectAbort?.abort();
+  const generation = ++connectionGeneration;
+  const controller = new AbortController();
+  connectAbort = controller;
   endpoint.value = requestedEndpoint; token.value = requestedToken;
   error.value = ''; busy.value = true; connected.value = false;
   try {
-    const health = await fetch(`${apiBase.value}/v1/health`);
+    const health = await fetch(`${apiBase.value}/v1/health`, { signal: controller.signal });
+    if (generation !== connectionGeneration) return;
     lastHealthCheck.value = new Date();
     if (!health.ok) throw new Error(t('gallery.connectionFailed'));
     const healthResult = await health.json() as { capabilities?: unknown };
+    if (generation !== connectionGeneration) return;
     const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
     mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
     thumbnailsEnabled.value = capabilities.includes('thumbnails');
-    const result = await request<{ items: Library[] }>('/v1/libraries');
+    const result = await request<{ items: Library[] }>('/v1/libraries', { signal: controller.signal });
+    if (generation !== connectionGeneration) return;
     libraries.value = result.items;
     suppressLibraryReload = true;
-    libraryId.value = sameSession && result.items.some((item) => item.libraryId === previousLibraryId)
-      ? previousLibraryId
-      : result.items[0]?.libraryId ?? '';
+    libraryId.value = result.items.find((item) => item.libraryId === preferredLibraryId)?.libraryId ?? result.items[0]?.libraryId ?? '';
+    requestedLibraryAfterReconnect = undefined;
     suppressLibraryReload = false;
     connected.value = true; hasSession.value = true;
     await loadLocalMetadata();
     if (libraryId.value) await loadPage(true, sameSession);
-    if (!hasSession.value) return;
+    if (!hasSession.value || generation !== connectionGeneration) return;
     await loadPeerList();
+    if (!hasSession.value || generation !== connectionGeneration) return;
     if (healthTimer) clearInterval(healthTimer);
     healthTimer = setInterval(() => { void checkHealth(); }, 30000);
-  } catch (cause) { error.value = errorText(cause); }
-  finally { busy.value = false; }
+  } catch (cause) {
+    if (generation === connectionGeneration && !isRequestAborted(cause)) error.value = errorText(cause);
+  } finally {
+    if (generation === connectionGeneration) busy.value = false;
+    if (connectAbort === controller) connectAbort = undefined;
+  }
 }
 function disconnectSession(): void {
+  requestedLibraryAfterReconnect = undefined;
+  endpointSwitchNeedsFreshToken = false;
   clearAuthorizedSession(true);
   endpointInput.value = endpoint.value;
   remoteEndpointAcknowledged.value = false;
@@ -217,12 +289,20 @@ function disconnectSession(): void {
 }
 async function checkHealth(): Promise<void> {
   const wasConnected = connected.value;
+  const expectedEndpoint = apiBase.value;
+  const generation = ++healthGeneration;
+  healthAbort?.abort();
+  const controller = new AbortController();
+  healthAbort = controller;
   lastHealthCheck.value = new Date();
   try {
-    const response = await fetch(`${apiBase.value}/v1/health`);
+    const response = await fetch(`${expectedEndpoint}/v1/health`, { signal: controller.signal });
+    if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
+    if (isAuthorizationFailure(response.status) && hasSession.value) { invalidateAuthorizationSession(); return; }
     connected.value = response.ok;
     if (response.ok) {
       const healthResult = await response.json() as { capabilities?: unknown };
+      if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
       const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
       mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
       thumbnailsEnabled.value = capabilities.includes('thumbnails');
@@ -232,7 +312,11 @@ async function checkHealth(): Promise<void> {
       await loadPeerList();
       if (section.value === 'recycle') await loadRecycleBin();
     }
-  } catch { connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; }
+  } catch (cause) {
+    if (generation === healthGeneration && !isRequestAborted(cause)) {
+      connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false;
+    }
+  } finally { if (healthAbort === controller) healthAbort = undefined; }
 }
 async function loadPage(reset = false, preserveOnFailure = false): Promise<boolean> {
   if (!connected.value || !hasSession.value || !libraryId.value || busy.value && !reset) return false;
@@ -262,7 +346,14 @@ async function loadPage(reset = false, preserveOnFailure = false): Promise<boole
 }
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 watch(search, () => { if (searchTimer) clearTimeout(searchTimer); searchTimer = setTimeout(() => void loadPage(true), 250); });
-watch(libraryId, (value) => {
+watch(libraryId, (value, previous) => {
+  if (!suppressLibraryReload && hasSession.value && previous && value && value !== previous) {
+    requestedLibraryAfterReconnect = value;
+    clearAuthorizedSession(true);
+    section.value = 'settings';
+    error.value = t('gallery.librarySessionChanged');
+    return;
+  }
   closePreview();
   clearThumbnailUrls();
   activeAlbum.value = '';
@@ -309,7 +400,7 @@ function clearThumbnailUrls(): void {
   cacheGeneration += 1;
   for (const controller of thumbnailRequests.values()) controller.abort();
   thumbnailRequests.clear();
-  for (const entry of thumbnailUrlCache.values()) URL.revokeObjectURL(entry.url);
+  revokeObjectUrls([...thumbnailUrlCache.values()].map((entry) => entry.url), (url) => URL.revokeObjectURL(url));
   thumbnailUrlCache.clear();
   thumbnailMemoryBytes = 0;
   thumbnailUrls.value = {};
@@ -327,7 +418,7 @@ function removeThumbnailUrl(assetId: string): void {
   if (!entry) return;
   thumbnailUrlCache.delete(assetId);
   thumbnailMemoryBytes -= entry.byteSize;
-  URL.revokeObjectURL(entry.url);
+  revokeObjectUrls([entry.url], (url) => URL.revokeObjectURL(url));
   const nextUrls = { ...thumbnailUrls.value };
   delete nextUrls[assetId];
   thumbnailUrls.value = nextUrls;
@@ -337,7 +428,7 @@ function setThumbnailUrl(assetId: string, blob: Blob): void {
   if (blob.size < 1 || blob.size > maxThumbnailMemoryBytes) return;
   const previous = thumbnailUrlCache.get(assetId);
   if (previous) {
-    URL.revokeObjectURL(previous.url);
+    revokeObjectUrls([previous.url], (url) => URL.revokeObjectURL(url));
     thumbnailMemoryBytes -= previous.byteSize;
     thumbnailUrlCache.delete(assetId);
   }
@@ -350,7 +441,7 @@ function setThumbnailUrl(assetId: string, blob: Blob): void {
     if (!oldest) break;
     thumbnailUrlCache.delete(oldest[0]);
     thumbnailMemoryBytes -= oldest[1].byteSize;
-    URL.revokeObjectURL(oldest[1].url);
+    revokeObjectUrls([oldest[1].url], (url) => URL.revokeObjectURL(url));
     const nextUrls = { ...thumbnailUrls.value };
     delete nextUrls[oldest[0]];
     thumbnailUrls.value = nextUrls;
@@ -365,10 +456,12 @@ async function ensureThumbnail(assetId: string): Promise<void> {
   const generation = cacheGeneration;
   const key = thumbnailCacheKey(asset);
   const controller = new AbortController();
+  const lease = sessionRequests.begin(controller.signal);
   thumbnailRequests.set(assetId, controller);
   try {
     let cached: Blob | undefined;
     try { cached = await idbGet<Blob>('thumbnails', key); } catch { /* A cache miss does not trigger original bytes. */ }
+    if (!lease.isCurrent()) return;
     if (cached && cached.size > 0 && cached.size <= maxThumbnailMemoryBytes &&
         generation === cacheGeneration && assets.value.some((item) => thumbnailCacheKey(item) === key)) {
       setThumbnailUrl(assetId, cached);
@@ -377,13 +470,10 @@ async function ensureThumbnail(assetId: string): Promise<void> {
     if (!thumbnailsEnabled.value || !connected.value || !token.value.trim()) return;
     const path = `/v1/libraries/${encodeURIComponent(asset.libraryId)}/assets/${encodeURIComponent(asset.assetId)}/thumbnail?profile=timeline-192`;
     const response = await fetch(`${apiBase.value}${path}`, {
-      headers: headers(), cache: 'no-store', signal: controller.signal
+      headers: headers(), cache: 'no-store', signal: lease.signal
     });
-    if (response.status === 401 || response.status === 403) {
-      if (generation === cacheGeneration) {
-        clearAuthorizedSession(true);
-        error.value = t('gallery.authorizationRequired');
-      }
+    if (isAuthorizationFailure(response.status)) {
+      if (generation === cacheGeneration && lease.isCurrent()) invalidateAuthorizationSession();
       return;
     }
     if (response.status === 404) {
@@ -407,11 +497,12 @@ async function ensureThumbnail(assetId: string): Promise<void> {
   } catch {
     // The grid keeps its placeholder on transport/decoder errors; no original read is attempted.
   } finally {
+    lease.release();
     if (thumbnailRequests.get(assetId) === controller) thumbnailRequests.delete(assetId);
   }
 }
 
-function clearVersionPreview(): void { versionPreviewRequestId += 1; if (versionPreviewUrl.value) URL.revokeObjectURL(versionPreviewUrl.value); versionPreviewUrl.value = ''; activeVersionId.value = ''; }
+function clearVersionPreview(): void { versionPreviewRequestId += 1; if (versionPreviewUrl.value) revokeObjectUrls([versionPreviewUrl.value], (url) => URL.revokeObjectURL(url)); versionPreviewUrl.value = ''; activeVersionId.value = ''; }
 function closePreview(restoreFocus = false): void {
   const invoker = restoreFocus ? previewInvoker : null;
   previewInvoker = null;
@@ -421,7 +512,7 @@ function closePreview(restoreFocus = false): void {
   previewGeneration += 1;
   previewAbort?.abort();
   previewAbort = undefined;
-  if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
+  if (previewUrl.value) revokeObjectUrls([previewUrl.value], (url) => URL.revokeObjectURL(url));
   previewUrl.value = '';
   previewAsset.value = null;
   previewBusy.value = false;
@@ -480,7 +571,14 @@ async function openPreview(asset: Asset): Promise<void> {
       isCachedPreview.value = true;
       return;
     }
-    const original = await loadAssetPreview({ apiBase: apiBase.value, token: token.value, asset, signal: controller.signal });
+    const original = await loadAssetPreview({
+      apiBase: apiBase.value, token: token.value, asset, signal: controller.signal,
+      fetcher: async (input, init) => {
+        const response = await fetch(input, init);
+        if (isAuthorizationFailure(response.status) && generation === previewGeneration) invalidateAuthorizationSession();
+        return response;
+      },
+    });
     if (generation !== previewGeneration) return;
     const view = await resizeImage(original, 1600, 1200);
     if (generation !== previewGeneration) return;
@@ -496,7 +594,8 @@ async function openPreview(asset: Asset): Promise<void> {
   } catch (cause) {
     if (generation === previewGeneration && !controller.signal.aborted) {
       if (cause instanceof GalleryPreviewError && cause.code === 'unauthorized') {
-        clearAuthorizedSession(true); error.value = t('gallery.authorizationRequired');
+        invalidateAuthorizationSession();
+        return;
       }
       previewErrorCode.value = cause instanceof GalleryPreviewError ? cause.code : 'unsupported-media';
     }
@@ -540,15 +639,26 @@ function previewErrorMessage(code: GalleryPreviewErrorCode): string {
   }
 }
 
+function handleVersionAuthorizationFailure(cause: unknown, lease: ReturnType<SessionRequestScope['begin']>): boolean {
+  if (!(cause instanceof GalleryVersionError) || !isAuthorizationFailure(cause.status) || !lease.isCurrent()) return false;
+  invalidateAuthorizationSession();
+  return true;
+}
 async function loadVersions(): Promise<void> {
   const asset = previewAsset.value; if (!asset || !mediaVersionsEnabled.value) return;
   const generation = versionGeneration;
+  const lease = sessionRequests.begin();
   versionsBusy.value = true; versionError.value = '';
   try {
-    const result = await loadMediaVersions(apiBase.value, token.value, libraryId.value, asset.assetId);
-    if (generation === versionGeneration && previewAsset.value === asset) versions.value = result;
-  } catch { if (generation === versionGeneration) versionError.value = t('gallery.versionsFailed'); }
-  finally { if (generation === versionGeneration) versionsBusy.value = false; }
+    const result = await loadMediaVersions(apiBase.value, token.value, libraryId.value, asset.assetId, fetch, lease.signal);
+    if (lease.isCurrent() && generation === versionGeneration && previewAsset.value === asset) versions.value = result;
+  } catch (cause) {
+    if (handleVersionAuthorizationFailure(cause, lease)) return;
+    if (generation === versionGeneration && !isRequestAborted(cause)) versionError.value = t('gallery.versionsFailed');
+  } finally {
+    lease.release();
+    if (generation === versionGeneration) versionsBusy.value = false;
+  }
 }
 function handleVersionSourceChange(): void {
   if (sourceVersionId.value) {
@@ -572,48 +682,77 @@ async function createVersion(): Promise<void> {
   const requestFingerprint = JSON.stringify([libraryId.value, asset.assetId, selectedSource?.versionId ?? null, sourceSha256, coordinates, rotation.value]);
   const idempotencyKey = pendingIdempotencyKeys.get(requestFingerprint) ?? crypto.randomUUID();
   pendingIdempotencyKeys.set(requestFingerprint, idempotencyKey);
+  const lease = sessionRequests.begin();
   versionsBusy.value = true; versionError.value = '';
   try {
-    const accepted = await createMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, { sourceVersionId: selectedSource?.versionId ?? null, sourceSha256, transform: { crop: coordinates, rotation: rotation.value }, idempotencyKey });
-    let current = await getMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, accepted.versionId);
+    const accepted = await createMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, { sourceVersionId: selectedSource?.versionId ?? null, sourceSha256, transform: { crop: coordinates, rotation: rotation.value }, idempotencyKey }, fetch, lease.signal);
+    let current = await getMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, accepted.versionId, fetch, lease.signal);
     for (let attempt = 0; !isTerminalVersionStatus(current.status) && attempt < 120; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 700));
-      if (generation !== versionGeneration || previewAsset.value !== asset) return;
-      current = await getMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, accepted.versionId);
+      if (!lease.isCurrent() || generation !== versionGeneration || previewAsset.value !== asset) return;
+      current = await getMediaVersion(apiBase.value, token.value, libraryId.value, asset.assetId, accepted.versionId, fetch, lease.signal);
     }
-    if (generation !== versionGeneration || previewAsset.value !== asset) return;
+    if (!lease.isCurrent() || generation !== versionGeneration || previewAsset.value !== asset) return;
     versions.value = { ...collection, items: [current, ...collection.items.filter((item) => item.versionId !== current.versionId)] };
     if (['ready', 'failed'].includes(current.status.toLowerCase())) pendingIdempotencyKeys.delete(requestFingerprint);
     if (!isTerminalVersionStatus(current.status) || current.status.toLowerCase() !== 'ready') throw new Error('version-processing-failed');
     await previewVersion(current.versionId);
-  } catch { if (generation === versionGeneration) versionError.value = t('gallery.versionCreateFailed'); }
-  finally { if (generation === versionGeneration) versionsBusy.value = false; }
+  } catch (cause) {
+    if (handleVersionAuthorizationFailure(cause, lease)) return;
+    if (generation === versionGeneration && !isRequestAborted(cause)) versionError.value = t('gallery.versionCreateFailed');
+  } finally {
+    lease.release();
+    if (generation === versionGeneration) versionsBusy.value = false;
+  }
 }
 async function previewVersion(versionId: string): Promise<void> {
   const asset = previewAsset.value; if (!asset) return;
   const generation = versionGeneration;
   clearVersionPreview();
   const requestId = ++versionPreviewRequestId;
+  const lease = sessionRequests.begin();
   try {
-    const blob = await loadVersionContent(apiBase.value, token.value, libraryId.value, asset.assetId, versionId);
-    if (generation !== versionGeneration || requestId !== versionPreviewRequestId || previewAsset.value !== asset) return;
+    const blob = await loadVersionContent(apiBase.value, token.value, libraryId.value, asset.assetId, versionId, fetch, lease.signal);
+    if (!lease.isCurrent() || generation !== versionGeneration || requestId !== versionPreviewRequestId || previewAsset.value !== asset) return;
     const displayPreview = await resizeImage(blob, 1600, 1200);
-    if (generation !== versionGeneration || requestId !== versionPreviewRequestId || previewAsset.value !== asset) return;
+    if (!lease.isCurrent() || generation !== versionGeneration || requestId !== versionPreviewRequestId || previewAsset.value !== asset) return;
     activeVersionId.value = versionId; versionPreviewUrl.value = URL.createObjectURL(displayPreview);
-  } catch { if (generation === versionGeneration && requestId === versionPreviewRequestId && previewAsset.value === asset) { clearVersionPreview(); versionError.value = t('gallery.versionContentFailed'); } }
+  } catch (cause) {
+    if (handleVersionAuthorizationFailure(cause, lease)) return;
+    if (generation === versionGeneration && requestId === versionPreviewRequestId && previewAsset.value === asset && !isRequestAborted(cause)) {
+      clearVersionPreview(); versionError.value = t('gallery.versionContentFailed');
+    }
+  } finally { lease.release(); }
 }
 
 async function downloadOriginal(asset: Asset): Promise<void> {
   if (!connected.value || !hasSession.value) return;
+  const revision = sessionRevision;
+  const lease = sessionRequests.begin();
+  let objectUrl = '';
   try {
-    const response = await fetch(`${apiBase.value}/v1/assets/${encodeURIComponent(asset.assetId)}/original`, { headers: headers(), cache: 'no-store' });
+    const response = await fetch(`${apiBase.value}/v1/assets/${encodeURIComponent(asset.assetId)}/original`, {
+      headers: headers(), cache: 'no-store', signal: lease.signal
+    });
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) { clearAuthorizedSession(true); error.value = t('gallery.authorizationRequired'); }
+      if (!lease.isCurrent() || revision !== sessionRevision) {
+        await discardResponseBody(response);
+        throw new DOMException('Session invalidated', 'AbortError');
+      }
+      if (isAuthorizationFailure(response.status)) invalidateAuthorizationSession();
+      await discardResponseBody(response);
       throw new NodeApiError(response.status);
     }
-    const blob = await response.blob(); const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a'); anchor.href = url; anchor.download = asset.filename; anchor.click(); URL.revokeObjectURL(url);
-  } catch (cause) { error.value = cause instanceof NodeApiError && cause.status === 409 ? t('gallery.sourceOffline') : errorText(cause); }
+    const blob = await response.blob();
+    if (!lease.isCurrent() || revision !== sessionRevision) return;
+    objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a'); anchor.href = objectUrl; anchor.download = asset.filename; anchor.click();
+  } catch (cause) {
+    if (!isRequestAborted(cause)) error.value = cause instanceof NodeApiError && cause.status === 409 ? t('gallery.sourceOffline') : errorText(cause);
+  } finally {
+    if (objectUrl) revokeObjectUrls([objectUrl], (url) => URL.revokeObjectURL(url));
+    lease.release();
+  }
 }
 async function clearLocalCache(): Promise<void> {
   if (!window.confirm(t('gallery.clearCacheConfirm'))) return;
@@ -626,14 +765,19 @@ async function clearLocalCache(): Promise<void> {
 }
 async function loadRecycleBin(): Promise<void> {
   if (!libraryId.value || !hasSession.value || !connected.value) return;
+  const revision = sessionRevision;
+  const requestedLibraryId = libraryId.value;
   tombstonesBusy.value = true; tombstoneError.value = ''; tombstoneStatus.value = '';
-  try { tombstones.value = (await request<{ items: Tombstone[] }>(`/v1/recycle-bin?libraryId=${encodeURIComponent(libraryId.value)}`)).items; }
-  catch (cause) { tombstoneError.value = errorText(cause); }
-  finally { tombstonesBusy.value = false; }
+  try {
+    const result = await request<{ items: Tombstone[] }>(`/v1/recycle-bin?libraryId=${encodeURIComponent(requestedLibraryId)}`);
+    if (revision === sessionRevision && hasSession.value && libraryId.value === requestedLibraryId) tombstones.value = result.items;
+  } catch (cause) { if (revision === sessionRevision) tombstoneError.value = errorText(cause); }
+  finally { if (revision === sessionRevision) tombstonesBusy.value = false; }
 }
 async function restoreTombstone(item: Tombstone): Promise<void> {
   if (!connected.value || !hasSession.value) return;
   if (!window.confirm(t('gallery.restoreConfirm'))) return;
+  const revision = sessionRevision;
   restoringTombstones.value = { ...restoringTombstones.value, [item.eventId]: true };
   tombstoneError.value = '';
   try {
@@ -641,60 +785,75 @@ async function restoreTombstone(item: Tombstone): Promise<void> {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ libraryId: item.libraryId, eventId: item.eventId })
     });
+    if (revision !== sessionRevision || !hasSession.value) return;
     await loadRecycleBin();
-    tombstoneStatus.value = t('gallery.restoreSucceeded');
-  } catch { tombstoneError.value = t('gallery.restoreFailed'); }
-  finally { restoringTombstones.value = { ...restoringTombstones.value, [item.eventId]: false }; }
+    if (revision === sessionRevision) tombstoneStatus.value = t('gallery.restoreSucceeded');
+  } catch (cause) {
+    if (revision === sessionRevision) tombstoneError.value = cause instanceof NodeApiError ? errorText(cause) : t('gallery.restoreFailed');
+  } finally {
+    if (revision === sessionRevision) restoringTombstones.value = { ...restoringTombstones.value, [item.eventId]: false };
+  }
 }
 async function loadPeerList(): Promise<void> {
   if (!hasSession.value || !connected.value) return;
+  const revision = sessionRevision;
   peersBusy.value = true; peersError.value = '';
   try {
     const result = await request<{ peers: typeof peers.value; pending: PendingPeerApproval[] }>('/v1/pairing/peers');
+    if (revision !== sessionRevision || !hasSession.value) return;
     peers.value = result.peers; pendingPeers.value = result.pending;
     for (const peer of peers.value) if (!grantLibraryByPeer.value[peer.peerId]) {
       grantLibraryByPeer.value[peer.peerId] = libraryId.value || libraries.value[0]?.libraryId || '';
     }
-  } catch (cause) { peersError.value = errorText(cause); }
-  finally { peersBusy.value = false; }
+  } catch (cause) { if (revision === sessionRevision) peersError.value = errorText(cause); }
+  finally { if (revision === sessionRevision) peersBusy.value = false; }
 }
 async function decidePeer(peer: PendingPeerApproval, approved: boolean): Promise<void> {
   const prompt = approved ? t('gallery.approvePeerConfirm') : t('gallery.rejectPeerConfirm');
   if (!window.confirm(`${prompt}\n\n${peer.peerId}`)) return;
+  const revision = sessionRevision;
   try {
     await request(`/v1/pairing/peers/${encodeURIComponent(peer.peerId)}/approval`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ approved, ...(approved ? { label: peer.proposedLabel, libraryIds: [] } : {}) })
     });
-    await loadPeerList();
-  } catch (cause) { peersError.value = errorText(cause); }
+    if (revision === sessionRevision) await loadPeerList();
+  } catch (cause) { if (revision === sessionRevision) peersError.value = errorText(cause); }
 }
 async function grantPeerLibrary(peerId: string): Promise<void> {
   const selectedLibrary = grantLibraryByPeer.value[peerId];
   if (!selectedLibrary) { peersError.value = t('gallery.selectLibraryToGrant'); return; }
+  const revision = sessionRevision;
   try {
     await request(`/v1/pairing/peers/${encodeURIComponent(peerId)}/libraries/${encodeURIComponent(selectedLibrary)}`, { method: 'PUT' });
-    peersError.value = '';
-  } catch (cause) { peersError.value = errorText(cause); }
+    if (revision === sessionRevision) peersError.value = '';
+  } catch (cause) { if (revision === sessionRevision) peersError.value = errorText(cause); }
 }
 async function createInvitation(): Promise<void> {
+  const revision = sessionRevision;
   try {
     const response = await request<{ qrDataUrl: string; protocol: string; version: number; hostPeerId: string; addresses: string[]; inviteId: string; secret: string; expiresAt: string }>('/v1/pairing/invitations', { method: 'POST' });
+    if (revision !== sessionRevision || !hasSession.value) return;
     const { qrDataUrl, ...invite } = response; invitation.value = { qrDataUrl, invite };
   }
-  catch (cause) { error.value = errorText(cause); }
+  catch (cause) { if (revision === sessionRevision) error.value = errorText(cause); }
 }
 async function pairFromInvite(): Promise<void> {
+  const revision = sessionRevision;
   try {
     const invite = JSON.parse(scannedInvite.value) as unknown;
     await request('/v1/pairing/join', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ invite, label: t('gallery.defaultNodeLabel') }) });
+    if (revision !== sessionRevision || !hasSession.value) return;
     scannedInvite.value = ''; await loadPeerList();
-  } catch (cause) { error.value = errorText(cause); }
+  } catch (cause) { if (revision === sessionRevision) error.value = errorText(cause); }
 }
 async function revokePeer(peerId: string): Promise<void> {
   if (!window.confirm(t('gallery.revokeConfirm'))) return;
-  try { await request(`/v1/pairing/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' }); await loadPeerList(); }
-  catch (cause) { error.value = errorText(cause); }
+  const revision = sessionRevision;
+  try {
+    await request(`/v1/pairing/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' });
+    if (revision === sessionRevision) await loadPeerList();
+  } catch (cause) { if (revision === sessionRevision) error.value = errorText(cause); }
 }
 async function loadLocalMetadata(): Promise<void> {
   const generation = ++metadataGeneration;
@@ -714,6 +873,7 @@ async function saveTagAndAlbum(): Promise<void> {
   const tag = tagInput.value.trim(); const asset = selectedAsset.value;
   if (!tag || !asset || !libraryId.value || !hasSession.value) return;
   const key = localMetadataKey();
+  const revision = sessionRevision;
   const nextTags = { ...tags.value, [asset.assetId]: [...new Set([...(tags.value[asset.assetId] ?? []), tag])] };
   const nextAlbums = albums.value.some((album) => album.tag === tag)
     ? albums.value
@@ -721,11 +881,13 @@ async function saveTagAndAlbum(): Promise<void> {
   try {
     await idbPut('tags', { key, value: nextTags });
     await idbPut('albums', { key, value: nextAlbums });
+    if (revision !== sessionRevision || !hasSession.value || key !== localMetadataKey()) return;
     tags.value = nextTags; albums.value = nextAlbums;
     tagInput.value = ''; selectedAsset.value = null;
-  } catch { error.value = t('gallery.localMetadataSaveFailed'); }
+  } catch { if (revision === sessionRevision) error.value = t('gallery.localMetadataSaveFailed'); }
 }
 function errorText(cause: unknown): string {
+  if (isRequestAborted(cause)) return '';
   if (cause instanceof NodeApiError) {
     if (cause.status === 401 || cause.status === 403) return t('gallery.authorizationRequired');
     if (cause.status === 409) return t('gallery.requestConflict');
@@ -778,9 +940,9 @@ function changeSection(value: typeof section.value): void { section.value = valu
 onMounted(() => { void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value; document.addEventListener('keydown', onPreviewKeydown); });
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', onPreviewKeydown);
-  if (healthTimer) clearInterval(healthTimer); if (searchTimer) clearTimeout(searchTimer);
-  closePreview();
-  imageObserver?.disconnect(); clearThumbnailUrls();
+  requestedLibraryAfterReconnect = undefined;
+  clearAuthorizedSession(true);
+  imageObserver?.disconnect();
 });
 
 function openDb(): Promise<IDBDatabase> {
