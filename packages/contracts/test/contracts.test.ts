@@ -35,6 +35,40 @@ describe('source contracts', () => {
     });
   });
 
+  it('defines authenticated status-only diagnostics with bounded components', async () => {
+    const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
+    const api = parse(await readFile(apiPath, 'utf8')) as {
+      paths: Record<string, unknown>;
+      components: { schemas: Record<string, object> };
+    };
+    const operation = api.paths['/v1/diagnostics'] as Record<string, unknown> | undefined;
+    expect(operation).toMatchObject({
+      get: {
+        security: [{ nodeAdminBearer: [] }],
+        responses: { '200': { description: expect.any(String) }, '403': { description: expect.any(String) } }
+      }
+    });
+
+    const dereferenced = await SwaggerParser.dereference(apiPath) as {
+      components: { schemas: Record<string, object> };
+    };
+    const validate = new Ajv2020.default({ allErrors: true }).compile(dereferenced.components.schemas.NodeDiagnostics!);
+    const response = {
+      status: 'ok',
+      readiness: 'ready',
+      components: {
+        api: { status: 'ok', capabilities: ['rest'] },
+        database: { status: 'ok', capabilities: ['sqlite'] },
+        storage: { status: 'ok', capabilities: ['managedFiles'] },
+        identity: { status: 'ok', capabilities: ['nodeIdentity', 'eventSigning'] }
+      }
+    };
+    expect(validate(response)).toBe(true);
+    const invalid = structuredClone(response) as typeof response & { components: { database: { path?: string } } };
+    invalid.components.database.path = 'C:\\\\private';
+    expect(validate(invalid)).toBe(false);
+  });
+
   it('validates a JSON Schema component from the OpenAPI source', async () => {
     const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
     const api = parse(await readFile(apiPath, 'utf8')) as {

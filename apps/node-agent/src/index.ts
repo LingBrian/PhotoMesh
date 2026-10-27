@@ -1,4 +1,5 @@
-import { mkdir } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { access, mkdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { SqliteRepository } from './db/repository.js';
@@ -9,6 +10,7 @@ import { ExternalScanService, type AuthorizedExternalRoot } from './media/extern
 import { NodeExternalFileSystem, NodeExternalWatcher } from './media/node-external-adapters.js';
 import { FixtureFileSecretStore, SystemSecretStore } from './auth/key-store.js';
 import { loadOrCreateLocalIdentity } from './auth/local-identity.js';
+import type { DiagnosticCapability } from './health.js';
 import { PairingService } from './auth/pairing-service.js';
 import { PairingApprovalQueue } from './auth/pairing-approval-queue.js';
 import { LanPairingNode } from './auth/lan-node.js';
@@ -136,6 +138,21 @@ const host = process.env.PHOTOMESH_API_BIND_ADDRESS ?? '127.0.0.1';
 if (!isSafeServiceBind(host)) throw new Error('PHOTOMESH_API_BIND_ADDRESS must be loopback or an explicit private LAN IP');
 const server = createNodeAgentServer({
   uploadService, authorizePairingAdmin,
+  diagnostics: {
+    checkDatabase: () => { database.prepare('SELECT 1').get(); },
+    checkStorage: async () => { await access(dataDirectory, fsConstants.R_OK | fsConstants.W_OK); },
+    apiCapabilities: (): DiagnosticCapability[] => [
+      'rest',
+      ...(mediaVersionService ? ['mediaVersions' as const] : []),
+      ...(mediaThumbnailService ? ['thumbnails' as const] : [])
+    ],
+    storageCapabilities: (): DiagnosticCapability[] => ['managedFiles'],
+    identityCapabilities: (): DiagnosticCapability[] => [
+      ...(pairing ? ['nodeIdentity' as const] : []),
+      ...(syncService ? ['eventSigning' as const] : []),
+      ...(lanNode ? ['lanPairing' as const] : [])
+    ]
+  },
   allowedWebOrigins: (process.env.PHOTOMESH_WEB_ORIGINS ?? '').split(',').map((origin) => origin.trim()).filter(Boolean),
   authorizeUpload: (request) => authorizePairingAdmin(request.token) ? { principalId: 'local-admin' } : undefined,
   authorizeLibraryList: (token) => authorizePairingAdmin(token),

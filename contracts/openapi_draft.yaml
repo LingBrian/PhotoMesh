@@ -29,6 +29,19 @@ paths:
                   capabilities:
                     type: array
                     items: {type: string}
+  /v1/diagnostics:
+    get:
+      summary: 管理员查看节点组件健康状态与能力
+      description: Requires the node administrator bearer token; returns enumerated statuses and capabilities only, never paths or user data.
+      security:
+        - nodeAdminBearer: []
+      responses:
+        '200':
+          description: Component diagnostics
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NodeDiagnostics'}
+        '403': {description: Forbidden}
   /v1/libraries:
     get:
       summary: 当前主体有权查看的照片库
@@ -527,7 +540,40 @@ components:
       type: http
       scheme: bearer
       bearerFormat: device-bound-token
+    nodeAdminBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: node-admin-token
   schemas:
+    NodeDiagnostics:
+      type: object
+      additionalProperties: false
+      required: [status, readiness, components]
+      properties:
+        status: {type: string, enum: [ok, degraded, unavailable]}
+        readiness: {type: string, enum: [ready, not_ready]}
+        components:
+          type: object
+          additionalProperties: false
+          required: [api, database, storage, identity]
+          properties:
+            api: {$ref: '#/components/schemas/DiagnosticComponent'}
+            database: {$ref: '#/components/schemas/DiagnosticComponent'}
+            storage: {$ref: '#/components/schemas/DiagnosticComponent'}
+            identity: {$ref: '#/components/schemas/DiagnosticComponent'}
+    DiagnosticComponent:
+      type: object
+      additionalProperties: false
+      required: [status, capabilities]
+      properties:
+        status: {type: string, enum: [ok, degraded, unavailable]}
+        capabilities:
+          type: array
+          uniqueItems: true
+          maxItems: 8
+          items:
+            type: string
+            enum: [rest, mediaVersions, thumbnails, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
     PairingInvite:
       type: object
       required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]

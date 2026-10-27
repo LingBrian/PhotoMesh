@@ -30,6 +30,46 @@ describe('node-agent health endpoint', () => {
     expect(await response.json()).toEqual({ status: 'degraded', protocolMin: 0, protocolMax: 0, capabilities: [] });
   });
 
+  it('protects component diagnostics and omits internal error details', async () => {
+    const sensitivePath = 'D:\\\\Users\\\\private\\\\photos';
+    const checkDatabase = vi.fn(() => { throw new Error(sensitivePath); });
+    const options: NodeAgentServerOptions = {
+      authorizePairingAdmin: (token) => token === 'admin-token',
+      diagnostics: {
+        checkDatabase,
+        checkStorage: () => undefined,
+        apiCapabilities: () => ['rest'],
+        storageCapabilities: () => ['managedFiles'],
+        identityCapabilities: () => []
+      }
+    };
+
+    const denied = await request('/v1/diagnostics', options);
+    expect(denied.status).toBe(403);
+    expect(denied.headers.get('cache-control')).toBe('no-store');
+    expect(await denied.json()).toMatchObject({ error: 'forbidden' });
+    expect(checkDatabase).not.toHaveBeenCalled();
+
+    const response = await request('/v1/diagnostics', options, {
+      headers: { authorization: 'Bearer admin-token' }
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const body = await response.json();
+    expect(body).toEqual({
+      status: 'unavailable',
+      readiness: 'not_ready',
+      components: {
+        api: { status: 'ok', capabilities: ['rest'] },
+        database: { status: 'unavailable', capabilities: ['sqlite'] },
+        storage: { status: 'ok', capabilities: ['managedFiles'] },
+        identity: { status: 'unavailable', capabilities: [] }
+      }
+    });
+    expect(JSON.stringify(body)).not.toContain(sensitivePath);
+    expect(checkDatabase).toHaveBeenCalledOnce();
+  });
+
   it('returns a structured 404 for unknown paths', async () => {
     const response = await request('/private');
     expect(response.status).toBe(404);

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
 import QRCode from 'qrcode';
-import { getHealth } from './health.js';
+import { getDiagnostics, getHealth, type HealthDiagnosticsSource } from './health.js';
 import { UploadError, UploadService, type CreateUploadRequest } from './uploads/service.js';
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
@@ -29,6 +29,7 @@ export interface NodeAgentServerOptions {
   uploadService?: UploadService;
   authorizeUpload?: UploadAuthorizer;
   authorizePairingAdmin?: (token: string | undefined) => boolean;
+  diagnostics?: HealthDiagnosticsSource;
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
@@ -38,6 +39,14 @@ export interface NodeAgentServerOptions {
   allowedWebOrigins?: readonly string[];
   maxRequestBytes?: number;
 }
+
+const unavailableDiagnostics: HealthDiagnosticsSource = {
+  checkDatabase: () => { throw new Error('database check unavailable'); },
+  checkStorage: () => { throw new Error('storage check unavailable'); },
+  apiCapabilities: () => [],
+  storageCapabilities: () => [],
+  identityCapabilities: () => []
+};
 
 export interface GalleryServerControl {
   listLibraries(): Array<{ libraryId: string; title: string }>;
@@ -100,6 +109,16 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       ...(options.thumbnails ? ['thumbnails'] : [])
     ];
     sendJson(response, 200, getHealth(capabilities));
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/v1/diagnostics') {
+    response.setHeader('cache-control', 'no-store');
+    if (!options.authorizePairingAdmin?.(bearerToken(request))) {
+      sendJson(response, 403, { error: 'forbidden', requestId });
+      return;
+    }
+    sendJson(response, 200, await getDiagnostics(options.diagnostics ?? unavailableDiagnostics));
     return;
   }
 
