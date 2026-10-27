@@ -664,7 +664,8 @@ function isAllowedLocalOrigin(value: string): boolean {
     const origin = new URL(value);
     return origin.protocol === 'tauri:' && origin.hostname === 'localhost' ||
       (origin.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) ||
-      (origin.protocol === 'https:' && origin.hostname === 'tauri.localhost');
+      (origin.protocol === 'http:' && origin.hostname === 'tauri.localhost' && origin.port === '') ||
+      (origin.protocol === 'https:' && origin.hostname === 'tauri.localhost' && origin.port === '');
   } catch { return false; }
 }
 

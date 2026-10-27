@@ -12,14 +12,16 @@ function directive(name: string): string {
 }
 
 describe('packaged desktop content security policy', () => {
-  it('allows only loopback Node API connections on configurable ports', () => {
+  it('permits remote HTTPS while keeping plain HTTP restricted to loopback', () => {
     const connect = directive('connect-src');
     expect(connect).toContain("'self'");
     expect(connect).toContain('http://127.0.0.1:*');
     expect(connect).toContain('http://localhost:*');
     expect(connect).toContain('http://[::1]:*');
+    const sources = connect.trim().split(/\s+/);
+    expect(sources).toContain('https:');
+    expect(sources).not.toContain('http:');
     expect(connect).not.toMatch(/(?:^|\s)https?:\/\/\*(?::|\s|$)/);
-    expect(connect).not.toMatch(/(?:^|\s)https?:\s*(?:;|$)/);
   });
 
   it('allows object URLs for generated previews without allowing arbitrary images', () => {
