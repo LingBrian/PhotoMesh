@@ -151,3 +151,9 @@
 - **安全/兼容：** 现有 read grant 仍只读，逐图库 tag-write 默认拒绝；采用独立 `asset-tags-v1` 事件流，N-1 节点仍可同步旧元数据，并明确显示未同步标签操作。
 - **容量澄清（用户批准）：** 每个写入者每资产最多64个活动标签；每图库最多64个唯一标签事件作者（含本机，撤权不释放名额）；OR-Set 合并集及 `Asset.tags` 契约上限为4096。
 - **回滚：** `0006` 为追加迁移；旧二进制需恢复迁移前备份。生产迁移和发布必须另行审批。
+
+## ADR-018：PM-045 虚拟相册同步与删除范围
+
+- **状态：** 提案待用户明确批准；独立只读架构审查未发现阻止提交默认选项的 blocker。详见 [`ADR-018`](adr/ADR-018-pm045-virtual-album-sync.md)。在用户对ADR问题列表作答前，不实施协议、ACL或schema变更。
+- **提案重点：** 独立 `virtual-albums-v1` stream；历史操作 bootstrap/no-op/key namespace；album-write 与可选 album-delete 授权；tombstone asset 的 history/projection 分离；local-only 与 global shared soft delete 可选范围；N/N-1与错误序列恢复有界策略。
+- **剩余边界：** Q09 的回收站保留期限/到期可见性由PM-061设计；永久 purge/审批另由PM-063处理。PM-045不做物理清除，也不授权生产迁移/push/merge/release。
