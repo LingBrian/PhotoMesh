@@ -42,7 +42,7 @@ test('Windows gallery loads image bytes only after an explicit preview action an
     };
   });
 
-  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: ['mediaVersions', 'thumbnails'] } }));
+  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: ['mediaVersions', 'thumbnails', 'assetTags'] } }));
   await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [
     { libraryId: 'fixture-library', title: 'Fixture library' },
     { libraryId: 'other-library', title: 'Other library' },
@@ -70,6 +70,10 @@ test('Windows gallery loads image bytes only after an explicit preview action an
     await route.fulfill({ status: 200, contentType: 'image/webp', body: previewPng, headers: { 'cache-control': 'private, no-store' } });
   });
   await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [], pending: [] } }));
+  await page.route('**/v1/libraries/*/assets/*/tags/**', async (route) => {
+    expect(route.request().headers().authorization).toBe('Bearer fixture-token');
+    await route.fulfill({ status: 204 });
+  });
   await page.route('**/v1/assets/*/original', async (route) => {
     originalReads += 1;
     expect(route.request().headers().authorization).toBe('Bearer fixture-token');

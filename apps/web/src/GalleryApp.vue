@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n';
 import { GalleryPreviewError, loadAssetPreview, type GalleryPreviewErrorCode } from './gallery-preview.js';
 import { maxGalleryThumbnailBytes, readGalleryThumbnail } from './gallery-thumbnail.js';
 import { createMediaVersion, GalleryVersionError, getMediaVersion, isTerminalVersionStatus, loadMediaVersions, loadVersionContent, normalizeCrop, type VersionCollection } from './gallery-versions.js';
+import { assetTagPath, maxLegacyTagsPerAsset, mergeAssetTags, normalizeAssetTag } from './asset-tags.js';
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
 import './gallery.css';
 
@@ -11,7 +12,7 @@ type Library = { libraryId: string; title: string };
 type Asset = {
   assetId: string; libraryId: string; originNodeId: string; kind: string; sha256: string;
   availability: 'online' | 'cached' | 'offline' | 'missing'; filename: string; capturedAt: string | null;
-  sourcePath: string | null; sourceKind: string; byteSize: number; version: string;
+  sourcePath: string | null; sourceKind: string; byteSize: number; version: string; tags?: string[];
 };
 type Page = { items: Asset[]; nextCursor: string | null };
 type Tombstone = { assetId: string; libraryId: string; eventId: string };
@@ -64,15 +65,26 @@ const theme = ref<'light' | 'dark'>(savedTheme === 'light' || savedTheme === 'da
 const scrollElement = ref<HTMLElement>();
 const scrollTop = ref(0);
 const tags = ref<Record<string, string[]>>({});
+const serverTags = ref<Record<string, string[]>>({});
+const legacyTags = ref<Record<string, string[]>>({});
+const importedLegacyTagAssets = ref<Record<string, boolean>>({});
+const legacyTagImportState = ref<'idle' | 'importing' | 'complete' | 'failed'>('idle');
+const legacyTagImportFailures = ref(0);
+const localMetadataUnavailable = ref(false);
+const legacyTagImportInFlight = new Set<string>();
+const legacyTagImportFailedKeys = new Set<string>();
 const albums = ref<Album[]>([]);
 const activeAlbum = ref('');
 const selectedAsset = ref<Asset | null>(null);
+const tagDialogError = ref('');
+const tagWriteBusy = ref(false);
 const previewAsset = ref<Asset | null>(null);
 const previewUrl = ref('');
 const previewBusy = ref(false);
 const previewErrorCode = ref<GalleryPreviewErrorCode | null>(null);
 const mediaVersionsEnabled = ref(false);
 const thumbnailsEnabled = ref(false);
+const assetTagsEnabled = ref(false);
 const tagSyncEnabled = ref(false);
 const versions = ref<VersionCollection | null>(null);
 const versionsBusy = ref(false);
@@ -130,6 +142,7 @@ const filteredAssets = computed(() => {
 const visibleStart = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeight) - 3));
 const visibleEnd = computed(() => Math.min(filteredAssets.value.length, visibleStart.value + 24));
 const visibleAssets = computed(() => filteredAssets.value.slice(visibleStart.value, visibleEnd.value));
+const hasLegacyTagData = computed(() => Object.values(legacyTags.value).some((assetTags) => assetTags.length > 0));
 const topSpacer = computed(() => visibleStart.value * rowHeight);
 const bottomSpacer = computed(() => Math.max(0, (filteredAssets.value.length - visibleEnd.value) * rowHeight));
 const apiBase = computed(() => endpoint.value.trim().replace(/\/+$/, ''));
@@ -186,9 +199,11 @@ function clearAuthorizedSession(clearCredentials = false): void {
   libraries.value = []; libraryId.value = ''; assets.value = []; cursor.value = null;
   tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
   peers.value = []; pendingPeers.value = []; peersError.value = ''; tagWriteNotice.value = ''; grantLibraryByPeer.value = {}; tagWritersByLibrary.value = {}; tagSyncStatusByPeer.value = {}; invitation.value = null; scannedInvite.value = '';
-  tags.value = {}; albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
-  tagInput.value = ''; pendingIdempotencyKeys.clear();
-  mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; tagSyncEnabled.value = false;
+  tags.value = {}; serverTags.value = {}; legacyTags.value = {}; importedLegacyTagAssets.value = {};
+  legacyTagImportState.value = 'idle'; legacyTagImportFailures.value = 0; localMetadataUnavailable.value = false; legacyTagImportInFlight.clear(); legacyTagImportFailedKeys.clear();
+  albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
+  tagInput.value = ''; tagDialogError.value = ''; tagWriteBusy.value = false; pendingIdempotencyKeys.clear();
+  mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
   closePreview(); clearThumbnailUrls();
   if (clearCredentials) { token.value = ''; tokenInput.value = ''; }
 }
@@ -260,6 +275,7 @@ async function connect(preserveSession = false): Promise<void> {
     const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
     mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
     thumbnailsEnabled.value = capabilities.includes('thumbnails');
+    assetTagsEnabled.value = capabilities.includes('assetTags');
     tagSyncEnabled.value = capabilities.includes('tagSync');
     const result = await request<{ items: Library[] }>('/v1/libraries', { signal: controller.signal });
     if (generation !== connectionGeneration) return;
@@ -311,6 +327,7 @@ async function checkHealth(): Promise<void> {
       const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
       mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
       thumbnailsEnabled.value = capabilities.includes('thumbnails');
+      assetTagsEnabled.value = capabilities.includes('assetTags');
       tagSyncEnabled.value = capabilities.includes('tagSync');
     }
     if (response.ok && !wasConnected && hasSession.value) {
@@ -320,7 +337,7 @@ async function checkHealth(): Promise<void> {
     }
   } catch (cause) {
     if (generation === healthGeneration && !isRequestAborted(cause)) {
-      connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; tagSyncEnabled.value = false;
+      connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
     }
   } finally { if (healthAbort === controller) healthAbort = undefined; }
 }
@@ -338,8 +355,12 @@ async function loadPage(reset = false, preserveOnFailure = false): Promise<boole
     if (search.value.trim()) query.set('q', search.value.trim());
     const page = await request<Page>(`/v1/assets?${query.toString()}`);
     if (generation !== pageGeneration) return false;
+    const pageTags = Object.fromEntries(page.items.map((asset) => [asset.assetId, Array.isArray(asset.tags) ? asset.tags : []]));
+    serverTags.value = reset ? pageTags : { ...serverTags.value, ...pageTags };
     assets.value = reset ? page.items : [...assets.value, ...page.items];
+    refreshTagView(page.items.map((asset) => asset.assetId));
     cursor.value = page.nextCursor ?? '';
+    void importLegacyTagsForAssets(page.items);
     return true;
   } catch (cause) {
     if (generation === pageGeneration) {
@@ -363,9 +384,10 @@ watch(libraryId, (value, previous) => {
   closePreview();
   clearThumbnailUrls();
   activeAlbum.value = '';
-  tags.value = {}; albums.value = [];
+  tags.value = {}; serverTags.value = {}; legacyTags.value = {}; importedLegacyTagAssets.value = {}; albums.value = [];
+  legacyTagImportState.value = 'idle'; legacyTagImportFailures.value = 0; legacyTagImportFailedKeys.clear();
   if (!suppressLibraryReload) { pageGeneration += 1; busy.value = false; assets.value = []; cursor.value = null; scrollTop.value = 0; }
-  if (!suppressLibraryReload && value) void loadLocalMetadata();
+  if (!suppressLibraryReload && value) void loadLocalMetadata().then(() => { if (libraryId.value === value) void importLegacyTagsForAssets(assets.value); });
   if (connected.value && !suppressLibraryReload) void loadPage(true);
 }, { flush: 'sync' });
 watch(theme, (value) => { document.documentElement.dataset.theme = value; writePreference('photomesh-ui-theme', value); }, { immediate: true });
@@ -401,6 +423,92 @@ function thumbnailCacheKey(asset: Asset): string {
 }
 function localMetadataKey(): string {
   return JSON.stringify([apiBase.value, libraryId.value]);
+}
+function refreshTagView(assetIds: readonly string[]): void {
+  const next = { ...tags.value };
+  for (const assetId of assetIds) {
+    const pendingLegacy = importedLegacyTagAssets.value[assetId] ? [] : legacyTags.value[assetId] ?? [];
+    next[assetId] = mergeAssetTags(serverTags.value[assetId] ?? [], pendingLegacy);
+  }
+  tags.value = next;
+}
+function legacyTagImportKey(metadataKey: string, assetId: string): string {
+  return JSON.stringify([metadataKey, assetId]);
+}
+async function importLegacyTagsForAssets(items: readonly Asset[]): Promise<void> {
+  if (!hasSession.value || !connected.value || !items.length) return;
+  const currentLibraryId = libraryId.value;
+  const candidates = items.filter((asset) => asset.libraryId === currentLibraryId && (legacyTags.value[asset.assetId] ?? []).length > 0);
+  if (!candidates.length) return;
+  const key = localMetadataKey();
+  if (!assetTagsEnabled.value) {
+    for (const asset of candidates) legacyTagImportFailedKeys.add(`${key}:${asset.assetId}`);
+    legacyTagImportState.value = 'failed';
+    legacyTagImportFailures.value = legacyTagImportFailedKeys.size;
+    return;
+  }
+
+  const revision = sessionRevision;
+  const isCurrent = (): boolean => revision === sessionRevision && key === localMetadataKey() && hasSession.value && currentLibraryId === libraryId.value;
+  const work = candidates.filter((asset) => !legacyTagImportInFlight.has(`${key}:${asset.assetId}`));
+  if (!work.length) return;
+  legacyTagImportState.value = 'importing';
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (nextIndex < work.length) {
+      const asset = work[nextIndex++];
+      if (!asset) continue;
+      const inFlightKey = `${key}:${asset.assetId}`;
+      legacyTagImportInFlight.add(inFlightKey);
+      const markerKey = legacyTagImportKey(key, asset.assetId);
+      try {
+        if (!isCurrent()) continue;
+        const marker = await idbGet<{ importedTags?: string[] }>('tag-imports', markerKey);
+        if (!isCurrent()) continue;
+        const rawTags = legacyTags.value[asset.assetId] ?? [];
+        const normalized = rawTags.map((rawTag) => normalizeAssetTag(rawTag));
+        if (normalized.some((tag) => !tag)) throw new NodeApiError(400);
+        const tagsToImport = mergeAssetTags(normalized as string[]);
+        if (tagsToImport.length > maxLegacyTagsPerAsset) throw new NodeApiError(400);
+        const previouslyImported = Array.isArray(marker?.importedTags)
+          ? marker.importedTags.filter((tag): tag is string => typeof tag === 'string')
+          : [];
+        const pendingTags = tagsToImport.filter((tag) => !previouslyImported.includes(tag));
+        if (!pendingTags.length) {
+          legacyTagImportFailedKeys.delete(inFlightKey);
+          importedLegacyTagAssets.value = { ...importedLegacyTagAssets.value, [asset.assetId]: true };
+          refreshTagView([asset.assetId]);
+          continue;
+        }
+        for (const tag of pendingTags) {
+          if (!isCurrent()) throw new DOMException('Session invalidated', 'AbortError');
+          await request<void>(assetTagPath(asset.libraryId, asset.assetId, tag), { method: 'PUT' });
+          if (!isCurrent()) throw new DOMException('Session invalidated', 'AbortError');
+        }
+        if (!isCurrent()) continue;
+        await idbMergeImportedTagMarker(markerKey, pendingTags);
+        if (!isCurrent()) continue;
+        legacyTagImportFailedKeys.delete(inFlightKey);
+        importedLegacyTagAssets.value = { ...importedLegacyTagAssets.value, [asset.assetId]: true };
+        serverTags.value = { ...serverTags.value, [asset.assetId]: mergeAssetTags(serverTags.value[asset.assetId] ?? asset.tags ?? [], pendingTags) };
+        refreshTagView([asset.assetId]);
+      } catch (cause) {
+        if (revision === sessionRevision && key === localMetadataKey() && !isRequestAborted(cause)) legacyTagImportFailedKeys.add(inFlightKey);
+      } finally {
+        legacyTagImportInFlight.delete(inFlightKey);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, work.length) }, () => worker()));
+  if (revision === sessionRevision && key === localMetadataKey()) {
+    legacyTagImportFailures.value = legacyTagImportFailedKeys.size;
+    legacyTagImportState.value = legacyTagImportFailures.value ? 'failed' : 'complete';
+  }
+}
+async function retryLegacyTagImport(): Promise<void> {
+  legacyTagImportState.value = 'idle';
+  legacyTagImportFailures.value = 0;
+  await importLegacyTagsForAssets(assets.value);
 }
 function clearThumbnailUrls(): void {
   cacheGeneration += 1;
@@ -905,34 +1013,71 @@ async function revokePeer(peerId: string): Promise<void> {
 }
 async function loadLocalMetadata(): Promise<void> {
   const generation = ++metadataGeneration;
-  if (!hasSession.value || !libraryId.value) { tags.value = {}; albums.value = []; return; }
+  localMetadataUnavailable.value = false;
+  if (!hasSession.value || !libraryId.value) { legacyTags.value = {}; tags.value = {}; albums.value = []; return; }
   const key = localMetadataKey();
   try {
     const [storedTags, storedAlbums] = await Promise.all([
       idbGet<Record<string, string[]>>('tags', key), idbGet<Album[]>('albums', key)
     ]);
     if (generation !== metadataGeneration || key !== localMetadataKey()) return;
-    tags.value = storedTags ?? {}; albums.value = storedAlbums ?? [];
+    legacyTags.value = storedTags ?? {};
+    importedLegacyTagAssets.value = {};
+    albums.value = storedAlbums ?? [];
+    refreshTagView(assets.value.map((asset) => asset.assetId));
   } catch {
-    if (generation === metadataGeneration) { tags.value = {}; albums.value = []; }
+    if (generation === metadataGeneration) {
+      localMetadataUnavailable.value = true;
+      legacyTags.value = {}; importedLegacyTagAssets.value = {}; albums.value = [];
+    }
   }
 }
 async function saveTagAndAlbum(): Promise<void> {
-  const tag = tagInput.value.trim(); const asset = selectedAsset.value;
-  if (!tag || !asset || !libraryId.value || !hasSession.value) return;
+  const tag = normalizeAssetTag(tagInput.value); const asset = selectedAsset.value;
+  if (!tag || !asset || !libraryId.value || !hasSession.value || !connected.value) {
+    tagDialogError.value = !tag ? t('gallery.invalidTag') : t('gallery.tagNodeOffline');
+    return;
+  }
+  if (!assetTagsEnabled.value || asset.libraryId !== libraryId.value) {
+    tagDialogError.value = t('gallery.tagApiUnavailable');
+    return;
+  }
   const key = localMetadataKey();
   const revision = sessionRevision;
-  const nextTags = { ...tags.value, [asset.assetId]: [...new Set([...(tags.value[asset.assetId] ?? []), tag])] };
   const nextAlbums = albums.value.some((album) => album.tag === tag)
     ? albums.value
     : [...albums.value, { id: crypto.randomUUID(), name: tag, tag }];
+  tagDialogError.value = '';
+  tagWriteBusy.value = true;
   try {
-    await idbPut('tags', { key, value: nextTags });
-    await idbPut('albums', { key, value: nextAlbums });
+    await request<void>(assetTagPath(asset.libraryId, asset.assetId, tag), { method: 'PUT' });
     if (revision !== sessionRevision || !hasSession.value || key !== localMetadataKey()) return;
-    tags.value = nextTags; albums.value = nextAlbums;
+    serverTags.value = { ...serverTags.value, [asset.assetId]: mergeAssetTags(serverTags.value[asset.assetId] ?? asset.tags ?? [], [tag]) };
+    refreshTagView([asset.assetId]);
+    if (nextAlbums !== albums.value) {
+      try {
+        await idbPut('albums', { key, value: nextAlbums });
+        if (revision !== sessionRevision || !hasSession.value || key !== localMetadataKey()) return;
+        albums.value = nextAlbums;
+      } catch {
+        tagDialogError.value = t('gallery.tagSavedAlbumNotSaved');
+        return;
+      }
+    }
     tagInput.value = ''; selectedAsset.value = null;
-  } catch { if (revision === sessionRevision) error.value = t('gallery.localMetadataSaveFailed'); }
+  } catch (cause) {
+    if (revision === sessionRevision && hasSession.value) tagDialogError.value = tagMutationErrorText(cause);
+  } finally {
+    if (revision === sessionRevision) tagWriteBusy.value = false;
+  }
+}
+function tagMutationErrorText(cause: unknown): string {
+  if (cause instanceof NodeApiError) {
+    if (cause.status === 400) return t('gallery.tagRejected');
+    if (cause.status === 404) return t('gallery.tagAssetUnavailable');
+    if (cause.status === 503) return t('gallery.tagServiceUnavailable');
+  }
+  return errorText(cause);
 }
 function errorText(cause: unknown): string {
   if (isRequestAborted(cause)) return '';
@@ -995,19 +1140,77 @@ onBeforeUnmount(() => {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open('photomesh-gallery-cache', 1);
-    request.onupgradeneeded = () => { for (const store of ['thumbnails', 'tags', 'albums']) if (!request.result.objectStoreNames.contains(store)) request.result.createObjectStore(store, { keyPath: 'key' }); };
-    request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    const request = indexedDB.open('photomesh-gallery-cache', 2);
+    let settled = false;
+    request.onupgradeneeded = () => {
+      for (const store of ['thumbnails', 'tags', 'albums', 'tag-imports']) {
+        if (!request.result.objectStoreNames.contains(store)) request.result.createObjectStore(store, { keyPath: 'key' });
+      }
+    };
+    request.onblocked = () => {
+      if (!settled) { settled = true; reject(new Error('IndexedDB upgrade is blocked by another PhotoMesh tab')); }
+    };
+    request.onsuccess = () => {
+      if (settled) { request.result.close(); return; }
+      settled = true;
+      request.result.onversionchange = () => request.result.close();
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      if (!settled) { settled = true; reject(request.error); }
+    };
   });
 }
 async function idbGet<T>(store: string, key: string): Promise<T | undefined> {
-  const db = await openDb(); return new Promise((resolve, reject) => { const req = db.transaction(store).objectStore(store).get(key); req.onsuccess = () => resolve(req.result?.value as T | undefined); req.onerror = () => reject(req.error); });
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(store).objectStore(store).get(key);
+    req.onsuccess = () => { const value = req.result?.value as T | undefined; db.close(); resolve(value); };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
 }
 async function idbPut(store: string, record: { key: string; value: unknown }): Promise<void> {
-  const db = await openDb(); return new Promise((resolve, reject) => { const tx = db.transaction(store, 'readwrite'); tx.objectStore(store).put(record); tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).put(record);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+    tx.onabort = () => { db.close(); reject(tx.error); };
+  });
+}
+async function idbMergeImportedTagMarker(key: string, tagsToMerge: readonly string[]): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('tag-imports', 'readwrite');
+    const store = tx.objectStore('tag-imports');
+    let importedTags: string[] = [];
+    let rejected = false;
+    const rejectOnce = (cause: DOMException | null): void => {
+      if (!rejected) { rejected = true; reject(cause ?? new Error('Could not update legacy tag import marker')); }
+    };
+    const get = store.get(key);
+    get.onsuccess = () => {
+      const current = get.result?.value as { importedTags?: unknown } | undefined;
+      const existing = Array.isArray(current?.importedTags) ? current.importedTags.filter((tag): tag is string => typeof tag === 'string') : [];
+      importedTags = mergeAssetTags(existing, tagsToMerge);
+      store.put({ key, value: { importedTags } });
+    };
+    get.onerror = () => { db.close(); rejectOnce(get.error); };
+    tx.oncomplete = () => { db.close(); if (!rejected) resolve(); };
+    tx.onerror = () => { db.close(); rejectOnce(tx.error); };
+    tx.onabort = () => { db.close(); rejectOnce(tx.error); };
+  });
 }
 async function idbClear(store: string): Promise<void> {
-  const db = await openDb(); return new Promise((resolve, reject) => { const tx = db.transaction(store, 'readwrite'); tx.objectStore(store).clear(); tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).clear();
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+    tx.onabort = () => { db.close(); reject(tx.error); };
+  });
 }
 </script>
 
@@ -1206,6 +1409,33 @@ async function idbClear(store: string): Promise<void> {
             {{ error }}
           </div>
           <div
+            v-if="localMetadataUnavailable"
+            class="notice error-notice"
+            role="alert"
+          >
+            {{ t('gallery.localMetadataUnavailable') }}
+          </div>
+          <div
+            v-if="hasLegacyTagData"
+            class="notice"
+            :class="legacyTagImportState === 'failed' ? 'error-notice' : 'offline-notice'"
+            :role="legacyTagImportState === 'failed' ? 'alert' : 'status'"
+          >
+            <span v-if="legacyTagImportState === 'importing'">{{ t('gallery.legacyTagImporting') }}</span>
+            <span v-else-if="legacyTagImportState === 'complete'">{{ t('gallery.legacyTagImportComplete') }}</span>
+            <span v-else-if="legacyTagImportState === 'failed' && !assetTagsEnabled">{{ t('gallery.legacyTagImportUnsupported') }}</span>
+            <span v-else-if="legacyTagImportState === 'failed'">{{ t('gallery.legacyTagImportFailed', { count: legacyTagImportFailures }) }}</span>
+            <span v-else>{{ t('gallery.legacyTagImportPending') }}</span>
+            <button
+              v-if="legacyTagImportState === 'failed' && assetTagsEnabled && connected"
+              type="button"
+              class="secondary-button"
+              @click="retryLegacyTagImport"
+            >
+              {{ t('gallery.retryLegacyTagImport') }}
+            </button>
+          </div>
+          <div
             v-if="activeAlbum"
             class="filter-chip"
           >
@@ -1295,7 +1525,8 @@ async function idbClear(store: string): Promise<void> {
                   class="icon-button"
                   :aria-label="t('gallery.addTag')"
                   :title="t('gallery.addTag')"
-                  @click="selectedAsset = asset; tagInput = ''"
+                  :disabled="!hasSession || !connected || !assetTagsEnabled"
+                  @click="selectedAsset = asset; tagInput = ''; tagDialogError = ''"
                 >
                   ＋
                 </button><button
@@ -1978,8 +2209,16 @@ async function idbClear(store: string): Promise<void> {
           v-model="tagInput"
           autofocus
           :placeholder="t('gallery.tagPlaceholder')"
+          :disabled="tagWriteBusy || !assetTagsEnabled || !connected"
+          @input="tagDialogError = ''"
           @keydown.enter.prevent="saveTagAndAlbum"
-        ></label><p class="muted">{{ t('gallery.tagPrivacy') }}</p><div class="dialog-actions">
+        ></label><p class="muted">{{ t('gallery.tagPrivacy') }}</p><p
+          v-if="tagDialogError"
+          class="notice error-notice"
+          role="alert"
+        >
+          {{ tagDialogError }}
+        </p><div class="dialog-actions">
           <button
             class="secondary-button"
             @click="selectedAsset = null"
@@ -1987,10 +2226,10 @@ async function idbClear(store: string): Promise<void> {
             {{ t('gallery.cancel') }}
           </button><button
             class="primary-button small-primary"
-            :disabled="!tagInput.trim()"
+            :disabled="!tagInput.trim() || tagWriteBusy || !assetTagsEnabled || !connected"
             @click="saveTagAndAlbum"
           >
-            {{ t('gallery.saveTag') }}
+            {{ tagWriteBusy ? t('gallery.savingTag') : t('gallery.saveTag') }}
           </button>
         </div>
       </section>

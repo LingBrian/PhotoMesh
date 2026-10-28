@@ -44,6 +44,14 @@
 - 验证记录（2026-10-27，PM-041 隔离 worktree）：`pnpm install --frozen-lockfile`、`pnpm lint`、`pnpm typecheck`、`pnpm test`、`pnpm contracts:check`、`pnpm build` 全部通过；Node Agent 190 项测试、contracts 12 项测试通过，Node Agent 总覆盖率 91.67% 行/83.73% 分支。
 - 本实现未执行生产数据库迁移，也未宣称 PM-042/043 或实机验收完成。
 
+## PM-043 Web 集成决策（2026-10-28）
+
+- 用户已批准继续推进 PM-043 至 PM-100；本节记录 PM-043 的具体集成边界。Web 只从当前经过管理员 Bearer 与图库 ACL 授权的 Node `GET /v1/assets` 读取标签，且仅当 `/v1/health` 宣告 `assetTags` 能力时提供编辑。新增标签沿用单元素 `PUT`；只有收到 `204` 后才更新服务端标签视图。虚拟相册仍单独保存在浏览器 IndexedDB。
+- 旧浏览器标签在相应资产页加载时逐资产、逐元素幂等 `PUT` 合并，绝不整组覆盖 Node 状态；尚未加载的资产会保留在本地缓存，直至其页加载后再导入。旧 `tags` store 保持不变；新增的 `tag-imports` store 保存每资产已成功导入的标签集合，且每次用单个 IndexedDB readwrite transaction 读取、合并、写回，避免多标签页并发覆盖标记；后续仅合并新增加的本地旧标签，并避免重连把已导入、后来由用户删除的标签复活。Node REST 写入使用节点持久化身份 `identity.peerId` 作为事件作者（不同管理员 Bearer 在同一 Node 上共用此写入身份），因此标记按节点源/图库/资产共享而非按浏览器 token 分割。该 API 未向 Web 暴露稳定节点身份字段；若在同一源地址复用库 ID 并替换节点身份，自动识别不在 PM-043 范围内，旧 `tags` 缓存仍保留以便后续人工恢复。浏览器 IndexedDB 升至版本 2 仅新增 store，不删除或重写已有标签；导入失败/超限/标签无效时保留并显示本地旧标签及重试提示。
+- 本切片不新增 Node 路由、SQLite migration、同步协议或生产数据操作。对失败/离线请求不作乐观成功；128 UTF-8 字节与服务端每作者 64 标签上限由本地预检及 Node 权威校验共同保障。
+- PM-043 验收包含：授权 API 写入、服务端已有标签保留、刷新后从 Node 恢复、旧缓存仍存在、无效或超长旧标签保留且明确提示、HTTP 拒绝/网络失败不改变标签视图或关闭编辑器。
+- 验证记录（2026-10-28，PM-043 隔离分支）：`pnpm install --frozen-lockfile`、`pnpm lint`、`pnpm typecheck`、`pnpm test`、`pnpm contracts:check`、`pnpm build` 均通过；Node Agent 241 项测试通过，行覆盖率 92.05%、分支覆盖率 83.76%；完整 Playwright 20 项通过。未修改 Node/SQLite schema，未执行生产迁移。
+
 ## 审批记录
 
-用户已批准元素级 `PUT/DELETE`（而非整组替换）、`GET /v1/assets` 增加 `tags` 字段、大小写敏感且仅 trim、128 字节/64 标签上限，以及“旧二进制回滚必须恢复迁移前备份且会丢失其后新增标签”的明确限制。批准范围仅包括隔离分支 PM-041 的实现与测试；生产迁移、push、merge、release 仍需单独审批。
+用户已批准元素级 `PUT/DELETE`（而非整组替换）、`GET /v1/assets` 增加 `tags` 字段、大小写敏感且仅 trim、128 字节/64 标签上限，以及“旧二进制回滚必须恢复迁移前备份且会丢失其后新增标签”的明确限制。此前批准范围仅包括隔离分支 PM-041 的实现与测试；2026-10-28 用户另行授权继续 PM-043–PM-100 的分阶段开发。生产迁移、push、merge、release 仍需按具体操作执行审批与安全门禁。
