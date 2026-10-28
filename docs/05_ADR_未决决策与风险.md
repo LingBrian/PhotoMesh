@@ -154,6 +154,6 @@
 
 ## ADR-018：PM-045 虚拟相册同步与删除范围
 
-- **状态：** 提案待用户明确批准；独立只读架构审查未发现阻止提交默认选项的 blocker。详见 [`ADR-018`](adr/ADR-018-pm045-virtual-album-sync.md)。在用户对ADR问题列表作答前，不实施协议、ACL或schema变更。
-- **提案重点：** 独立 `virtual-albums-v1` stream；历史操作 bootstrap/no-op/key namespace；album-write 与可选 album-delete 授权；tombstone asset 的 history/projection 分离；local-only 与 global shared soft delete 可选范围；N/N-1与错误序列恢复有界策略。
+- **状态：** 用户于2026-10-28批准 ADR-018 推荐默认项1–11；仅限隔离分支协议/API/schema实现、测试和本地提交。详见 [`ADR-018`](adr/ADR-018-pm045-virtual-album-sync.md)。生产迁移、push、merge、release未获授权。
+- **批准重点：** 独立 `virtual-albums-v1` stream；历史操作 bootstrap/no-op/key namespace；独立 album-write/album-delete grants；tombstone asset 的 history/projection 分离；local-only 与 global shared soft delete；N/N-1与错误序列恢复有界策略。
 - **剩余边界：** Q09 的回收站保留期限/到期可见性由PM-061设计；永久 purge/审批另由PM-063处理。PM-045不做物理清除，也不授权生产迁移/push/merge/release。
