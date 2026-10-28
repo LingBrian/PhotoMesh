@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { makeUnsignedEvent, parseEventEnvelope, signEvent, signingBytes, verifyEvent, type JsonValue } from '../src/sync/event-envelope.js';
+import { makeUnsignedEvent, parseEventEnvelope, signEvent, signingBytes, verifyEnvelopeSignature, verifyEvent, type JsonValue } from '../src/sync/event-envelope.js';
 import { loadOrCreateLocalIdentity } from '../src/auth/local-identity.js';
 import { SqliteRepository } from '../src/db/repository.js';
 import Database from 'better-sqlite3';
@@ -21,6 +21,23 @@ describe('signed EventEnvelope', () => {
     expect(await verifyEvent({ ...signed, payload: { ...(signed.payload as Record<string, JsonValue>), byteLength: 11 } }, publicKeyText(identity))).toBe(false);
     const stranger = await makeIdentity();
     expect(await verifyEvent(signed, publicKeyText(stranger))).toBe(false);
+  });
+
+  it('can verify the author signature of a schema-invalid envelope before quarantining it', async () => {
+    const identity = await makeIdentity();
+    const valid = makeUnsignedEvent({
+      libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 1, causalParents: [],
+      eventType: 'album.created', payload: { albumId: '123e4567-e89b-42d3-a456-426614174000', title: 'Trip', createdAt: '2026-10-21T00:00:00.000Z' },
+      createdAt: '2026-10-21T00:00:00.000Z'
+    });
+    const signedInvalid = await signEvent({ ...valid, payload: { albumId: 'invalid', title: '', createdAt: 'not-a-date' } }, identity);
+    expect(await verifyEvent(signedInvalid, publicKeyText(identity))).toBe(false);
+    expect(await verifyEnvelopeSignature(signedInvalid, publicKeyText(identity))).toBe(true);
+    const oversizedUnsigned = { ...valid, eventType: 'asset.metadata.updated', payload: { assetId: 'asset-1', fields: { description: 'x'.repeat(300_000) } } };
+    const oversized = { ...oversizedUnsigned, signature: Buffer.from(await identity.privateKey.sign(signingBytes(oversizedUnsigned))).toString('base64url') };
+    expect(await verifyEvent(oversized as never, publicKeyText(identity))).toBe(false);
+    expect(await verifyEnvelopeSignature(oversized, publicKeyText(identity))).toBe(true);
+    expect(() => parseEventEnvelope(oversized)).toThrow('event exceeds maximum size');
   });
 
   it('rejects malformed, oversized, duplicate-parent and unsupported local events', async () => {

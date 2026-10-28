@@ -2,7 +2,7 @@ import { constants as fsConstants } from 'node:fs';
 import { access, mkdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import Database from 'better-sqlite3';
-import { SqliteRepository, verifySqliteIntegrity } from './db/repository.js';
+import { SqliteRepository, verifySqliteIntegrity, RepositoryConflictError } from './db/repository.js';
 import { createNodeAgentServer } from './server.js';
 import { createShutdownHandler } from './lifecycle.js';
 import { NodeUploadFileSystem } from './uploads/file-system.js';
@@ -25,6 +25,8 @@ import { SyncRepository } from './sync/sync-repository.js';
 import { SyncService } from './sync/sync-service.js';
 import { TagSyncRepository } from './sync/tag-sync-repository.js';
 import { TagSyncService } from './sync/tag-sync-service.js';
+import { AlbumSyncRepository } from './sync/album-sync-repository.js';
+import { AlbumSyncService } from './sync/album-sync-service.js';
 import { TombstoneRestoreCoordinator } from './sync/restore-coordinator.js';
 import { restoreTombstoneOperation } from './sync/restore-operation.js';
 
@@ -52,6 +54,8 @@ let lanNode: LanPairingNode | undefined;
 let syncService: SyncService | undefined;
 let tagSyncRepository: TagSyncRepository | undefined;
 let tagSyncService: TagSyncService | undefined;
+let albumSyncRepository: AlbumSyncRepository | undefined;
+let albumSyncService: AlbumSyncService | undefined;
 let nodeId = process.env.PHOTOMESH_NODE_ID ?? 'local-node';
 let albumPeerId: string | undefined;
 try {
@@ -64,23 +68,31 @@ try {
   albumPeerId = identity.peerId;
   pairing = new PairingService(repository, identity.peerId, pairingApprovals.request);
   tagSyncRepository = new TagSyncRepository(database);
+  albumSyncRepository = new AlbumSyncRepository(database);
   syncService = new SyncService(new SyncRepository(database), identity, pairing, undefined, (event) => {
     const payload = event.payload;
     if (typeof payload === 'object' && payload !== null && !Array.isArray(payload) &&
         ['asset.indexed', 'asset.tombstoned', 'asset.restored'].includes(event.eventType) &&
         typeof payload.assetId === 'string') {
       tagSyncRepository!.rebuildAssetTagProjection(event.libraryId, payload.assetId);
+      albumSyncRepository!.rebuildMembershipsForAsset(event.libraryId, payload.assetId);
     }
     tagSyncRepository!.reconcilePendingEvents(event.libraryId);
-  }, true);
+    albumSyncRepository!.reconcilePendingEvents(event.libraryId);
+  }, true, Boolean(albumPeerId));
   tagSyncService = new TagSyncService(tagSyncRepository, identity, pairing, () => syncService!.hello());
+  albumSyncService = new AlbumSyncService(albumSyncRepository, identity, pairing, () => syncService!.hello());
+  repository.setAlbumOperationEventDrafter((input) => { albumSyncService!.reserveLocalOperation(input); });
+  repository.setAlbumLifecycleEventDrafter((input) => { albumSyncService!.reserveLocalLifecycleOperation(input); });
   await syncService.signPendingLocalEvents();
   await syncService.reconcileLocalAssets();
   await tagSyncService.reconcileLegacyTagSeeds();
+  albumSyncService.reconcileLegacyOperations();
+  await albumSyncService.signPendingLocalEvents();
   const listenAddresses = (process.env.PHOTOMESH_LAN_BIND_ADDRESSES ?? '').split(',').map((value) => value.trim()).filter(Boolean);
   if (listenAddresses.length > 0) {
     lanNode = await LanPairingNode.start({
-      identity, pairing, listenAddresses, syncService, tagSyncService,
+      identity, pairing, listenAddresses, syncService, tagSyncService, albumSyncService,
       listenPort: Number(process.env.PHOTOMESH_P2P_PORT ?? 0)
     });
     process.stdout.write(`PhotoMesh LAN pairing enabled on ${listenAddresses.length} configured interface(s)\n`);
@@ -134,7 +146,7 @@ const uploadService = new UploadService({
   } : {})
 });
 
-const pairingControl: PairingServerControl | undefined = pairing && tagSyncRepository ? {
+const pairingControl: PairingServerControl | undefined = pairing && tagSyncRepository && albumSyncRepository ? {
   createInvite: () => {
     if (!lanNode) throw new Error('LAN pairing is not listening on a configured private interface');
     return lanNode.createInvite();
@@ -152,6 +164,43 @@ const pairingControl: PairingServerControl | undefined = pairing && tagSyncRepos
   revokeTagWrite: (peerId, libraryId) => tagSyncRepository!.revokeTagWriter(libraryId, peerId, new Date().toISOString()),
   listTagWriters: (libraryId) => tagSyncRepository!.listTagWriters(libraryId),
   getTagSyncStatus: (peerId) => tagSyncRepository!.getPeerSyncStatus(peerId),
+  grantAlbumWrite: (peerId, libraryId, grantedAt) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId)) return undefined;
+    if (!pairing!.listPeers().some((peer) => peer.peerId === peerId && peer.trustState === 'trusted')) throw new RepositoryConflictError('peer is not trusted');
+    albumSyncRepository!.setAlbumWriteGrant(libraryId, peerId, grantedAt);
+    return { peerId, libraryId, permission: 'album-write' as const, granted: true };
+  },
+  revokeAlbumWrite: (peerId, libraryId, revokedAt) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId) || !pairing!.listPeers().some((peer) => peer.peerId === peerId)) return undefined;
+    albumSyncRepository!.revokeAlbumWriteGrant(libraryId, peerId, revokedAt);
+    return { peerId, libraryId, permission: 'album-write' as const, granted: false };
+  },
+  grantAlbumDelete: (peerId, libraryId, grantedAt) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId)) return undefined;
+    if (!pairing!.listPeers().some((peer) => peer.peerId === peerId && peer.trustState === 'trusted')) throw new RepositoryConflictError('peer is not trusted');
+    albumSyncRepository!.setAlbumDeleteGrant(libraryId, peerId, grantedAt);
+    return { peerId, libraryId, permission: 'album-delete' as const, granted: true };
+  },
+  revokeAlbumDelete: (peerId, libraryId, revokedAt) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId) || !pairing!.listPeers().some((peer) => peer.peerId === peerId)) return undefined;
+    albumSyncRepository!.revokeAlbumDeleteGrant(libraryId, peerId, revokedAt);
+    return { peerId, libraryId, permission: 'album-delete' as const, granted: false };
+  },
+  listAlbumSyncGrants: (libraryId) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId)) return undefined;
+    const grants = albumSyncRepository!.listAlbumSyncGrants(libraryId).flatMap((grant) => [
+      ...(grant.writeGranted ? [{ peerId: grant.peerId, libraryId, permission: 'album-write' as const, granted: true }] : []),
+      ...(grant.deleteGranted ? [{ peerId: grant.peerId, libraryId, permission: 'album-delete' as const, granted: true }] : [])
+    ]);
+    return { grants };
+  },
+  getAlbumSyncStatus: (peerId) => {
+    if (!pairing!.listPeers().some((peer) => peer.peerId === peerId)) return undefined;
+    const status = albumSyncRepository!.getPeerSyncStatus(peerId);
+    const lastErrorCode = status.lastError === null ? null : /denied|unauthori[sz]ed|write/i.test(status.lastError)
+      ? 'unauthorized' as const : /conflict|invalid|sequence/i.test(status.lastError) ? 'conflict' as const : 'unavailable' as const;
+    return { peerId, pendingEvents: status.pending, lastErrorCode };
+  },
   readLibraryIndex: (peerId, libraryId) => pairing!.readLibraryIndex(peerId, libraryId),
   listDiscoveredPeers: () => lanNode?.listDiscoveredPeers() ?? [],
   dialManualIp: async (host, port, peerId) => {
@@ -200,11 +249,34 @@ const server = createNodeAgentServer({
   },
   ...(albumPeerId ? { albums: {
     listAlbums: (libraryId: string, cursor: string | undefined, limit: number) => repository.listAlbums(libraryId, cursor, limit),
-    createAlbum: (input) => repository.createAlbum({ ...input, authorPeerId: albumPeerId! }),
+    createAlbum: async (input) => {
+      const result = repository.createAlbum({ ...input, authorPeerId: albumPeerId! });
+      await albumSyncService!.signPendingLocalEvents();
+      return result;
+    },
     listMembers: (libraryId: string, albumId: string, cursor: string | undefined, limit: number) =>
       repository.listAlbumMembers(libraryId, albumId, cursor, limit),
-    addMember: (input) => repository.addAlbumMember({ ...input, authorPeerId: albumPeerId! }),
-    removeMember: (input) => repository.removeAlbumMember({ ...input, authorPeerId: albumPeerId! })
+    deleteAlbum: async (input) => {
+      const result = repository.deleteAlbum({ ...input, authorPeerId: albumPeerId! });
+      await albumSyncService!.signPendingLocalEvents();
+      return result;
+    },
+    listDeletedAlbums: (libraryId, scope, cursor, limit) => repository.listDeletedAlbums(libraryId, scope, cursor, limit),
+    restoreAlbum: async (input) => {
+      const result = repository.restoreAlbum({ ...input, authorPeerId: albumPeerId! });
+      await albumSyncService!.signPendingLocalEvents();
+      return result;
+    },
+    addMember: async (input) => {
+      const result = repository.addAlbumMember({ ...input, authorPeerId: albumPeerId! });
+      await albumSyncService!.signPendingLocalEvents();
+      return result;
+    },
+    removeMember: async (input) => {
+      const result = repository.removeAlbumMember({ ...input, authorPeerId: albumPeerId! });
+      await albumSyncService!.signPendingLocalEvents();
+      return result;
+    }
   } } : {}),
   tagSync: Boolean(tagSyncService),
   ...(tagSyncService ? { assetTags: {

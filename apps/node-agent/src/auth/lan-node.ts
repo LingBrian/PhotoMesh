@@ -12,12 +12,14 @@ import type { LocalIdentity } from './local-identity.js';
 import { PAIRING_PROTOCOL_VERSION, PairingRejectedError, PairingService, type PairingQrPayload } from './pairing-service.js';
 import { isSyncExchangeRequest, SYNC_PROTOCOL, SyncService, type SyncExchangeRequest, type SyncExchangeResponse, type SyncTransport } from '../sync/sync-service.js';
 import { isTagSyncExchangeRequest, TAG_SYNC_CAPABILITY, TAG_SYNC_PROTOCOL, TagSyncService, type TagSyncExchangeRequest, type TagSyncExchangeResponse, type TagSyncTransport } from '../sync/tag-sync-service.js';
+import { ALBUM_SYNC_CAPABILITY, ALBUM_SYNC_PROTOCOL, AlbumSyncService, isAlbumSyncExchangeRequest, type AlbumSyncExchangeRequest, type AlbumSyncExchangeResponse, type AlbumSyncTransport } from '../sync/album-sync-service.js';
 
 const PAIR_PROTOCOL = '/photomesh/pairing/1.0.0';
 const INDEX_PROTOCOL = '/photomesh/library-index/1.0.0';
 const MAX_FRAME_BYTES = 32 * 1024;
 const MAX_SYNC_FRAME_BYTES = 18 * 1024 * 1024;
 const MAX_TAG_SYNC_FRAME_BYTES = 18 * 1024 * 1024;
+const MAX_ALBUM_SYNC_FRAME_BYTES = 16 * 1024 * 1024;
 
 export interface DiscoveredPeer { peerId: string; addresses: string[] }
 
@@ -29,9 +31,10 @@ export interface LanNodeOptions {
   listenPort?: number;
   syncService?: SyncService;
   tagSyncService?: TagSyncService;
+  albumSyncService?: AlbumSyncService;
 }
 
-export class LanPairingNode implements SyncTransport, TagSyncTransport {
+export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyncTransport {
   private readonly discovered = new Map<string, Set<string>>();
   private readonly syncTasks = new Map<string, Promise<{ rounds: number; received: number; sent: number }>>();
   private syncTimer: ReturnType<typeof setInterval> | undefined;
@@ -43,13 +46,16 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport {
     private readonly pairing: PairingService,
     private readonly publicKey: Uint8Array,
     private readonly syncService?: SyncService,
-    private readonly tagSyncService?: TagSyncService
+    private readonly tagSyncService?: TagSyncService,
+    private readonly albumSyncService?: AlbumSyncService
   ) {}
 
   static async start(options: LanNodeOptions): Promise<LanPairingNode> {
-    if (options.tagSyncService && !options.syncService) throw new Error('tag sync requires event sync capability negotiation');
+    if ((options.tagSyncService || options.albumSyncService) && !options.syncService) throw new Error('extension sync requires event sync capability negotiation');
     const advertisesTagSync = options.syncService?.hello().capabilities.includes(TAG_SYNC_CAPABILITY) ?? false;
     if (advertisesTagSync !== Boolean(options.tagSyncService)) throw new Error('tag sync capability must match its transport handler');
+    const advertisesAlbumSync = options.syncService?.hello().capabilities.includes(ALBUM_SYNC_CAPABILITY) ?? false;
+    if (advertisesAlbumSync !== Boolean(options.albumSyncService)) throw new Error('album sync capability must match its transport handler');
     const privateAddresses = [...new Set(options.listenAddresses)].map(normalizePrivateLanAddress);
     if (privateAddresses.length === 0) throw new Error('explicit private LAN listen addresses are required');
     const node = await createLibp2p({
@@ -57,7 +63,7 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport {
       addresses: { listen: privateAddresses.map((address) => `${address}/tcp/${options.listenPort ?? 0}`) },
       transports: [tcp()], connectionEncrypters: [noise()], streamMuxers: [yamux()], peerDiscovery: [mdns()]
     });
-    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey, options.syncService, options.tagSyncService);
+    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey, options.syncService, options.tagSyncService, options.albumSyncService);
     node.addEventListener('peer:discovery', (event) => {
       const detail = event.detail as { id: { toString(): string }; multiaddrs?: Array<{ toString(): string }> };
       const peerId = detail.id.toString();
@@ -121,6 +127,16 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport {
         await writeFrame(stream, { ...response }, MAX_TAG_SYNC_FRAME_BYTES);
       } catch {
         await writeFrame(stream, { ok: false, error: 'tag_sync_rejected' }, MAX_TAG_SYNC_FRAME_BYTES).catch(() => undefined);
+      }
+    });
+    if (options.albumSyncService) node.handle(ALBUM_SYNC_PROTOCOL, async (stream, connection) => {
+      try {
+        const message = await readFrame(stream, MAX_ALBUM_SYNC_FRAME_BYTES);
+        if (!isAlbumSyncExchangeRequest(message)) throw new Error('invalid album sync request');
+        const response = await options.albumSyncService!.handleExchange(connection.remotePeer.toString(), message);
+        await writeFrame(stream, { ...response }, MAX_ALBUM_SYNC_FRAME_BYTES);
+      } catch {
+        await writeFrame(stream, { ok: false, error: 'album_sync_rejected' }, MAX_ALBUM_SYNC_FRAME_BYTES).catch(() => undefined);
       }
     });
     await node.start();
@@ -201,6 +217,14 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport {
     return response as unknown as TagSyncExchangeResponse;
   }
 
+  async exchangeAlbums(peerId: string, request: AlbumSyncExchangeRequest): Promise<AlbumSyncExchangeResponse> {
+    const stream = await this.node.dialProtocol(peerIdFromString(peerId), ALBUM_SYNC_PROTOCOL);
+    await writeFrame(stream, { ...request }, MAX_ALBUM_SYNC_FRAME_BYTES);
+    const response = await readFrame(stream, MAX_ALBUM_SYNC_FRAME_BYTES);
+    if (response.ok === false || typeof response.hello !== 'object' || response.hello === null) throw new Error('peer rejected album sync exchange');
+    return response as unknown as AlbumSyncExchangeResponse;
+  }
+
   async syncWithPeer(peerId: string): Promise<{ rounds: number; received: number; sent: number }> {
     if (this.stopping) throw new Error('LAN node is stopping');
     if (!this.syncService) throw new Error('event sync is not configured');
@@ -213,6 +237,13 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport {
           await this.tagSyncService.syncWithPeer(peerId, this);
         } else {
           this.tagSyncService.markPeerUnsupported(peerId);
+        }
+      }
+      if (this.albumSyncService) {
+        if (this.syncService!.peerSupportsCapability(peerId, ALBUM_SYNC_CAPABILITY)) {
+          await this.albumSyncService.syncWithPeer(peerId, this);
+        } else {
+          this.albumSyncService.markPeerUnsupported(peerId);
         }
       }
       return result;

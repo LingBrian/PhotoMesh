@@ -3,7 +3,8 @@ const maxCursorBytes = 2048;
 
 export type AlbumCursorScope =
   | { collection: 'albums'; libraryId: string }
-  | { collection: 'members'; libraryId: string; albumId: string };
+  | { collection: 'members'; libraryId: string; albumId: string }
+  | { collection: 'deleted'; libraryId: string; scope: 'all' | 'local' | 'global' };
 
 export class InvalidAlbumCursorError extends Error {
   constructor() {
@@ -26,6 +27,7 @@ export function encodeAlbumCursor(scope: AlbumCursorScope, lastId: string): stri
     collection: scope.collection,
     libraryId: scope.libraryId,
     ...(scope.collection === 'members' ? { albumId: scope.albumId } : {}),
+    ...(scope.collection === 'deleted' ? { scope: scope.scope } : {}),
     lastId
   };
   const token = Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
@@ -45,13 +47,16 @@ export function decodeAlbumCursor(token: string, expectedScope: AlbumCursorScope
     const candidate = value as Record<string, unknown>;
     const expectedKeys = expectedScope.collection === 'members'
       ? ['version', 'collection', 'libraryId', 'albumId', 'lastId']
-      : ['version', 'collection', 'libraryId', 'lastId'];
+      : expectedScope.collection === 'deleted'
+        ? ['version', 'collection', 'libraryId', 'scope', 'lastId']
+        : ['version', 'collection', 'libraryId', 'lastId'];
     if (Object.keys(candidate).length !== expectedKeys.length || expectedKeys.some((key) => !Object.hasOwn(candidate, key))) {
       throw new InvalidAlbumCursorError();
     }
     if (candidate.version !== 1 || candidate.collection !== expectedScope.collection ||
       candidate.libraryId !== expectedScope.libraryId ||
       (expectedScope.collection === 'members' && candidate.albumId !== expectedScope.albumId) ||
+      (expectedScope.collection === 'deleted' && candidate.scope !== expectedScope.scope) ||
       typeof candidate.lastId !== 'string' || !isValidIdentifier(candidate.lastId)) {
       throw new InvalidAlbumCursorError();
     }
@@ -64,7 +69,8 @@ export function decodeAlbumCursor(token: string, expectedScope: AlbumCursorScope
 
 function isValidScope(scope: AlbumCursorScope): boolean {
   return isValidIdentifier(scope.libraryId) &&
-    (scope.collection === 'albums' || scope.collection === 'members' && isValidIdentifier(scope.albumId));
+    (scope.collection === 'albums' || scope.collection === 'members' && isValidIdentifier(scope.albumId) ||
+     scope.collection === 'deleted' && ['all', 'local', 'global'].includes(scope.scope));
 }
 
 function isValidIdentifier(value: string): boolean {

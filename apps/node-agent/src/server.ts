@@ -53,12 +53,23 @@ export interface AlbumMutationRequest {
   createdAt: string;
 }
 
+export type AlbumDeleteScope = 'local' | 'global';
+export type AlbumDeletedQueryScope = 'all' | AlbumDeleteScope;
+export interface DeletedAlbumRecord extends AlbumRecord { scopes: AlbumDeleteScope[]; deletedAt: string }
+export interface DeletedAlbumPage { items: DeletedAlbumRecord[]; nextCursor: string | null }
+
+export type AlbumDeletionResult = 'deleted' | 'already_deleted' | 'not_found' | 'writer_limit';
+export type AlbumRestoreResult = 'restored' | 'already_active' | 'not_found' | 'writer_limit';
+
 export interface AlbumServerControl {
   listAlbums(libraryId: string, cursor: string | undefined, limit: number): AlbumPage | undefined | Promise<AlbumPage | undefined>;
   createAlbum(input: AlbumMutationRequest & { title: string }): AlbumRecord | 'writer_limit' | undefined | Promise<AlbumRecord | 'writer_limit' | undefined>;
   listMembers(libraryId: string, albumId: string, cursor: string | undefined, limit: number): AlbumMemberPage | undefined | Promise<AlbumMemberPage | undefined>;
   addMember(input: AlbumMutationRequest & { albumId: string; assetId: string }): AlbumMemberMutationResult | Promise<AlbumMemberMutationResult>;
   removeMember(input: AlbumMutationRequest & { albumId: string; assetId: string }): AlbumMemberMutationResult | Promise<AlbumMemberMutationResult>;
+  deleteAlbum?(input: AlbumMutationRequest & { albumId: string; scope: AlbumDeleteScope }): AlbumDeletionResult | Promise<AlbumDeletionResult>;
+  listDeletedAlbums?(libraryId: string, scope: AlbumDeletedQueryScope, cursor: string | undefined, limit: number): DeletedAlbumPage | undefined | Promise<DeletedAlbumPage | undefined>;
+  restoreAlbum?(input: AlbumMutationRequest & { albumId: string; scope: AlbumDeleteScope }): AlbumRestoreResult | Promise<AlbumRestoreResult>;
 }
 
 const unavailableDiagnostics: HealthDiagnosticsSource = {
@@ -96,6 +107,11 @@ export interface AssetTagServerControl {
   removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
 }
 
+export type AlbumSyncPermission = 'album-write' | 'album-delete';
+export interface AlbumSyncGrantStatus { peerId: string; libraryId: string; permission: AlbumSyncPermission; granted: boolean }
+export interface AlbumSyncGrantList { grants: AlbumSyncGrantStatus[] }
+export interface AlbumSyncPeerStatus { peerId: string; pendingEvents: number; lastErrorCode: 'unauthorized' | 'unavailable' | 'conflict' | null }
+
 export interface PairingServerControl {
   createInvite(): PairingQrPayload;
   pairWithInvite(invite: PairingQrPayload, label: string, manualIp?: { host: string; port: number }): Promise<{ hostPeerId: string }>;
@@ -108,6 +124,12 @@ export interface PairingServerControl {
   revokeTagWrite?(peerId: string, libraryId: string): boolean;
   listTagWriters?(libraryId: string): string[];
   getTagSyncStatus?(peerId: string): { pending: number; lastError: string | null };
+  grantAlbumWrite?(peerId: string, libraryId: string, grantedAt: string): AlbumSyncGrantStatus | undefined;
+  revokeAlbumWrite?(peerId: string, libraryId: string, revokedAt: string): AlbumSyncGrantStatus | undefined;
+  grantAlbumDelete?(peerId: string, libraryId: string, grantedAt: string): AlbumSyncGrantStatus | undefined;
+  revokeAlbumDelete?(peerId: string, libraryId: string, revokedAt: string): AlbumSyncGrantStatus | undefined;
+  listAlbumSyncGrants?(libraryId: string): AlbumSyncGrantList | undefined;
+  getAlbumSyncStatus?(peerId: string): AlbumSyncPeerStatus | undefined;
   readLibraryIndex(peerId: string, libraryId: string): unknown[] | undefined;
   listDiscoveredPeers(): Array<{ peerId: string; addresses: string[] }>;
   dialManualIp(host: string, port: number, peerId: string): Promise<{ peerId: string; addresses: string[] }>;
@@ -466,14 +488,18 @@ async function handleAlbumRequest(
   request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string, url: URL
 ): Promise<boolean> {
   const collection = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums$/);
+  const deleted = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/deleted$/);
   const members = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/members$/);
   const member = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/members\/([^/]+)$/);
-  const route = collection || members || member;
+  const deletion = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/deletion$/);
+  const restore = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/restore$/);
+  const route = collection || deleted || members || member || deletion || restore;
   if (!route) return false;
   response.setHeader('cache-control', 'private, no-store');
-  const allowed = collection
-    ? request.method === 'GET' || request.method === 'POST'
-    : members ? request.method === 'GET' : request.method === 'PUT' || request.method === 'DELETE';
+  const allowed = collection ? request.method === 'GET' || request.method === 'POST'
+    : deleted || members ? request.method === 'GET'
+      : member ? request.method === 'PUT' || request.method === 'DELETE'
+        : deletion || restore ? request.method === 'POST' : false;
   if (!allowed) return false;
 
   const token = bearerToken(request);
@@ -482,9 +508,9 @@ async function handleAlbumRequest(
     return true;
   }
   const libraryId = decodePathSegment(route[1]);
-  const albumId = members || member ? decodePathSegment(route[2]) : undefined;
+  const albumId = members || member || deletion || restore ? decodePathSegment(route[2]) : undefined;
   const assetId = member ? decodePathSegment(route[3]) : undefined;
-  if (!libraryId || (members || member) && !albumId || member && !assetId) {
+  if (!libraryId || (members || member || deletion || restore) && !albumId || member && !assetId) {
     sendJson(response, 400, { error: 'invalid_request', requestId });
     return true;
   }
@@ -504,6 +530,20 @@ async function handleAlbumRequest(
   }
 
   if (request.method === 'GET') {
+    if (deleted) {
+      if (!control.listDeletedAlbums) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+      const page = parseDeletedAlbumPageQuery(url.searchParams, libraryId);
+      if (!page) { sendJson(response, 400, { error: 'invalid_request', requestId }); return true; }
+      try {
+        const result = await control.listDeletedAlbums(libraryId, page.scope, page.cursor, page.limit);
+        if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+        else sendJson(response, 200, projectDeletedAlbumPage(result, libraryId, page.scope, page.limit));
+      } catch (error) {
+        if (error instanceof InvalidAlbumCursorError) sendJson(response, 400, { error: 'invalid_request', requestId });
+        else throw error;
+      }
+      return true;
+    }
     const scope: AlbumCursorScope = albumId === undefined
       ? { collection: 'albums', libraryId }
       : { collection: 'members', libraryId, albumId };
@@ -533,6 +573,38 @@ async function handleAlbumRequest(
     return true;
   }
   const createdAt = new Date().toISOString();
+  if (deletion || restore) {
+    const controlMethod = deletion ? control.deleteAlbum : control.restoreAlbum;
+    if (!controlMethod) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['scope']) || (body.scope !== 'local' && body.scope !== 'global')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+    }
+    const input = {
+      libraryId, albumId: albumId!, scope: body.scope as AlbumDeleteScope, operationId, principalId,
+      requestFingerprint: albumRequestFingerprint(principalId, 'POST', libraryId, albumId, undefined, { scope: body.scope }), createdAt
+    };
+    try {
+      if (deletion) {
+        const result = await control.deleteAlbum!(input);
+        if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+        else if (result === 'writer_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+        else { response.writeHead(204); response.end(); }
+      } else {
+        const result = await control.restoreAlbum!(input);
+        if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+        else if (result === 'writer_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+        else { response.writeHead(204); response.end(); }
+      }
+    } catch (error) {
+      if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
   if (request.method === 'POST') {
     if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
       sendJson(response, 400, { error: 'invalid_request', requestId });
@@ -595,6 +667,30 @@ async function handleAlbumRequest(
   return true;
 }
 
+function projectAlbumSyncGrantStatus(value: AlbumSyncGrantStatus): AlbumSyncGrantStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !isValidAlbumIdentifier(value.libraryId) ||
+      (value.permission !== 'album-write' && value.permission !== 'album-delete') || typeof value.granted !== 'boolean') {
+    throw new Error('album sync control returned an invalid grant');
+  }
+  return { peerId: value.peerId, libraryId: value.libraryId, permission: value.permission, granted: value.granted };
+}
+
+function projectAlbumSyncGrantList(value: AlbumSyncGrantList): AlbumSyncGrantList {
+  if (!isPlainRecord(value) || !Array.isArray(value.grants)) throw new Error('album sync control returned an invalid grant list');
+  const grants = value.grants.map((grant) => projectAlbumSyncGrantStatus(grant));
+  const keys = grants.map((grant) => `${grant.peerId}\\0${grant.libraryId}\\0${grant.permission}`);
+  if (new Set(keys).size !== keys.length) throw new Error('album sync control returned duplicate grants');
+  return { grants };
+}
+
+function projectAlbumSyncStatus(value: AlbumSyncPeerStatus): AlbumSyncPeerStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !Number.isSafeInteger(value.pendingEvents) || value.pendingEvents < 0 ||
+      !(value.lastErrorCode === null || ['unauthorized', 'unavailable', 'conflict'].includes(value.lastErrorCode))) {
+    throw new Error('album sync control returned an invalid status');
+  }
+  return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
+}
+
 function parseAlbumPageQuery(searchParams: URLSearchParams, scope: AlbumCursorScope): { cursor: string | undefined; limit: number } | undefined {
   if ([...searchParams.keys()].some((key) => key !== 'cursor' && key !== 'limit')) return undefined;
   const limitValues = searchParams.getAll('limit');
@@ -610,6 +706,42 @@ function parseAlbumPageQuery(searchParams: URLSearchParams, scope: AlbumCursorSc
     try { decodeAlbumCursor(cursor, scope); } catch { return undefined; }
   }
   return { cursor, limit };
+}
+
+function parseDeletedAlbumPageQuery(searchParams: URLSearchParams, libraryId: string): { scope: AlbumDeletedQueryScope; cursor: string | undefined; limit: number } | undefined {
+  if ([...searchParams.keys()].some((key) => key !== 'scope' && key !== 'cursor' && key !== 'limit')) return undefined;
+  const scopeValues = searchParams.getAll('scope');
+  const cursorValues = searchParams.getAll('cursor');
+  const limitValues = searchParams.getAll('limit');
+  if (scopeValues.length !== 1 || cursorValues.length > 1 || limitValues.length > 1 ||
+      !['all', 'local', 'global'].includes(scopeValues[0] ?? '')) return undefined;
+  const rawLimit = limitValues[0] ?? '50';
+  if (!/^\d+$/.test(rawLimit)) return undefined;
+  const limit = Number(rawLimit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) return undefined;
+  const cursor = cursorValues[0];
+  const scope: AlbumDeletedQueryScope = scopeValues[0] as AlbumDeletedQueryScope;
+  if (cursor !== undefined) {
+    if (cursor.length > 2048) return undefined;
+    try { decodeAlbumCursor(cursor, { collection: 'deleted', libraryId, scope }); } catch { return undefined; }
+  }
+  return { scope, cursor, limit };
+}
+
+function projectDeletedAlbumPage(value: DeletedAlbumPage, libraryId: string, scope: AlbumDeletedQueryScope, limit: number): DeletedAlbumPage {
+  if (!isPlainRecord(value) || !Array.isArray(value.items) || value.items.length > limit ||
+      !(value.nextCursor === null || typeof value.nextCursor === 'string')) throw new Error('album control returned an invalid deleted page');
+  const items = value.items.map((item) => {
+    if (!isPlainRecord(item) || !Array.isArray(item.scopes) || item.scopes.length < 1 || item.scopes.length > 2 ||
+        item.scopes.some((itemScope) => itemScope !== 'local' && itemScope !== 'global') || new Set(item.scopes).size !== item.scopes.length ||
+        scope !== 'all' && !item.scopes.includes(scope) || typeof item.deletedAt !== 'string' || !Number.isFinite(Date.parse(item.deletedAt))) {
+      throw new Error('album control returned an invalid deleted album');
+    }
+    return { ...projectAlbumRecord(item as AlbumRecord, libraryId), scopes: [...item.scopes] as AlbumDeleteScope[], deletedAt: item.deletedAt };
+  });
+  if (new Set(items.map((item) => item.albumId)).size !== items.length) throw new Error('album control returned duplicate deleted albums');
+  const nextCursor = validateAlbumOutputCursor(value.nextCursor, { collection: 'deleted', libraryId, scope }, items.length, limit);
+  return { items, nextCursor };
 }
 
 function projectAlbumRecord(value: AlbumRecord, libraryId: string): AlbumRecord {
@@ -716,6 +848,50 @@ async function handlePairingRequest(
   if (request.method === 'GET' && tagStatusPath?.[1]) {
     if (!control.getTagSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
     sendJson(response, 200, control.getTagSyncStatus(decodeURIComponent(tagStatusPath[1])));
+    return true;
+  }
+  const albumGrantListPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/album-sync-grants$/);
+  if (request.method === 'GET' && albumGrantListPath?.[1]) {
+    if (!control.listAlbumSyncGrants) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.listAlbumSyncGrants(decodeURIComponent(albumGrantListPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectAlbumSyncGrantList(result));
+    return true;
+  }
+  const albumStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/album-sync-status$/);
+  if (request.method === 'GET' && albumStatusPath?.[1]) {
+    if (!control.getAlbumSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.getAlbumSyncStatus(decodeURIComponent(albumStatusPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectAlbumSyncStatus(result));
+    return true;
+  }
+  const albumGrantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/(album-write|album-delete)$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && albumGrantPath?.[1] && albumGrantPath[2] && albumGrantPath[3]) {
+    const permission = albumGrantPath[3] as AlbumSyncPermission;
+    const update = request.method === 'PUT'
+      ? permission === 'album-write' ? control.grantAlbumWrite : control.grantAlbumDelete
+      : permission === 'album-write' ? control.revokeAlbumWrite : control.revokeAlbumDelete;
+    if (!update) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (request.method === 'PUT') {
+      if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+      const body = await readJsonBody(request, 8 * 1024);
+      if (!isPlainRecord(body) || !hasExactKeys(body, ['enabled']) || body.enabled !== true) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+    }
+    try {
+      const peerId = decodeURIComponent(albumGrantPath[1]);
+      const libraryId = decodeURIComponent(albumGrantPath[2]);
+      const result = update.call(control, peerId, libraryId, new Date().toISOString());
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, projectAlbumSyncGrantStatus(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'conflict', requestId });
+      else throw error;
+    }
     return true;
   }
   if (request.method === 'GET' && pathname === '/v1/pairing/discovered') {

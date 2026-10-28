@@ -653,5 +653,397 @@ export const migrations: readonly Migration[] = [
           AND t.album_id = OLD.album_id AND t.asset_id = OLD.asset_id)
       BEGIN SELECT RAISE(ABORT, 'album membership remove target required'); END;
     `
+  },
+  {
+    id: '0008_virtual_album_sync',
+    sql: `
+      CREATE TABLE sync_global_id_registry (
+        global_id TEXT PRIMARY KEY CHECK (length(global_id) = 36),
+        event_stream TEXT CHECK (event_stream IN ('asset-metadata-v1', 'asset-tags-v1', 'virtual-albums-v1')),
+        operation_kind TEXT CHECK (operation_kind IN ('album-operation', 'album-lifecycle', 'album-visibility')),
+        CHECK (event_stream IS NOT NULL OR operation_kind IS NOT NULL),
+        CHECK (event_stream IS NULL OR operation_kind IS NULL OR
+          (event_stream = 'virtual-albums-v1' AND operation_kind IN ('album-operation', 'album-lifecycle')))
+      );
+
+      INSERT INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+      SELECT event_id, 'asset-metadata-v1', NULL FROM sync_event_log
+      UNION SELECT event_id, 'asset-metadata-v1', NULL FROM sync_inbox
+      UNION SELECT event_id, 'asset-tags-v1', NULL FROM tag_sync_event_log
+      UNION SELECT event_id, 'asset-tags-v1', NULL FROM tag_sync_inbox;
+      INSERT INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+      SELECT operation_id,
+        CASE WHEN operation_type IN ('album.created', 'member.added', 'member.removed') THEN 'virtual-albums-v1' ELSE NULL END,
+        'album-operation'
+      FROM album_operations;
+
+       DROP TRIGGER albums_library_guard;
+       CREATE TRIGGER albums_library_guard BEFORE INSERT ON albums
+       WHEN NOT EXISTS (SELECT 1 FROM assets WHERE library_id = NEW.library_id
+         UNION ALL SELECT 1 FROM sync_asset_projection WHERE library_id = NEW.library_id
+         UNION ALL SELECT 1 FROM sync_remote_library_grants g JOIN trusted_peers p ON p.peer_id = g.peer_id
+           WHERE g.library_id = NEW.library_id AND p.trust_state = 'trusted'
+         UNION ALL SELECT 1 FROM album_sync_inbox i WHERE i.library_id = NEW.library_id AND i.author_peer_id = NEW.created_by_peer_id
+           AND i.state = 'applying' AND json_extract(i.envelope_json, '$.eventType') = 'album.created')
+       BEGIN SELECT RAISE(ABORT, 'album_library_not_found'); END;
+
+      CREATE TRIGGER sync_global_id_registry_no_delete BEFORE DELETE ON sync_global_id_registry
+      BEGIN SELECT RAISE(ABORT, 'global event ID registry is retained'); END;
+      CREATE TRIGGER sync_global_id_registry_update_guard BEFORE UPDATE ON sync_global_id_registry
+      WHEN (OLD.event_stream IS NOT NULL AND NEW.event_stream IS NOT OLD.event_stream) OR
+        (OLD.operation_kind IS NOT NULL AND NEW.operation_kind IS NOT OLD.operation_kind) OR
+        (NEW.event_stream IS NOT NULL AND NEW.operation_kind IS NOT NULL AND
+          NOT (NEW.event_stream = 'virtual-albums-v1' AND NEW.operation_kind IN ('album-operation', 'album-lifecycle')))
+      BEGIN SELECT RAISE(ABORT, 'global event ID registry identity is immutable'); END;
+
+      CREATE TABLE library_album_write_grants (
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        granted_at TEXT NOT NULL,
+        revoked_at TEXT,
+        PRIMARY KEY (peer_id, library_id)
+      );
+      CREATE INDEX library_album_write_grants_library_idx ON library_album_write_grants (library_id, peer_id, revoked_at);
+      CREATE TABLE library_album_delete_grants (
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        granted_at TEXT NOT NULL,
+        revoked_at TEXT,
+        PRIMARY KEY (peer_id, library_id)
+      );
+      CREATE INDEX library_album_delete_grants_library_idx ON library_album_delete_grants (library_id, peer_id, revoked_at);
+
+      CREATE TABLE album_sync_author_registry (
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        PRIMARY KEY (library_id, author_peer_id)
+      );
+      INSERT INTO album_sync_author_registry (library_id, author_peer_id, first_seen_at)
+      SELECT library_id, author_peer_id, MIN(created_at) FROM album_operations GROUP BY library_id, author_peer_id;
+
+      CREATE TABLE album_sync_event_log (
+        event_id TEXT PRIMARY KEY CHECK (length(event_id) = 36),
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        author_sequence INTEGER NOT NULL CHECK (author_sequence > 0),
+        protocol_version INTEGER NOT NULL CHECK (protocol_version > 0),
+        schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+        event_type TEXT NOT NULL CHECK (event_type IN ('album.created', 'album.member.added', 'album.member.removed', 'album.deleted', 'album.restored')),
+        causal_parents_json TEXT NOT NULL CHECK (json_valid(causal_parents_json)),
+        payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+        created_at TEXT NOT NULL,
+        signature TEXT,
+        envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json)),
+        state TEXT NOT NULL CHECK (state IN ('signing', 'ready')),
+        CHECK ((state = 'signing' AND signature IS NULL) OR (state = 'ready' AND signature IS NOT NULL)),
+        UNIQUE (library_id, author_peer_id, author_sequence)
+      );
+      CREATE INDEX album_sync_event_log_library_idx ON album_sync_event_log (library_id, author_peer_id, author_sequence);
+      CREATE TRIGGER album_sync_event_global_id_guard BEFORE INSERT ON album_sync_event_log
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream <> 'virtual-albums-v1') OR r.operation_kind = 'album-visibility' OR
+         (r.operation_kind = 'album-operation' AND NOT EXISTS (SELECT 1 FROM album_operations o
+           WHERE o.operation_id = NEW.event_id AND o.operation_type IN ('album.created', 'member.added', 'member.removed'))) OR
+         (r.operation_kind = 'album-lifecycle' AND NOT EXISTS (SELECT 1 FROM album_lifecycle_operations o
+           WHERE o.operation_id = NEW.event_id AND o.operation_type IN ('album.deleted', 'album.restored')))))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER album_sync_event_global_id_register AFTER INSERT ON album_sync_event_log
+      BEGIN
+        INSERT INTO sync_global_id_registry (global_id, event_stream, operation_kind) VALUES (NEW.event_id, 'virtual-albums-v1', NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream = 'virtual-albums-v1'
+        WHERE sync_global_id_registry.event_stream IS NULL;
+      END;
+      CREATE TRIGGER album_sync_event_identity_guard BEFORE UPDATE ON album_sync_event_log
+      WHEN NEW.event_id IS NOT OLD.event_id OR NEW.library_id IS NOT OLD.library_id OR
+        NEW.author_peer_id IS NOT OLD.author_peer_id OR NEW.author_sequence IS NOT OLD.author_sequence OR
+        NEW.protocol_version IS NOT OLD.protocol_version OR NEW.schema_version IS NOT OLD.schema_version OR
+        NEW.event_type IS NOT OLD.event_type OR NEW.causal_parents_json IS NOT OLD.causal_parents_json OR
+        NEW.payload_json IS NOT OLD.payload_json OR NEW.created_at IS NOT OLD.created_at OR
+        OLD.state <> 'signing' OR NEW.state <> 'ready'
+      BEGIN SELECT RAISE(ABORT, 'album sync event identity is immutable'); END;
+      CREATE TRIGGER album_sync_event_no_delete BEFORE DELETE ON album_sync_event_log
+      BEGIN SELECT RAISE(ABORT, 'album sync event deletion is disabled'); END;
+
+      CREATE TABLE album_sync_inbox (
+        event_id TEXT PRIMARY KEY CHECK (length(event_id) = 36),
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        author_sequence INTEGER NOT NULL CHECK (author_sequence > 0),
+        envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json)),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'applied', 'unsupported', 'conflict')),
+        error_code TEXT,
+        received_at TEXT NOT NULL,
+        applied_at TEXT,
+        UNIQUE (library_id, author_peer_id, author_sequence)
+      );
+      CREATE INDEX album_sync_inbox_pending_idx ON album_sync_inbox (library_id, state, author_peer_id, author_sequence);
+       CREATE TABLE album_sync_conflicts (
+         conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+         relay_peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+         event_id TEXT NOT NULL,
+         library_id TEXT NOT NULL,
+         author_peer_id TEXT NOT NULL,
+         author_sequence INTEGER NOT NULL CHECK (author_sequence > 0),
+         envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json)),
+         error_code TEXT NOT NULL CHECK (length(error_code) BETWEEN 1 AND 64),
+         received_at TEXT NOT NULL,
+         UNIQUE (library_id, author_peer_id)
+       );
+       CREATE INDEX album_sync_conflicts_author_idx ON album_sync_conflicts (library_id, author_peer_id, author_sequence);
+       CREATE TRIGGER album_sync_conflicts_no_update BEFORE UPDATE ON album_sync_conflicts
+       BEGIN SELECT RAISE(ABORT, 'album sync conflicts are immutable'); END;
+       CREATE TRIGGER album_sync_conflicts_no_delete BEFORE DELETE ON album_sync_conflicts
+       BEGIN SELECT RAISE(ABORT, 'album sync conflicts cannot be deleted'); END;
+      CREATE TRIGGER album_sync_inbox_global_id_guard BEFORE INSERT ON album_sync_inbox
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream <> 'virtual-albums-v1') OR r.operation_kind = 'album-visibility' OR
+         (r.operation_kind = 'album-operation' AND NOT EXISTS (SELECT 1 FROM album_operations o
+           WHERE o.operation_id = NEW.event_id AND o.operation_type IN ('album.created', 'member.added', 'member.removed'))) OR
+         (r.operation_kind = 'album-lifecycle' AND NOT EXISTS (SELECT 1 FROM album_lifecycle_operations o
+           WHERE o.operation_id = NEW.event_id AND o.operation_type IN ('album.deleted', 'album.restored')))))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER album_sync_inbox_global_id_register AFTER INSERT ON album_sync_inbox
+      BEGIN
+        INSERT INTO sync_global_id_registry (global_id, event_stream, operation_kind) VALUES (NEW.event_id, 'virtual-albums-v1', NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream = 'virtual-albums-v1'
+        WHERE sync_global_id_registry.event_stream IS NULL;
+      END;
+      CREATE TRIGGER album_sync_inbox_identity_guard BEFORE UPDATE ON album_sync_inbox
+      WHEN NEW.event_id IS NOT OLD.event_id OR NEW.peer_id IS NOT OLD.peer_id OR NEW.library_id IS NOT OLD.library_id OR
+        NEW.author_peer_id IS NOT OLD.author_peer_id OR NEW.author_sequence IS NOT OLD.author_sequence OR NEW.envelope_json IS NOT OLD.envelope_json
+      BEGIN SELECT RAISE(ABORT, 'album sync inbox identity is immutable'); END;
+
+      CREATE TABLE album_sync_outbox (
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        event_id TEXT NOT NULL REFERENCES album_sync_event_log(event_id) ON DELETE RESTRICT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        next_attempt_at TEXT NOT NULL,
+        last_error TEXT,
+        PRIMARY KEY (peer_id, event_id)
+      );
+      CREATE INDEX album_sync_outbox_due_idx ON album_sync_outbox (peer_id, next_attempt_at, event_id);
+      CREATE TABLE album_sync_author_heads (
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        author_sequence INTEGER NOT NULL CHECK (author_sequence > 0),
+        event_id TEXT NOT NULL REFERENCES album_sync_event_log(event_id) ON DELETE RESTRICT,
+        ready INTEGER NOT NULL DEFAULT 1 CHECK (ready IN (0, 1)),
+        PRIMARY KEY (library_id, author_peer_id)
+      );
+      CREATE TABLE album_sync_peer_cursors (
+        library_id TEXT NOT NULL,
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        author_peer_id TEXT NOT NULL,
+        contiguous_sequence INTEGER NOT NULL DEFAULT 0 CHECK (contiguous_sequence >= 0),
+        event_id TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (library_id, peer_id, author_peer_id)
+      );
+
+      CREATE TABLE album_lifecycle_operations (
+        operation_id TEXT PRIMARY KEY CHECK (length(operation_id) = 36),
+        principal_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        operation_type TEXT NOT NULL CHECK (operation_type IN ('album.deleted', 'album.delete.noop', 'album.restored', 'album.restore.noop')),
+        request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+        observed_delete_event_ids_json TEXT NOT NULL CHECK (json_valid(observed_delete_event_ids_json)),
+        result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (library_id, album_id) REFERENCES albums(library_id, album_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX album_lifecycle_author_idx ON album_lifecycle_operations (library_id, author_peer_id, operation_type);
+      CREATE TABLE album_visibility_operations (
+        operation_id TEXT PRIMARY KEY CHECK (length(operation_id) = 36),
+        principal_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        operation_type TEXT NOT NULL CHECK (operation_type IN ('local.hidden', 'local.hide.noop', 'local.restored', 'local.restore.noop')),
+        request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+        result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (library_id, album_id) REFERENCES albums(library_id, album_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX album_visibility_operation_scope_idx ON album_visibility_operations (library_id, album_id, created_at);
+      CREATE TABLE album_local_visibility (
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL REFERENCES album_visibility_operations(operation_id) ON DELETE RESTRICT,
+        hidden_at TEXT NOT NULL,
+        PRIMARY KEY (library_id, album_id),
+        FOREIGN KEY (library_id, album_id) REFERENCES albums(library_id, album_id) ON DELETE RESTRICT
+      );
+      CREATE TABLE album_global_delete_tokens (
+        delete_event_id TEXT PRIMARY KEY REFERENCES album_lifecycle_operations(operation_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (library_id, album_id) REFERENCES albums(library_id, album_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX album_global_delete_tokens_active_idx ON album_global_delete_tokens (library_id, album_id, delete_event_id);
+      CREATE TABLE album_global_restore_targets (
+        restore_operation_id TEXT NOT NULL REFERENCES album_lifecycle_operations(operation_id) ON DELETE RESTRICT,
+        observed_delete_event_id TEXT NOT NULL REFERENCES album_global_delete_tokens(delete_event_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        PRIMARY KEY (restore_operation_id, observed_delete_event_id),
+        FOREIGN KEY (library_id, album_id) REFERENCES albums(library_id, album_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX album_global_restore_targets_delete_idx ON album_global_restore_targets (observed_delete_event_id);
+      CREATE TRIGGER album_global_restore_target_guard BEFORE INSERT ON album_global_restore_targets
+      WHEN NOT EXISTS (SELECT 1 FROM album_lifecycle_operations r JOIN album_global_delete_tokens d
+        ON d.delete_event_id = NEW.observed_delete_event_id AND d.library_id = NEW.library_id AND d.album_id = NEW.album_id
+        WHERE r.operation_id = NEW.restore_operation_id AND r.operation_type = 'album.restored'
+          AND r.library_id = NEW.library_id AND r.album_id = NEW.album_id)
+      BEGIN SELECT RAISE(ABORT, 'album restore target mismatch'); END;
+
+      CREATE TRIGGER sync_event_global_id_guard BEFORE INSERT ON sync_event_log
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.event_id AND
+        (r.event_stream IS NOT 'asset-metadata-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER sync_event_global_id_register AFTER INSERT ON sync_event_log
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+        VALUES (NEW.event_id, 'asset-metadata-v1', NULL); END;
+      CREATE TRIGGER sync_inbox_global_id_guard BEFORE INSERT ON sync_inbox
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.event_id AND
+        (r.event_stream IS NOT 'asset-metadata-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER sync_inbox_global_id_register AFTER INSERT ON sync_inbox
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+        VALUES (NEW.event_id, 'asset-metadata-v1', NULL); END;
+      CREATE TRIGGER tag_sync_event_global_id_guard BEFORE INSERT ON tag_sync_event_log
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.event_id AND
+        (r.event_stream IS NOT 'asset-tags-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER tag_sync_event_global_id_register AFTER INSERT ON tag_sync_event_log
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+        VALUES (NEW.event_id, 'asset-tags-v1', NULL); END;
+      CREATE TRIGGER tag_sync_inbox_global_id_guard BEFORE INSERT ON tag_sync_inbox
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.event_id AND
+        (r.event_stream IS NOT 'asset-tags-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER tag_sync_inbox_global_id_register AFTER INSERT ON tag_sync_inbox
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+        VALUES (NEW.event_id, 'asset-tags-v1', NULL); END;
+
+      DROP TRIGGER album_operations_author_limit;
+      CREATE TRIGGER album_operations_global_id_guard BEFORE INSERT ON album_operations
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.operation_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream <> 'virtual-albums-v1') OR r.operation_kind IS NOT NULL OR
+         (r.event_stream = 'virtual-albums-v1' AND NOT EXISTS (SELECT 1 FROM album_sync_inbox i
+           WHERE i.event_id = NEW.operation_id AND i.state = 'applying' AND i.library_id = NEW.library_id AND
+             i.author_peer_id = NEW.author_peer_id AND json_extract(i.envelope_json, '$.payload.albumId') = NEW.album_id AND
+             (NEW.operation_type <> 'member.added' OR json_extract(i.envelope_json, '$.eventType') = 'album.member.added') AND
+             (NEW.operation_type <> 'member.removed' OR json_extract(i.envelope_json, '$.eventType') = 'album.member.removed') AND
+             (NEW.operation_type <> 'album.created' OR json_extract(i.envelope_json, '$.eventType') = 'album.created')))))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER album_operations_global_id_register AFTER INSERT ON album_operations
+      BEGIN
+        INSERT INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+        VALUES (NEW.operation_id,
+          CASE WHEN NEW.operation_type IN ('album.created', 'member.added', 'member.removed') THEN 'virtual-albums-v1' ELSE NULL END,
+          'album-operation')
+        ON CONFLICT(global_id) DO UPDATE SET operation_kind = 'album-operation',
+          event_stream = COALESCE(sync_global_id_registry.event_stream, excluded.event_stream)
+        WHERE sync_global_id_registry.operation_kind IS NULL AND
+          (sync_global_id_registry.event_stream IS NULL OR sync_global_id_registry.event_stream = 'virtual-albums-v1');
+      END;
+      CREATE TRIGGER album_lifecycle_global_id_guard BEFORE INSERT ON album_lifecycle_operations
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry r WHERE r.global_id = NEW.operation_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream <> 'virtual-albums-v1') OR r.operation_kind IS NOT NULL OR
+         (r.event_stream = 'virtual-albums-v1' AND NOT EXISTS (SELECT 1 FROM album_sync_inbox i
+           WHERE i.event_id = NEW.operation_id AND i.state = 'applying' AND i.library_id = NEW.library_id AND
+             i.author_peer_id = NEW.author_peer_id AND json_extract(i.envelope_json, '$.payload.albumId') = NEW.album_id AND
+             json_extract(i.envelope_json, '$.eventType') = NEW.operation_type))))
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER album_lifecycle_global_id_register AFTER INSERT ON album_lifecycle_operations
+      BEGIN
+        INSERT INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+        VALUES (NEW.operation_id,
+          CASE WHEN NEW.operation_type IN ('album.deleted', 'album.restored') THEN 'virtual-albums-v1' ELSE NULL END,
+          'album-lifecycle')
+        ON CONFLICT(global_id) DO UPDATE SET operation_kind = 'album-lifecycle',
+          event_stream = COALESCE(sync_global_id_registry.event_stream, excluded.event_stream)
+        WHERE sync_global_id_registry.operation_kind IS NULL AND
+          (sync_global_id_registry.event_stream IS NULL OR sync_global_id_registry.event_stream = 'virtual-albums-v1');
+      END;
+      CREATE TRIGGER album_visibility_global_id_guard BEFORE INSERT ON album_visibility_operations
+      WHEN EXISTS (SELECT 1 FROM sync_global_id_registry WHERE global_id = NEW.operation_id)
+      BEGIN SELECT RAISE(ABORT, 'global event ID collision'); END;
+      CREATE TRIGGER album_visibility_global_id_register AFTER INSERT ON album_visibility_operations
+      BEGIN INSERT INTO sync_global_id_registry (global_id, event_stream, operation_kind)
+        VALUES (NEW.operation_id, NULL, 'album-visibility'); END;
+
+      CREATE TRIGGER album_operations_author_limit_pm045 BEFORE INSERT ON album_operations
+      WHEN NOT EXISTS (SELECT 1 FROM album_sync_author_registry WHERE library_id = NEW.library_id AND author_peer_id = NEW.author_peer_id)
+        AND (SELECT count(*) FROM album_sync_author_registry WHERE library_id = NEW.library_id) >= 64
+      BEGIN SELECT RAISE(ABORT, 'album_author_limit'); END;
+      CREATE TRIGGER album_operations_author_register AFTER INSERT ON album_operations
+      BEGIN INSERT OR IGNORE INTO album_sync_author_registry (library_id, author_peer_id, first_seen_at)
+        VALUES (NEW.library_id, NEW.author_peer_id, NEW.created_at); END;
+      CREATE TRIGGER album_lifecycle_author_limit BEFORE INSERT ON album_lifecycle_operations
+      WHEN NOT EXISTS (SELECT 1 FROM album_sync_author_registry WHERE library_id = NEW.library_id AND author_peer_id = NEW.author_peer_id)
+        AND (SELECT count(*) FROM album_sync_author_registry WHERE library_id = NEW.library_id) >= 64
+      BEGIN SELECT RAISE(ABORT, 'album_author_limit'); END;
+      CREATE TRIGGER album_lifecycle_author_register AFTER INSERT ON album_lifecycle_operations
+      BEGIN INSERT OR IGNORE INTO album_sync_author_registry (library_id, author_peer_id, first_seen_at)
+        VALUES (NEW.library_id, NEW.author_peer_id, NEW.created_at); END;
+      CREATE TRIGGER album_operations_no_update_pm045 BEFORE UPDATE ON album_operations
+      BEGIN SELECT RAISE(ABORT, 'album operations are immutable'); END;
+      CREATE TRIGGER album_operations_no_delete_pm045 BEFORE DELETE ON album_operations
+      BEGIN SELECT RAISE(ABORT, 'album operations are retained'); END;
+      CREATE TRIGGER album_lifecycle_no_update BEFORE UPDATE ON album_lifecycle_operations
+      BEGIN SELECT RAISE(ABORT, 'album lifecycle operations are immutable'); END;
+      CREATE TRIGGER album_lifecycle_no_delete BEFORE DELETE ON album_lifecycle_operations
+      BEGIN SELECT RAISE(ABORT, 'album lifecycle operations are retained'); END;
+      CREATE TRIGGER album_visibility_no_update BEFORE UPDATE ON album_visibility_operations
+      BEGIN SELECT RAISE(ABORT, 'album visibility operations are immutable'); END;
+      CREATE TRIGGER album_visibility_no_delete BEFORE DELETE ON album_visibility_operations
+      BEGIN SELECT RAISE(ABORT, 'album visibility operations are retained'); END;
+
+      DROP TRIGGER album_operations_scope_guard;
+      CREATE TRIGGER album_operations_scope_guard BEFORE INSERT ON album_operations
+      WHEN NOT EXISTS (SELECT 1 FROM albums a WHERE a.library_id = NEW.library_id AND a.album_id = NEW.album_id
+        AND ((NEW.operation_type = 'album.created' AND a.created_by_peer_id = NEW.author_peer_id) OR NEW.operation_type <> 'album.created'))
+        OR (NEW.operation_type <> 'album.created' AND NOT EXISTS (
+          SELECT 1 FROM assets a WHERE a.library_id = NEW.library_id AND a.asset_id = NEW.asset_id
+            AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+          UNION ALL
+          SELECT 1 FROM sync_asset_projection p WHERE p.library_id = NEW.library_id AND p.asset_id = NEW.asset_id
+            AND p.tombstone_event_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+          UNION ALL
+          SELECT 1 FROM album_sync_inbox i WHERE i.event_id = NEW.operation_id AND i.state = 'applying'
+            AND i.library_id = NEW.library_id AND i.author_peer_id = NEW.author_peer_id
+            AND json_extract(i.envelope_json, '$.payload.albumId') = NEW.album_id
+            AND json_extract(i.envelope_json, '$.payload.assetId') = NEW.asset_id
+            AND ((NEW.operation_type = 'member.added' AND json_extract(i.envelope_json, '$.eventType') = 'album.member.added') OR
+                 (NEW.operation_type = 'member.removed' AND json_extract(i.envelope_json, '$.eventType') = 'album.member.removed'))
+        ))
+      BEGIN SELECT RAISE(ABORT, 'album_operation_scope_mismatch'); END;
+      DROP TRIGGER album_memberships_add_guard;
+      CREATE TRIGGER album_memberships_add_guard BEFORE INSERT ON album_memberships
+      WHEN NOT EXISTS (SELECT 1 FROM album_operations o WHERE o.operation_id = NEW.add_operation_id
+        AND o.operation_type = 'member.added' AND o.library_id = NEW.library_id AND o.album_id = NEW.album_id
+        AND o.asset_id = NEW.asset_id AND o.author_peer_id = NEW.author_peer_id)
+        OR (NOT EXISTS (
+          SELECT 1 FROM assets a WHERE a.library_id = NEW.library_id AND a.asset_id = NEW.asset_id
+            AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+          UNION ALL
+          SELECT 1 FROM sync_asset_projection p WHERE p.library_id = NEW.library_id AND p.asset_id = NEW.asset_id
+            AND p.tombstone_event_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND p.asset_id = a.asset_id)
+        ) AND NOT EXISTS (SELECT 1 FROM album_sync_inbox i WHERE i.event_id = NEW.add_operation_id AND i.state = 'applying'
+          AND i.library_id = NEW.library_id AND i.author_peer_id = NEW.author_peer_id
+          AND json_extract(i.envelope_json, '$.eventType') = 'album.member.added'
+          AND json_extract(i.envelope_json, '$.payload.albumId') = NEW.album_id
+          AND json_extract(i.envelope_json, '$.payload.assetId') = NEW.asset_id))
+      BEGIN SELECT RAISE(ABORT, 'album_membership_scope_mismatch'); END;
+    `
   }
 ];

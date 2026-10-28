@@ -8,11 +8,14 @@ import { validateTagOperationPayload } from './tag-orset.js';
 export const EVENT_PROTOCOL_VERSION = 1;
 export const EVENT_SCHEMA_VERSION = 1;
 export const MAX_EVENT_BYTES = 256 * 1024;
+const MAX_SIGNATURE_VERIFICATION_BYTES = 16 * 1024 * 1024;
 const SIGNING_DOMAIN = 'PhotoMesh.EventEnvelope.v1\n';
 
 export type SyncEventType = 'asset.indexed' | 'asset.metadata.updated' | 'asset.tombstoned' | 'asset.restored';
 export type TagSyncEventType = 'asset.tag.added' | 'asset.tag.removed';
-export type AnyEventType = SyncEventType | TagSyncEventType;
+export type AlbumSyncEventType = 'album.created' | 'album.member.added' | 'album.member.removed' | 'album.deleted' | 'album.restored';
+export type AnyEventType = SyncEventType | TagSyncEventType | AlbumSyncEventType;
+export const MAX_ALBUM_OBSERVED_IDS = 64;
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface EventEnvelope {
@@ -50,7 +53,7 @@ export function makeUnsignedEvent(input: {
     causalParents: [...new Set(input.causalParents)].sort(), eventType: input.eventType,
     payload: input.payload, createdAt: input.createdAt
   };
-  if (!isSupportedEventType(input.eventType) && !isTagSyncEventType(input.eventType)) throw new Error('unsupported local event type');
+  if (!isSupportedEventType(input.eventType) && !isTagSyncEventType(input.eventType) && !isAlbumSyncEventType(input.eventType)) throw new Error('unsupported local event type');
   validateUnsignedEvent(event);
   return event;
 }
@@ -63,17 +66,27 @@ export async function signEvent(event: UnsignedEventEnvelope, identity: LocalIde
   return { ...event, signature: Buffer.from(signature).toString('base64url') };
 }
 
-export async function verifyEvent(event: EventEnvelope, trustedPublicKey: string): Promise<boolean> {
+export async function verifyEnvelopeSignature(value: unknown, trustedPublicKey: string): Promise<boolean> {
   try {
-    const unsigned = omitSignature(event);
-    validateUnsignedEvent(unsigned);
+    if (!isRecord(value) || typeof value.signature !== 'string' || typeof value.authorPeerId !== 'string' ||
+        Buffer.byteLength(JSON.stringify(value), 'utf8') > MAX_SIGNATURE_VERIFICATION_BYTES) return false;
+    const { signature: signatureText, ...unsigned } = value;
     const publicKeyBytes = Buffer.from(trustedPublicKey, 'base64');
     if (publicKeyBytes.toString('base64') !== trustedPublicKey) return false;
     const publicKey = publicKeyFromProtobuf(publicKeyBytes);
-    if (publicKey.type !== 'Ed25519' || peerIdFromPublicKey(publicKey).toString() !== event.authorPeerId) return false;
-    const signature = Buffer.from(event.signature, 'base64url');
-    if (signature.byteLength !== 64 || signature.toString('base64url') !== event.signature) return false;
-    return await publicKey.verify(signingBytes(unsigned), signature);
+    if (publicKey.type !== 'Ed25519' || peerIdFromPublicKey(publicKey).toString() !== value.authorPeerId) return false;
+    const signature = Buffer.from(signatureText, 'base64url');
+    if (signature.byteLength !== 64 || signature.toString('base64url') !== signatureText) return false;
+    return await publicKey.verify(signingBytes(unsigned as UnsignedEventEnvelope), signature);
+  } catch {
+    return false;
+  }
+}
+
+export async function verifyEvent(event: EventEnvelope, trustedPublicKey: string): Promise<boolean> {
+  try {
+    validateUnsignedEvent(omitSignature(event));
+    return await verifyEnvelopeSignature(event, trustedPublicKey);
   } catch {
     return false;
   }
@@ -111,6 +124,7 @@ function validateUnsignedEvent(event: UnsignedEventEnvelope): void {
   }
   if (isSupportedEventType(event.eventType)) validatePayload(event.eventType, event.payload);
   else if (isTagSyncEventType(event.eventType)) validateTagOperationPayload(event.eventType, event.payload);
+  else if (isAlbumSyncEventType(event.eventType)) validateAlbumEventPayload(event.eventType, event.payload);
   if (Buffer.byteLength(JSON.stringify(event), 'utf8') > MAX_EVENT_BYTES) throw new Error('event exceeds maximum size');
 }
 
@@ -136,6 +150,40 @@ function validatePayload(type: SyncEventType, payload: Record<string, unknown>):
   if (!isUuid(payload.tombstoneEventId)) throw new Error('restore must reference a tombstone event');
 }
 
+function validateAlbumEventPayload(type: AlbumSyncEventType, payload: Record<string, unknown>): void {
+  const albumId = payload.albumId;
+  if (!isUuid(albumId)) throw new Error('invalid album event payload');
+  if (type === 'album.created') {
+    if (!hasExactKeys(payload, ['albumId', 'title', 'createdAt']) || typeof payload.title !== 'string' ||
+        payload.title.length === 0 || payload.title.trim() !== payload.title || Buffer.byteLength(payload.title, 'utf8') > 256 ||
+        typeof payload.createdAt !== 'string' || !Number.isFinite(Date.parse(payload.createdAt))) {
+      throw new Error('invalid album create payload');
+    }
+    return;
+  }
+  if (type === 'album.member.added') {
+    if (!hasExactKeys(payload, ['albumId', 'assetId']) || !isSafeId(payload.assetId, 128)) throw new Error('invalid album member add payload');
+    return;
+  }
+  if (type === 'album.member.removed' || type === 'album.restored') {
+    const key = type === 'album.member.removed' ? 'observedAddEventIds' : 'observedDeleteEventIds';
+    const expectedKeys = type === 'album.member.removed' ? ['albumId', 'assetId', key] : ['albumId', key];
+    const ids = payload[key];
+    if (!hasExactKeys(payload, expectedKeys) ||
+        (type === 'album.member.removed' && !isSafeId(payload.assetId, 128)) ||
+        !Array.isArray(ids) || ids.length < 1 || ids.length > MAX_ALBUM_OBSERVED_IDS ||
+        !ids.every((id) => isUuid(id)) || ids.some((id, index) => index > 0 && String(ids[index - 1]) >= String(id))) {
+      throw new Error('invalid album observed-event payload');
+    }
+    return;
+  }
+  if (!hasExactKeys(payload, ['albumId'])) throw new Error('invalid album delete payload');
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
 function omitSignature(event: EventEnvelope | Record<string, unknown>): UnsignedEventEnvelope {
   const { signature: _signature, ...unsigned } = event as EventEnvelope;
   void _signature;
@@ -152,6 +200,11 @@ export function isSupportedEventType(value: string): value is SyncEventType {
 
 export function isTagSyncEventType(value: string): value is TagSyncEventType {
   return value === 'asset.tag.added' || value === 'asset.tag.removed';
+}
+
+export function isAlbumSyncEventType(value: string): value is AlbumSyncEventType {
+  return value === 'album.created' || value === 'album.member.added' || value === 'album.member.removed' ||
+    value === 'album.deleted' || value === 'album.restored';
 }
 
 function isSafeId(value: unknown, maxLength: number): value is string {

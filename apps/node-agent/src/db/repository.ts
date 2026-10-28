@@ -140,6 +140,36 @@ export interface AlbumOperationContext {
   createdAt: string;
 }
 
+export interface AlbumOperationEventDraftInput {
+  operationId: string;
+  authorPeerId: string;
+  libraryId: string;
+  albumId: string;
+  assetId: string | null;
+  operationType: 'album.created' | 'member.added' | 'member.removed';
+  createdAt: string;
+  title?: string;
+  observedAddIds?: readonly string[];
+}
+export type AlbumOperationEventDrafter = (input: AlbumOperationEventDraftInput) => void;
+
+export interface AlbumLifecycleEventDraftInput {
+  operationId: string;
+  authorPeerId: string;
+  libraryId: string;
+  albumId: string;
+  operationType: 'album.deleted' | 'album.restored';
+  createdAt: string;
+  observedDeleteIds?: readonly string[];
+}
+export type AlbumLifecycleEventDrafter = (input: AlbumLifecycleEventDraftInput) => void;
+export type AlbumDeleteScope = 'local' | 'global';
+export type AlbumDeletedQueryScope = 'all' | AlbumDeleteScope;
+export interface DeletedAlbumRecord extends AlbumRecord { scopes: AlbumDeleteScope[]; deletedAt: string }
+export interface DeletedAlbumPage { items: DeletedAlbumRecord[]; nextCursor: string | null }
+export type AlbumDeletionResult = 'deleted' | 'already_deleted' | 'not_found' | 'writer_limit';
+export type AlbumRestoreResult = 'restored' | 'already_active' | 'not_found' | 'writer_limit';
+
 export type AlbumMemberMutationResult =
   | { status: 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'writer_limit'; observedAddIds?: string[] };
 
@@ -313,10 +343,21 @@ export function verifySqliteIntegrity(database: Database.Database): void {
 }
 
 export class SqliteRepository implements UploadRepository {
+  private albumOperationEventDrafter: AlbumOperationEventDrafter | undefined;
+  private albumLifecycleEventDrafter: AlbumLifecycleEventDrafter | undefined;
+
   constructor(private readonly db: Database.Database, private readonly faults: RepositoryFaults = {}) {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('journal_mode = WAL');
+  }
+
+  setAlbumOperationEventDrafter(drafter: AlbumOperationEventDrafter): void {
+    this.albumOperationEventDrafter = drafter;
+  }
+
+  setAlbumLifecycleEventDrafter(drafter: AlbumLifecycleEventDrafter): void {
+    this.albumLifecycleEventDrafter = drafter;
   }
 
   verifyIntegrity(): void {
@@ -530,6 +571,10 @@ export class SqliteRepository implements UploadRepository {
       this.db.prepare(`INSERT INTO albums (album_id, library_id, title, created_by_peer_id, created_at)
         VALUES (?, ?, ?, ?, ?)`).run(album.albumId, album.libraryId, album.title, album.createdByPeerId, album.createdAt);
       this.insertAlbumOperation(input, album.albumId, null, 'album.created', album);
+      this.albumOperationEventDrafter?.({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: album.albumId, assetId: null, operationType: 'album.created', createdAt: input.createdAt, title: album.title
+      });
       this.faults.beforeAlbumOperationCommit?.();
       return album;
     });
@@ -541,8 +586,13 @@ export class SqliteRepository implements UploadRepository {
     if (!this.hasGalleryLibrary(libraryId)) return undefined;
     const scope: AlbumCursorScope = { collection: 'albums', libraryId };
     const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, scope);
+    const visibilityFilter = this.hasAlbumLifecycleTables() ? `
+        AND NOT EXISTS (SELECT 1 FROM album_local_visibility v WHERE v.library_id = albums.library_id AND v.album_id = albums.album_id)
+        AND NOT EXISTS (SELECT 1 FROM album_global_delete_tokens d WHERE d.library_id = albums.library_id AND d.album_id = albums.album_id
+          AND NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id))` : '';
     const rows = this.db.prepare(`SELECT album_id, library_id, title, created_by_peer_id, created_at FROM albums
-      WHERE library_id = ? ${lastId === undefined ? '' : 'AND album_id COLLATE BINARY > ?'}
+      WHERE library_id = ? ${visibilityFilter}
+        ${lastId === undefined ? '' : 'AND album_id COLLATE BINARY > ?'}
       ORDER BY album_id COLLATE BINARY LIMIT ?`).all(
         libraryId, ...(lastId === undefined ? [] : [lastId]), limit + 1
       ) as AlbumSqlRow[];
@@ -554,9 +604,128 @@ export class SqliteRepository implements UploadRepository {
     };
   }
 
+  listDeletedAlbums(libraryId: string, scope: AlbumDeletedQueryScope, cursor: string | undefined, limit: number): DeletedAlbumPage | undefined {
+    this.validateAlbumLimit(limit);
+    if (!this.hasAlbumLifecycleTables() || !this.hasGalleryLibrary(libraryId)) return undefined;
+    const cursorScope: AlbumCursorScope = { collection: 'deleted', libraryId, scope };
+    const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, cursorScope);
+    const filter = scope === 'all' ? '(local_hidden_at IS NOT NULL OR global_deleted_at IS NOT NULL)'
+      : scope === 'local' ? 'local_hidden_at IS NOT NULL' : 'global_deleted_at IS NOT NULL';
+    const rows = this.db.prepare(`WITH active_global AS (
+        SELECT d.library_id, d.album_id, MAX(d.created_at) AS global_deleted_at
+        FROM album_global_delete_tokens d
+        WHERE NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id)
+        GROUP BY d.library_id, d.album_id
+      ), album_state AS (
+        SELECT a.album_id, a.library_id, a.title, a.created_by_peer_id, a.created_at,
+          v.hidden_at AS local_hidden_at, g.global_deleted_at
+        FROM albums a
+        LEFT JOIN album_local_visibility v ON v.library_id = a.library_id AND v.album_id = a.album_id
+        LEFT JOIN active_global g ON g.library_id = a.library_id AND g.album_id = a.album_id
+        WHERE a.library_id = ?
+      )
+      SELECT album_id, library_id, title, created_by_peer_id, created_at, local_hidden_at, global_deleted_at
+      FROM album_state WHERE ${filter} ${lastId === undefined ? '' : 'AND album_id COLLATE BINARY > ?'}
+      ORDER BY album_id COLLATE BINARY LIMIT ?`).all(
+        libraryId, ...(lastId === undefined ? [] : [lastId]), limit + 1
+      ) as DeletedAlbumSqlRow[];
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map((row): DeletedAlbumRecord => {
+      const scopes: AlbumDeleteScope[] = [];
+      if (row.local_hidden_at !== null) scopes.push('local');
+      if (row.global_deleted_at !== null) scopes.push('global');
+      const deletedAt = [row.local_hidden_at, row.global_deleted_at].filter((value): value is string => value !== null).sort()[0]!;
+      return { ...toAlbumRecord(row), scopes, deletedAt };
+    });
+    return {
+      items,
+      nextCursor: hasMore && items.length > 0 ? encodeAlbumCursor(cursorScope, items[items.length - 1]!.albumId) : null
+    };
+  }
+
+  deleteAlbum(input: AlbumOperationContext & { albumId: string; scope: AlbumDeleteScope }): AlbumDeletionResult {
+    const write = this.db.transaction((): AlbumDeletionResult => {
+      const replay = this.getAlbumLifecycleReplay<AlbumDeletionResult>(input, input.scope, ['local.hidden', 'local.hide.noop', 'album.deleted', 'album.delete.noop']);
+      if (replay !== undefined) return replay;
+      if (!this.hasAlbum(input.libraryId, input.albumId)) return 'not_found';
+      if (input.scope === 'local') {
+        const hidden = this.db.prepare('SELECT 1 FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
+          .get(input.libraryId, input.albumId);
+        const result: AlbumDeletionResult = hidden ? 'already_deleted' : 'deleted';
+        const operationType = hidden ? 'local.hide.noop' : 'local.hidden';
+        this.insertAlbumVisibilityOperation(input, input.albumId, operationType, result);
+        if (!hidden) this.db.prepare(`INSERT INTO album_local_visibility(library_id,album_id,operation_id,hidden_at) VALUES(?,?,?,?)`)
+          .run(input.libraryId, input.albumId, input.operationId, input.createdAt);
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      if (!this.canAuthorAlbumLifecycleOperation(input.libraryId, input.authorPeerId)) return 'writer_limit';
+      const active = this.getActiveAlbumDeleteIds(input.libraryId, input.albumId);
+      if (active.length > 0) {
+        const result: AlbumDeletionResult = 'already_deleted';
+        this.insertAlbumLifecycleOperation(input, input.albumId, 'album.delete.noop', [], result);
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      if (!this.albumLifecycleEventDrafter) throw new RepositoryConflictError('album lifecycle event drafter is unavailable');
+      const result: AlbumDeletionResult = 'deleted';
+      this.insertAlbumLifecycleOperation(input, input.albumId, 'album.deleted', [], result);
+      this.db.prepare(`INSERT INTO album_global_delete_tokens(delete_event_id,library_id,album_id,author_peer_id,created_at)
+        VALUES(?,?,?,?,?)`).run(input.operationId, input.libraryId, input.albumId, input.authorPeerId, input.createdAt);
+      this.albumLifecycleEventDrafter({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, operationType: 'album.deleted', createdAt: input.createdAt
+      });
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
+  restoreAlbum(input: AlbumOperationContext & { albumId: string; scope: AlbumDeleteScope }): AlbumRestoreResult {
+    const write = this.db.transaction((): AlbumRestoreResult => {
+      const replay = this.getAlbumLifecycleReplay<AlbumRestoreResult>(input, input.scope, ['local.restored', 'local.restore.noop', 'album.restored', 'album.restore.noop']);
+      if (replay !== undefined) return replay;
+      if (!this.hasAlbum(input.libraryId, input.albumId)) return 'not_found';
+      if (input.scope === 'local') {
+        const hidden = this.db.prepare('SELECT 1 FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
+          .get(input.libraryId, input.albumId);
+        const result: AlbumRestoreResult = hidden ? 'restored' : 'already_active';
+        const operationType = hidden ? 'local.restored' : 'local.restore.noop';
+        this.insertAlbumVisibilityOperation(input, input.albumId, operationType, result);
+        if (hidden) this.db.prepare('DELETE FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
+          .run(input.libraryId, input.albumId);
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      const observedDeleteIds = this.getActiveAlbumDeleteIds(input.libraryId, input.albumId);
+      if (observedDeleteIds.length > 64) return 'writer_limit';
+      if (!this.canAuthorAlbumLifecycleOperation(input.libraryId, input.authorPeerId)) return 'writer_limit';
+      if (observedDeleteIds.length === 0) {
+        const result: AlbumRestoreResult = 'already_active';
+        this.insertAlbumLifecycleOperation(input, input.albumId, 'album.restore.noop', [], result);
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      if (!this.albumLifecycleEventDrafter) throw new RepositoryConflictError('album lifecycle event drafter is unavailable');
+      const result: AlbumRestoreResult = 'restored';
+      this.insertAlbumLifecycleOperation(input, input.albumId, 'album.restored', observedDeleteIds, result);
+      const insertTarget = this.db.prepare(`INSERT INTO album_global_restore_targets
+        (restore_operation_id,observed_delete_event_id,library_id,album_id) VALUES(?,?,?,?)`);
+      for (const deleteEventId of observedDeleteIds) insertTarget.run(input.operationId, deleteEventId, input.libraryId, input.albumId);
+      this.albumLifecycleEventDrafter({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, operationType: 'album.restored', createdAt: input.createdAt, observedDeleteIds
+      });
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
   listAlbumMembers(libraryId: string, albumId: string, cursor: string | undefined, limit: number): AlbumMemberPage | undefined {
     this.validateAlbumLimit(limit);
-    if (!this.hasAlbum(libraryId, albumId)) return undefined;
+    if (!this.hasVisibleAlbum(libraryId, albumId)) return undefined;
     const scope: AlbumCursorScope = { collection: 'members', libraryId, albumId };
     const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, scope);
     const rows = this.db.prepare(`SELECT DISTINCT m.asset_id FROM album_memberships m
@@ -585,7 +754,7 @@ export class SqliteRepository implements UploadRepository {
     const write = this.db.transaction((): AlbumMemberMutationResult => {
       const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.added', 'member.add.noop']);
       if (replay !== undefined) return replay;
-      if (!this.hasAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
+      if (!this.hasVisibleAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
         return { status: 'not_found' };
       }
       if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return { status: 'writer_limit' };
@@ -604,6 +773,10 @@ export class SqliteRepository implements UploadRepository {
         (library_id, album_id, asset_id, author_peer_id, add_operation_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?)`).run(input.libraryId, input.albumId, input.assetId,
           input.authorPeerId, input.operationId, input.createdAt);
+      this.albumOperationEventDrafter?.({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, assetId: input.assetId, operationType: 'member.added', createdAt: input.createdAt
+      });
       this.faults.beforeAlbumOperationCommit?.();
       return result;
     });
@@ -614,7 +787,7 @@ export class SqliteRepository implements UploadRepository {
     const write = this.db.transaction((): AlbumMemberMutationResult => {
       const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.removed', 'member.remove.noop']);
       if (replay !== undefined) return replay;
-      if (!this.hasAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
+      if (!this.hasVisibleAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
         return { status: 'not_found' };
       }
       if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return { status: 'writer_limit' };
@@ -636,6 +809,11 @@ export class SqliteRepository implements UploadRepository {
         this.db.prepare(`DELETE FROM album_memberships WHERE library_id = ? AND album_id = ? AND asset_id = ?
           AND add_operation_id = ?`).run(input.libraryId, input.albumId, input.assetId, target.add_operation_id);
       }
+      if (targets.length > 0) this.albumOperationEventDrafter?.({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, assetId: input.assetId, operationType: 'member.removed', createdAt: input.createdAt,
+        observedAddIds
+      });
       this.faults.beforeAlbumOperationCommit?.();
       return result;
     });
@@ -679,6 +857,89 @@ export class SqliteRepository implements UploadRepository {
     return Boolean(this.db.prepare('SELECT 1 FROM albums WHERE library_id = ? AND album_id = ?').get(libraryId, albumId));
   }
 
+  private hasAlbumLifecycleTables(): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='album_global_delete_tokens'").get());
+  }
+
+  private hasVisibleAlbum(libraryId: string, albumId: string): boolean {
+    if (!this.hasAlbumLifecycleTables()) return this.hasAlbum(libraryId, albumId);
+    return Boolean(this.db.prepare(`SELECT 1 FROM albums a WHERE a.library_id = ? AND a.album_id = ?
+      AND NOT EXISTS (SELECT 1 FROM album_local_visibility v WHERE v.library_id = a.library_id AND v.album_id = a.album_id)
+      AND NOT EXISTS (SELECT 1 FROM album_global_delete_tokens d WHERE d.library_id = a.library_id AND d.album_id = a.album_id
+        AND NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id))`)
+      .get(libraryId, albumId));
+  }
+
+  private canAuthorAlbumLifecycleOperation(libraryId: string, authorPeerId: string): boolean {
+    if (this.db.prepare('SELECT 1 FROM album_sync_author_registry WHERE library_id = ? AND author_peer_id = ?')
+      .get(libraryId, authorPeerId)) return true;
+    const count = this.db.prepare('SELECT count(*) AS count FROM album_sync_author_registry WHERE library_id = ?')
+      .get(libraryId) as { count: number };
+    return count.count < 64;
+  }
+
+  private getActiveAlbumDeleteIds(libraryId: string, albumId: string): string[] {
+    return (this.db.prepare(`SELECT d.delete_event_id FROM album_global_delete_tokens d
+      WHERE d.library_id = ? AND d.album_id = ?
+        AND NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id)
+      ORDER BY d.delete_event_id COLLATE BINARY`).all(libraryId, albumId) as Array<{ delete_event_id: string }>)
+      .map((row) => row.delete_event_id);
+  }
+
+  private insertAlbumLifecycleOperation(
+    input: AlbumOperationContext,
+    albumId: string,
+    operationType: 'album.deleted' | 'album.delete.noop' | 'album.restored' | 'album.restore.noop',
+    observedDeleteIds: readonly string[],
+    result: AlbumDeletionResult | AlbumRestoreResult
+  ): void {
+    this.db.prepare(`INSERT INTO album_lifecycle_operations
+      (operation_id,principal_id,author_peer_id,library_id,album_id,operation_type,request_fingerprint,
+       observed_delete_event_ids_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(input.operationId, input.principalId, input.authorPeerId, input.libraryId, albumId, operationType,
+        input.requestFingerprint, JSON.stringify(observedDeleteIds), JSON.stringify(result), input.createdAt);
+  }
+
+  private insertAlbumVisibilityOperation(
+    input: AlbumOperationContext,
+    albumId: string,
+    operationType: 'local.hidden' | 'local.hide.noop' | 'local.restored' | 'local.restore.noop',
+    result: AlbumDeletionResult | AlbumRestoreResult
+  ): void {
+    this.db.prepare(`INSERT INTO album_visibility_operations
+      (operation_id,principal_id,author_peer_id,library_id,album_id,operation_type,request_fingerprint,result_json,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(input.operationId, input.principalId, input.authorPeerId, input.libraryId, albumId, operationType,
+        input.requestFingerprint, JSON.stringify(result), input.createdAt);
+  }
+
+  private getAlbumLifecycleReplay<T>(
+    input: AlbumOperationContext,
+    scope: AlbumDeleteScope,
+    allowedTypes: readonly string[]
+  ): T | undefined {
+    type LifecycleReplayRow = { principal_id: string; request_fingerprint: string; operation_type: string; result_json: string };
+    const local = this.db.prepare(`SELECT principal_id,request_fingerprint,operation_type,result_json FROM album_visibility_operations WHERE operation_id=?`)
+      .get(input.operationId) as LifecycleReplayRow | undefined;
+    const global = this.db.prepare(`SELECT principal_id,request_fingerprint,operation_type,result_json FROM album_lifecycle_operations WHERE operation_id=?`)
+      .get(input.operationId) as LifecycleReplayRow | undefined;
+    const priorAlbumOperation = this.db.prepare('SELECT 1 FROM album_operations WHERE operation_id=?').get(input.operationId);
+    const expected = scope === 'local' ? local : global;
+    const opposite = scope === 'local' ? global : local;
+    if (!expected) {
+      const registered = this.db.prepare('SELECT 1 FROM sync_global_id_registry WHERE global_id=?').get(input.operationId);
+      if (opposite || priorAlbumOperation || registered) {
+        throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+      }
+      return undefined;
+    }
+    if (opposite || priorAlbumOperation || expected.principal_id !== input.principalId ||
+        expected.request_fingerprint !== input.requestFingerprint || !allowedTypes.includes(expected.operation_type)) {
+      throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+    }
+    return JSON.parse(expected.result_json) as T;
+  }
+
   private canAuthorAlbumOperation(libraryId: string, authorPeerId: string): boolean {
     const known = this.db.prepare('SELECT 1 FROM album_operations WHERE library_id = ? AND author_peer_id = ? LIMIT 1')
       .get(libraryId, authorPeerId);
@@ -713,7 +974,12 @@ export class SqliteRepository implements UploadRepository {
       FROM album_operations WHERE operation_id = ?`).get(input.operationId) as {
         principal_id: string; request_fingerprint: string; operation_type: string; result_json: string;
       } | undefined;
-    if (!row) return undefined;
+    if (!row) {
+      if (this.hasAlbumLifecycleTables() && this.db.prepare('SELECT 1 FROM sync_global_id_registry WHERE global_id = ?').get(input.operationId)) {
+        throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+      }
+      return undefined;
+    }
     if (row.principal_id !== input.principalId || row.request_fingerprint !== input.requestFingerprint ||
       !allowedTypes.includes(row.operation_type)) {
       throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
@@ -1088,6 +1354,11 @@ interface AlbumSqlRow {
   title: string;
   created_by_peer_id: string;
   created_at: string;
+}
+
+interface DeletedAlbumSqlRow extends AlbumSqlRow {
+  local_hidden_at: string | null;
+  global_deleted_at: string | null;
 }
 
 function toAlbumRecord(row: AlbumSqlRow): AlbumRecord {

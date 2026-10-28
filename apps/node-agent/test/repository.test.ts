@@ -2,6 +2,61 @@ import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { assertQuickCheckResults, MigrationError, RepositoryConflictError, SqliteRepository, verifySqliteIntegrity } from '../src/db/repository.js';
 import { migrations } from '../src/db/migrations.js';
+import { AlbumSyncRepository } from '../src/sync/album-sync-repository.js';
+import { makeUnsignedEvent, type AlbumSyncEventType, type EventEnvelope, type JsonValue } from '../src/sync/event-envelope.js';
+
+const albumNow = '2026-11-01T00:00:00.000Z';
+const albumAuthor = '12D3KooWPM045LocalAuthor';
+const albumRelay = '12D3KooWPM045RelayPeer';
+const albumRemote = '12D3KooWPM045RemoteAuthor';
+const albumUuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
+const testSignature = 'a'.repeat(86);
+
+function lifecycleFactory(operationId: string) {
+  return (input: { context: { authorSequence: number; causalParents: string[] }; libraryId: string; authorPeerId: string;
+    eventType: string; payload: JsonValue; createdAt: string }) => makeUnsignedEvent({
+      eventId: operationId, libraryId: input.libraryId, authorPeerId: input.authorPeerId,
+      authorSequence: input.context.authorSequence, causalParents: input.context.causalParents,
+      eventType: input.eventType as AlbumSyncEventType, payload: input.payload, createdAt: input.createdAt
+    });
+}
+
+function albumContext(operationId: string, requestFingerprint = '1'.repeat(64), scope: 'local' | 'global' = 'local') {
+  return { operationId, principalId: 'local-admin', authorPeerId: albumAuthor, libraryId: 'family',
+    requestFingerprint, createdAt: albumNow, scope } as const;
+}
+
+async function setupAlbumLifecycle() {
+  const db = new Database(':memory:');
+  const repository = new SqliteRepository(db);
+  await repository.migrate(migrations);
+  db.prepare(`INSERT INTO assets(asset_id,library_id,origin_node_id,kind,created_at)
+    VALUES('asset-for-albums','family',?,'photo',?)`).run(albumAuthor, albumNow);
+  const albumSync = new AlbumSyncRepository(db, () => albumNow);
+  repository.setAlbumOperationEventDrafter((input) => {
+    if (input.operationType !== 'album.created') return;
+    albumSync.reserveLocalDraft({
+      operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId, albumId: input.albumId,
+      assetId: null, operationType: 'album.created', createdAt: input.createdAt,
+      ...(input.title === undefined ? {} : { title: input.title }), draftFactory: lifecycleFactory(input.operationId)
+    });
+  });
+  const created = repository.createAlbum({ ...albumContext(albumUuid(100)), title: 'Lifecycle album' });
+  if (!created || created === 'writer_limit') throw new Error('album fixture create failed');
+  const createDraft = albumSync.getUnsignedLocalDrafts(albumAuthor)[0]!;
+  albumSync.completeLocalDraft({ ...createDraft, signature: testSignature });
+  repository.setAlbumLifecycleEventDrafter((input) => albumSync.reserveLocalLifecycleDraft({
+    ...input, draftFactory: lifecycleFactory(input.operationId)
+  }));
+  db.prepare(`INSERT INTO trusted_peers(peer_id,public_key,label,trust_state,created_at)
+    VALUES(?, 'AQ==', ?, 'trusted', ?)`).run(albumRemote, albumRemote, albumNow);
+  db.prepare(`INSERT INTO trusted_peers(peer_id,public_key,label,trust_state,created_at)
+    VALUES(?, 'AQ==', ?, 'trusted', ?)`).run(albumRelay, albumRelay, albumNow);
+  db.prepare(`INSERT INTO sync_remote_library_grants(peer_id,library_id,observed_at) VALUES(?, 'family', ?)`)
+    .run(albumRelay, albumNow);
+  albumSync.setAlbumDeleteGrant('family', albumRemote, albumNow);
+  return { db, repository, albumSync, album: created, createEventId: createDraft.eventId };
+}
 
 describe('SQLite repository and migrations', () => {
   it('fails closed on corrupt or ambiguous SQLite quick-check results without exposing details', () => {
@@ -128,11 +183,11 @@ describe('SQLite repository and migrations', () => {
       .run('family', 'local-asset', 'legacy', '2026-10-28T00:00:00.000Z');
     db.prepare(`INSERT INTO sync_event_log (event_id, library_id, author_peer_id, author_sequence, protocol_version,
       schema_version, event_type, causal_parents_json, payload_json, created_at, signature, envelope_json, state)
-      VALUES ('projection-event', 'family', 'remote-node', 1, 1, 1, 'asset.indexed', '[]', '{}', ?, 'sig', '{}', 'ready')`)
+      VALUES ('00000000-0000-4000-8000-000000000001', 'family', 'remote-node', 1, 1, 1, 'asset.indexed', '[]', '{}', ?, 'sig', '{}', 'ready')`)
       .run('2026-10-28T00:00:00.000Z');
     db.prepare(`INSERT INTO sync_asset_projection (library_id, asset_id, origin_node_id, kind, sha256, byte_length,
       metadata_json, tombstone_event_id, restored_by_event_id, last_event_id)
-      VALUES ('family', 'projected-asset', 'remote-node', 'photo', ?, 4, '{}', NULL, NULL, 'projection-event')`)
+      VALUES ('family', 'projected-asset', 'remote-node', 'photo', ?, 4, '{}', NULL, NULL, '00000000-0000-4000-8000-000000000001')`)
       .run('a'.repeat(64));
     const addingTagSync = new SqliteRepository(db, { backupBeforeMigration: async () => undefined });
     await addingTagSync.migrate(beforeAlbums);
@@ -364,6 +419,186 @@ describe('SQLite repository and migrations', () => {
     ])).rejects.toThrow('duplicate migration id');
     db.exec("INSERT INTO schema_migrations VALUES ('0009_future', 'checksum', 'now')");
     await expect(repository.migrate([])).rejects.toThrow('unknown migration');
+    db.close();
+  });
+
+  it('hides and restores an album locally without creating album-sync events', async () => {
+    const { db, repository, album, albumSync } = await setupAlbumLifecycle();
+    const eventCount = db.prepare('SELECT COUNT(*) AS n FROM album_sync_event_log').get();
+    const context = { ...albumContext(albumUuid(101)), albumId: album.albumId, scope: 'local' as const };
+    expect(repository.deleteAlbum(context)).toBe('deleted');
+    expect(repository.deleteAlbum(context)).toBe('deleted');
+    expect(repository.listAlbums('family', undefined, 10)?.items).toEqual([]);
+    expect(repository.listAlbumMembers('family', album.albumId, undefined, 10)).toBeUndefined();
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_sync_event_log').get()).toEqual(eventCount);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_visibility_operations').get()).toEqual({ n: 1 });
+    expect(repository.restoreAlbum({ ...albumContext(albumUuid(102)), albumId: album.albumId, scope: 'local' })).toBe('restored');
+    expect(repository.restoreAlbum({ ...albumContext(albumUuid(103)), albumId: album.albumId, scope: 'local' })).toBe('already_active');
+    expect(repository.listAlbums('family', undefined, 10)?.items).toHaveLength(1);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_sync_event_log').get()).toEqual(eventCount);
+    expect(albumSync.eventsMissingForPeer(albumRelay, [])).toEqual([]);
+    db.close();
+  });
+
+  it('records global delete/restore drafts with concurrent observed tokens and idempotency', async () => {
+    const { db, repository, album, albumSync, createEventId } = await setupAlbumLifecycle();
+    const deletedContext = { ...albumContext(albumUuid(111), '2'.repeat(64), 'global'), albumId: album.albumId };
+    expect(repository.deleteAlbum(deletedContext)).toBe('deleted');
+    const deleteDraft = albumSync.getUnsignedLocalDrafts(albumAuthor).find((event) => event.eventId === deletedContext.operationId)!;
+    expect(deleteDraft).toMatchObject({ eventType: 'album.deleted', causalParents: [createEventId], payload: { albumId: album.albumId } });
+    albumSync.completeLocalDraft({ ...deleteDraft, signature: testSignature });
+    expect(repository.deleteAlbum(deletedContext)).toBe('deleted');
+    expect(() => repository.deleteAlbum({ ...deletedContext, requestFingerprint: '3'.repeat(64) })).toThrow(RepositoryConflictError);
+    expect(() => repository.deleteAlbum({ ...deletedContext, scope: 'local' })).toThrow(RepositoryConflictError);
+
+    const remoteDeleteId = albumUuid(112);
+    const remoteDelete = { ...makeUnsignedEvent({ eventId: remoteDeleteId, libraryId: 'family', authorPeerId: albumRemote,
+      authorSequence: 1, causalParents: [createEventId], eventType: 'album.deleted',
+      payload: { albumId: album.albumId }, createdAt: albumNow }), signature: testSignature } satisfies EventEnvelope;
+    expect(albumSync.ingest(albumRelay, remoteDelete).status).toBe('applied');
+    const expectedDeleteIds = [deletedContext.operationId, remoteDeleteId].sort();
+    const restoredContext = { ...albumContext(albumUuid(113), '4'.repeat(64), 'global'), albumId: album.albumId };
+    expect(repository.restoreAlbum(restoredContext)).toBe('restored');
+    const restoreDraft = albumSync.getUnsignedLocalDrafts(albumAuthor).find((event) => event.eventId === restoredContext.operationId)!;
+    expect(restoreDraft).toMatchObject({ eventType: 'album.restored', causalParents: expectedDeleteIds,
+      payload: { albumId: album.albumId, observedDeleteEventIds: expectedDeleteIds } });
+    albumSync.completeLocalDraft({ ...restoreDraft, signature: testSignature });
+    expect(repository.restoreAlbum(restoredContext)).toBe('restored');
+    expect(repository.listDeletedAlbums('family', 'global', undefined, 10)?.items).toEqual([]);
+    expect(repository.listAlbums('family', undefined, 10)?.items).toHaveLength(1);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_global_restore_targets WHERE restore_operation_id=?').get(restoredContext.operationId))
+      .toEqual({ n: 2 });
+    expect(() => repository.restoreAlbum({ ...restoredContext, scope: 'local' })).toThrow(RepositoryConflictError);
+    db.close();
+  });
+
+  it('lists deletion scopes once and binds deleted-album cursors to the query scope', async () => {
+    const { db, repository, album, albumSync } = await setupAlbumLifecycle();
+    const otherIds = [albumUuid(120), albumUuid(121)];
+    for (const [index, albumId] of otherIds.entries()) {
+      db.prepare(`INSERT INTO albums(album_id,library_id,title,created_by_peer_id,created_at) VALUES(?,'family',?,?,?)`)
+        .run(albumId, `Other ${index}`, albumAuthor, albumNow);
+    }
+    expect(repository.deleteAlbum({ ...albumContext(albumUuid(122)), albumId: album.albumId, scope: 'local' })).toBe('deleted');
+    expect(repository.deleteAlbum({ ...albumContext(albumUuid(123), '5'.repeat(64), 'global'), albumId: album.albumId, scope: 'global' })).toBe('deleted');
+    expect(repository.deleteAlbum({ ...albumContext(albumUuid(124)), albumId: otherIds[0]!, scope: 'local' })).toBe('deleted');
+    expect(repository.deleteAlbum({ ...albumContext(albumUuid(125)), albumId: otherIds[1]!, scope: 'local' })).toBe('deleted');
+
+    const first = repository.listDeletedAlbums('family', 'all', undefined, 1)!;
+    const allItems = [...first.items];
+    expect(() => repository.listDeletedAlbums('family', 'global', first.nextCursor!, 1)).toThrow();
+    let cursor = first.nextCursor;
+    while (cursor) {
+      const page = repository.listDeletedAlbums('family', 'all', cursor, 1)!;
+      allItems.push(...page.items);
+      cursor = page.nextCursor;
+    }
+    expect(allItems.map((item) => item.albumId)).toEqual([...allItems.map((item) => item.albumId)].sort());
+    expect(new Set(allItems.map((item) => item.albumId)).size).toBe(3);
+    expect(allItems.find((item) => item.albumId === album.albumId)?.scopes).toEqual(['local', 'global']);
+    expect(repository.listDeletedAlbums('family', 'local', undefined, 10)?.items).toHaveLength(3);
+    expect(repository.listDeletedAlbums('family', 'global', undefined, 10)?.items).toHaveLength(1);
+    expect(repository.listAlbums('family', undefined, 10)?.items).toEqual([]);
+    expect(repository.listAlbumMembers('family', album.albumId, undefined, 10)).toBeUndefined();
+    expect(repository.listAlbumMembers('family', otherIds[0]!, undefined, 10)).toBeUndefined();
+
+    expect(repository.restoreAlbum({ ...albumContext(albumUuid(126)), albumId: album.albumId, scope: 'local' })).toBe('restored');
+    expect(repository.listAlbums('family', undefined, 10)?.items).toEqual([]);
+    expect(repository.listDeletedAlbums('family', 'global', undefined, 10)?.items.map((item) => item.albumId)).toEqual([album.albumId]);
+    const globalDeleteDraft = albumSync.getUnsignedLocalDrafts(albumAuthor).find((draft) => draft.eventId === albumUuid(123))!;
+    albumSync.completeLocalDraft({ ...globalDeleteDraft, signature: testSignature });
+    expect(repository.restoreAlbum({ ...albumContext(albumUuid(127), 'c'.repeat(64), 'global'), albumId: album.albumId, scope: 'global' }))
+      .toBe('restored');
+    expect(repository.listAlbums('family', undefined, 10)?.items.map((item) => item.albumId)).toEqual([album.albumId]);
+    expect(repository.listDeletedAlbums('family', 'local', undefined, 10)?.items.map((item) => item.albumId)).toEqual(otherIds);
+    db.close();
+  });
+
+  it('restores all 64 active delete tokens as sorted causal parents', async () => {
+    const { db, repository, album, albumSync, createEventId } = await setupAlbumLifecycle();
+    const localDelete = { ...albumContext(albumUuid(140), 'a'.repeat(64), 'global'), albumId: album.albumId };
+    expect(repository.deleteAlbum(localDelete)).toBe('deleted');
+    const deleteDraft = albumSync.getUnsignedLocalDrafts(albumAuthor).find((draft) => draft.eventId === localDelete.operationId)!;
+    albumSync.completeLocalDraft({ ...deleteDraft, signature: testSignature });
+    for (let index = 0; index < 63; index += 1) {
+      const authorPeerId = `12D3KooWPM045Remote${index.toString().padStart(3, '0')}`;
+      db.prepare(`INSERT INTO trusted_peers(peer_id,public_key,label,trust_state,created_at) VALUES(?, 'AQ==', ?, 'trusted', ?)`)
+        .run(authorPeerId, authorPeerId, albumNow);
+      albumSync.setAlbumDeleteGrant('family', authorPeerId, albumNow);
+      const deleteEvent = { ...makeUnsignedEvent({ eventId: albumUuid(400 + index), libraryId: 'family', authorPeerId,
+        authorSequence: 1, causalParents: [createEventId], eventType: 'album.deleted', payload: { albumId: album.albumId }, createdAt: albumNow }),
+        signature: testSignature } satisfies EventEnvelope;
+      expect(albumSync.ingest(albumRelay, deleteEvent).status).toBe('applied');
+    }
+    const activeIds = (db.prepare(`SELECT d.delete_event_id FROM album_global_delete_tokens d WHERE d.library_id='family' AND d.album_id=?
+      AND NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id=d.delete_event_id)
+      ORDER BY d.delete_event_id COLLATE BINARY`).all(album.albumId) as Array<{ delete_event_id: string }>).map((row) => row.delete_event_id);
+    expect(activeIds).toHaveLength(64);
+    const restoreContext = { ...albumContext(albumUuid(141), 'b'.repeat(64), 'global'), albumId: album.albumId };
+    expect(repository.restoreAlbum(restoreContext)).toBe('restored');
+    const restoreDraft = albumSync.getUnsignedLocalDrafts(albumAuthor).find((draft) => draft.eventId === restoreContext.operationId)!;
+    expect(restoreDraft.eventType).toBe('album.restored');
+    expect(restoreDraft.causalParents).toEqual(activeIds);
+    expect(restoreDraft.causalParents).toHaveLength(64);
+    expect(restoreDraft.causalParents).not.toContain(createEventId);
+    db.close();
+  });
+
+  it('applies album-stream signing recovery rules to lifecycle drafts atomically', async () => {
+    const { db, repository, album, albumSync } = await setupAlbumLifecycle();
+    const deleteContext = { ...albumContext(albumUuid(128), 'd'.repeat(64), 'global'), albumId: album.albumId };
+    expect(repository.deleteAlbum(deleteContext)).toBe('deleted');
+    const restoreContext = { ...albumContext(albumUuid(129), 'e'.repeat(64), 'global'), albumId: album.albumId };
+    expect(() => repository.restoreAlbum(restoreContext)).toThrow('earlier album draft requires signing recovery');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_lifecycle_operations WHERE operation_id=?').get(restoreContext.operationId))
+      .toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_global_restore_targets WHERE restore_operation_id=?').get(restoreContext.operationId))
+      .toEqual({ n: 0 });
+    const deleteDraft = albumSync.getUnsignedLocalDrafts(albumAuthor).find((draft) => draft.eventId === deleteContext.operationId)!;
+    albumSync.completeLocalDraft({ ...deleteDraft, signature: testSignature });
+    expect(repository.restoreAlbum(restoreContext)).toBe('restored');
+    expect(albumSync.getUnsignedLocalDrafts(albumAuthor).some((draft) => draft.eventId === restoreContext.operationId)).toBe(true);
+    db.close();
+  });
+
+  it('rolls back global state when lifecycle draft reservation throws', async () => {
+    const { db, repository, album } = await setupAlbumLifecycle();
+    repository.setAlbumLifecycleEventDrafter(() => { throw new Error('draft reservation failed'); });
+    expect(() => repository.deleteAlbum({ ...albumContext(albumUuid(130), '6'.repeat(64), 'global'), albumId: album.albumId, scope: 'global' }))
+      .toThrow('draft reservation failed');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_lifecycle_operations').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_global_delete_tokens').get()).toEqual({ n: 0 });
+    expect(repository.listAlbums('family', undefined, 10)?.items).toHaveLength(1);
+    expect(db.prepare('SELECT 1 FROM sync_global_id_registry WHERE global_id=?').get(albumUuid(130))).toBeUndefined();
+    db.close();
+  });
+
+  it('returns writer_limit without mutation when global delete-token or author cap is reached', async () => {
+    const { db, repository, album } = await setupAlbumLifecycle();
+    const insertOperation = db.prepare(`INSERT INTO album_lifecycle_operations
+      (operation_id,principal_id,author_peer_id,library_id,album_id,operation_type,request_fingerprint,observed_delete_event_ids_json,result_json,created_at)
+      VALUES(?, 'seed', ?, 'family', ?, 'album.deleted', ?, '[]', '{"status":"deleted"}', ?)`);
+    const insertToken = db.prepare(`INSERT INTO album_global_delete_tokens(delete_event_id,library_id,album_id,author_peer_id,created_at)
+      VALUES(?, 'family', ?, ?, ?)`);
+    for (let index = 0; index < 65; index += 1) {
+      const tokenId = albumUuid(200 + index);
+      insertOperation.run(tokenId, albumAuthor, album.albumId, '7'.repeat(64), albumNow);
+      insertToken.run(tokenId, album.albumId, albumAuthor, albumNow);
+    }
+    expect(repository.restoreAlbum({ ...albumContext(albumUuid(300), '8'.repeat(64), 'global'), albumId: album.albumId, scope: 'global' }))
+      .toBe('writer_limit');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_lifecycle_operations').get()).toEqual({ n: 65 });
+
+    const secondAlbumId = albumUuid(301);
+    db.prepare(`INSERT INTO albums(album_id,library_id,title,created_by_peer_id,created_at) VALUES(?,'family','Author cap',?,?)`)
+      .run(secondAlbumId, albumAuthor, albumNow);
+    db.prepare(`INSERT INTO album_sync_author_registry(library_id,author_peer_id,first_seen_at)
+      SELECT 'family', 'synthetic-author-' || value, ? FROM json_each(?)`)
+      .run(albumNow, JSON.stringify(Array.from({ length: 63 }, (_, index) => index)));
+    expect(repository.deleteAlbum({ ...albumContext(albumUuid(302), '9'.repeat(64), 'global'),
+      authorPeerId: 'new-author-over-limit', albumId: secondAlbumId, scope: 'global' })).toBe('writer_limit');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_lifecycle_operations WHERE album_id=?').get(secondAlbumId)).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM album_global_delete_tokens WHERE album_id=?').get(secondAlbumId)).toEqual({ n: 0 });
     db.close();
   });
 

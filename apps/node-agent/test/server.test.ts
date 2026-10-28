@@ -5,6 +5,7 @@ import { createNodeAgentServer, type MediaVersionServerControl, type NodeAgentSe
 import { MediaThumbnailService } from '../src/media/thumbnail-service.js';
 import type { MediaThumbnailTransformer } from '../src/media/image-transformer.js';
 import { RepositoryConflictError, type MediaVersionSourceRecord } from '../src/db/repository.js';
+import { decodeAlbumCursor, encodeAlbumCursor } from '../src/albums/album-utils.js';
 
 const servers: ReturnType<typeof createNodeAgentServer>[] = [];
 
@@ -617,6 +618,55 @@ describe('pairing and library authorization endpoints', () => {
     expect(revokeTagWrite).toHaveBeenCalledWith('peer-writer', 'family');
   });
 
+  it('protects independently-scoped album write/delete grants and sync status', async () => {
+    const grantAlbumWrite = vi.fn(() => ({ peerId: 'peer-writer', libraryId: 'family', permission: 'album-write' as const, granted: true }));
+    const revokeAlbumDelete = vi.fn(() => ({ peerId: 'peer-writer', libraryId: 'family', permission: 'album-delete' as const, granted: false }));
+    const options: NodeAgentServerOptions = {
+      pairingControl: pairingControl({
+        grantAlbumWrite, revokeAlbumDelete,
+        listAlbumSyncGrants: () => ({ grants: [
+          { peerId: 'peer-writer', libraryId: 'family', permission: 'album-write', granted: true },
+          { peerId: 'peer-delete', libraryId: 'family', permission: 'album-delete', granted: true }
+        ] }),
+        getAlbumSyncStatus: () => ({ peerId: 'peer-writer', pendingEvents: 2, lastErrorCode: 'unauthorized' })
+      }),
+      authorizePairingAdmin: (token) => token === 'admin-secret'
+    };
+    const body = JSON.stringify({ enabled: true });
+    const denied = await request('/v1/pairing/peers/peer-writer/libraries/family/album-write', options, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body
+    });
+    expect(denied.status).toBe(403);
+    expect(grantAlbumWrite).not.toHaveBeenCalled();
+
+    const invalid = await request('/v1/pairing/peers/peer-writer/libraries/family/album-write', options, {
+      method: 'PUT', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false })
+    });
+    expect(invalid.status).toBe(400);
+
+    const granted = await request('/v1/pairing/peers/peer-writer/libraries/family/album-write', options, {
+      method: 'PUT', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' }, body
+    });
+    expect(granted.status).toBe(200);
+    expect(await granted.json()).toEqual({ peerId: 'peer-writer', libraryId: 'family', permission: 'album-write', granted: true });
+    expect(grantAlbumWrite).toHaveBeenCalledWith('peer-writer', 'family', expect.any(String));
+
+    const grants = await request('/v1/pairing/libraries/family/album-sync-grants', options, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(await grants.json()).toEqual({ grants: [
+      { peerId: 'peer-writer', libraryId: 'family', permission: 'album-write', granted: true },
+      { peerId: 'peer-delete', libraryId: 'family', permission: 'album-delete', granted: true }
+    ] });
+    const status = await request('/v1/pairing/peers/peer-writer/album-sync-status', options, { headers: { authorization: 'Bearer admin-secret' } });
+    expect(await status.json()).toEqual({ peerId: 'peer-writer', pendingEvents: 2, lastErrorCode: 'unauthorized' });
+
+    const revoked = await request('/v1/pairing/peers/peer-writer/libraries/family/album-delete', options, {
+      method: 'DELETE', headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(revoked.status).toBe(200);
+    expect(await revoked.json()).toMatchObject({ permission: 'album-delete', granted: false });
+    expect(revokeAlbumDelete).toHaveBeenCalledWith('peer-writer', 'family', expect.any(String));
+  });
+
   it('validates local approval payloads and bounds library pagination', async () => {
     const options: NodeAgentServerOptions = {
       pairingControl: pairingControl({ readLibraryIndex: () => [] }), authorizePairingAdmin: (token) => token === 'admin-secret',
@@ -742,6 +792,72 @@ describe('virtual albums HTTP API', () => {
     }));
     expect(response.headers.get('cache-control')).toBe('private, no-store');
     expect(response.headers.get('x-request-id')).toBeTruthy();
+  });
+
+  it('administers reversible album deletion and restore with scoped idempotency', async () => {
+    const deleteAlbum = vi.fn(() => 'deleted' as const);
+    const restoreAlbum = vi.fn(() => 'restored' as const);
+    const options = albumOptions({ deleteAlbum, restoreAlbum });
+    const body = JSON.stringify({ scope: 'local' });
+    const unauthenticated = await request('/v1/libraries/family/albums/album-1/deletion', options, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body
+    });
+    expect(unauthenticated.status).toBe(403);
+
+    const missingKey = await request('/v1/libraries/family/albums/album-1/deletion', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json' }, body
+    });
+    expect(missingKey.status).toBe(400);
+    expect(deleteAlbum).not.toHaveBeenCalled();
+
+    const invalidScope = await request('/v1/libraries/family/albums/album-1/deletion', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json', 'idempotency-key': operationKey },
+      body: JSON.stringify({ scope: 'remote' })
+    });
+    expect(invalidScope.status).toBe(400);
+
+    const deleted = await request('/v1/libraries/family/albums/album-1/deletion', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json', 'idempotency-key': operationKey }, body
+    });
+    expect(deleted.status).toBe(204);
+    expect(deleteAlbum).toHaveBeenCalledWith(expect.objectContaining({
+      operationId: operationKey, libraryId: 'family', albumId: 'album-1', scope: 'local', principalId: 'local-admin'
+    }));
+
+    const restored = await request('/v1/libraries/family/albums/album-1/restore', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json', 'idempotency-key': '223e4567-e89b-42d3-a456-426614174000' },
+      body: JSON.stringify({ scope: 'global' })
+    });
+    expect(restored.status).toBe(204);
+    expect(restoreAlbum).toHaveBeenCalledWith(expect.objectContaining({
+      operationId: '223e4567-e89b-42d3-a456-426614174000', libraryId: 'family', albumId: 'album-1', scope: 'global'
+    }));
+    expect(restored.headers.get('cache-control')).toBe('private, no-store');
+  });
+
+  it('pages soft-deleted albums by scope and projects strict DTOs', async () => {
+    const nextCursor = encodeAlbumCursor({ collection: 'deleted', libraryId: 'family', scope: 'all' }, albumRecord.albumId);
+    expect(decodeAlbumCursor(nextCursor, { collection: 'deleted', libraryId: 'family', scope: 'all' })).toBe('album-1');
+    const listDeletedAlbums = vi.fn(() => ({
+      items: [{ ...albumRecord, scopes: ['local' as 'local' | 'global'], deletedAt: '2026-10-28T00:00:00.000Z', sourcePath: 'D:\\secret.jpg' }],
+      nextCursor
+    }));
+    const options = albumOptions({ listDeletedAlbums });
+    const unauthorized = await request('/v1/libraries/family/albums/deleted?scope=local', options);
+    expect(unauthorized.status).toBe(403);
+
+    const page = await request('/v1/libraries/family/albums/deleted?scope=all&limit=1', options, { headers: adminHeaders });
+    const pageText = await page.text();
+    expect(page.status, pageText).toBe(200);
+    expect(JSON.parse(pageText)).toEqual({
+      items: [{ ...albumRecord, scopes: ['local' as 'local' | 'global'], deletedAt: '2026-10-28T00:00:00.000Z' }], nextCursor
+    });
+    expect(listDeletedAlbums).toHaveBeenCalledWith('family', 'all', undefined, 1);
+    expect(page.headers.get('cache-control')).toBe('private, no-store');
+
+    const invalid = await request('/v1/libraries/family/albums/deleted?scope=unknown', options, { headers: adminHeaders });
+    expect(invalid.status).toBe(400);
+    expect(listDeletedAlbums).toHaveBeenCalledOnce();
   });
 
   it('requires operation keys for membership writes and maps idempotency/writer conflicts', async () => {

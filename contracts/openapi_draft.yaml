@@ -144,6 +144,92 @@ paths:
         '409': {description: Global idempotency key conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/deletion:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    post:
+      summary: Locally-administered reversible soft deletion of a virtual album
+      description: Requires the local node administrator. local creates a node-local tombstone; global creates a replicated deletion event subject to album-delete grants. Both are reversible; this API never physically purges an album or source asset.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumDeletionRequest'}}}
+      responses:
+        '204':
+          description: Deletion recorded or idempotent no-op replay; no body
+          headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '400': {description: 'Invalid scope, request, or idempotency key', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Album absent or not authorized; no cross-library disclosure, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or required global album-delete grant absent, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error using the common error envelope, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/deleted:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: Page reversible soft-deleted albums visible at this node
+      description: Local-admin only. Keyset cursor is not an MVCC snapshot; scope selects all, local-only, or globally replicated tombstones. No physical purge is performed.
+      parameters:
+        - in: query
+          name: scope
+          required: true
+          schema: {type: string, enum: [all, local, global]}
+        - in: query
+          name: cursor
+          schema: {type: string, maxLength: 2048}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Deleted album page without total count
+          content: {application/json: {schema: {$ref: '#/components/schemas/DeletedAlbumPage'}}}
+          headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '400': {description: Invalid or repeated query parameter or cursor, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown or unauthorized library, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error using the common error envelope, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/restore:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    post:
+      summary: Restore a soft-deleted album locally or globally
+      description: Requires the local node administrator. Restores only the selected tombstone scope; the operation is reversible and never purges data.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumRestoreRequest'}}}
+      responses:
+        '204':
+          description: Album restored or scope was already active; no body
+          headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '400': {description: Invalid scope or request, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Deleted album absent or not authorized, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Global restore grant missing or tombstone state conflicts, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error using the common error envelope, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries/{libraryId}/albums/{albumId}/members:
     parameters:
       - in: path
@@ -869,6 +955,106 @@ paths:
             X-Request-ID: {$ref: '#/components/headers/XRequestId'}
         '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '503': {description: Tag sync capability is unavailable on this node, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/album-write:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: Local-admin grant of album metadata write authority to a trusted peer
+      description: Separate from read access and album-delete authority; default-deny. Does not grant deletion.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      summary: Local-admin revocation of a peer album metadata write grant
+      description: Revocation blocks future authorized writes but cannot retract events already replicated.
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/album-delete:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: Local-admin grant of separately-scoped album deletion authority
+      description: Independent of album-write and read grants; default-deny.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      summary: Local-admin revocation of a peer album deletion grant
+      description: Revocation blocks future authorized deletion events but cannot retract events already replicated.
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/libraries/{libraryId}/album-sync-grants:
+    get:
+      summary: Operator-visible active album write and delete grants for a library
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200':
+          description: Active grants only; no user content or unrelated resource enumeration
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantList'}}}
+          headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/album-sync-status:
+    get:
+      summary: Operator-visible album sync queue and authorization status for a peer
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200':
+          description: Operational counters and enumerated error only
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncPeerStatus'}}}
+          headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/pairing/discovered:
     get:
       summary: 获取 mDNS 发现的未信任节点地址（发现不代表信任）
@@ -1094,7 +1280,7 @@ components:
       in: header
       required: true
       description: UUID operation ID globally unique across libraries, resources and mutation types; retained durably for replay.
-      schema: {type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+      schema: {type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
   schemas:
     Album:
       type: object
@@ -1140,6 +1326,85 @@ components:
       properties:
         items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AlbumMember'}}
         nextCursor: {type: [string, 'null'], maxLength: 2048}
+    AlbumDeletionRequest:
+      type: object
+      additionalProperties: false
+      required: [scope]
+      properties:
+        scope: {type: string, enum: [local, global]}
+    AlbumDeletionResult:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, scope, status, deletedAt]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        scope: {type: string, enum: [local, global]}
+        status: {type: string, enum: [deleted, already_deleted]}
+        deletedAt: {type: string, format: date-time}
+    AlbumRestoreRequest:
+      type: object
+      additionalProperties: false
+      required: [scope]
+      properties:
+        scope: {type: string, enum: [local, global]}
+    AlbumRestoreResult:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, scope, status]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        scope: {type: string, enum: [local, global]}
+        status: {type: string, enum: [restored, already_active]}
+    DeletedAlbum:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, title, createdByPeerId, createdAt, scopes, deletedAt]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        title: {type: string}
+        createdByPeerId: {type: string, minLength: 1, maxLength: 128}
+        createdAt: {type: string, format: date-time}
+        scopes: {type: array, minItems: 1, maxItems: 2, uniqueItems: true, items: {type: string, enum: [local, global]}}
+        deletedAt: {type: string, format: date-time}
+    DeletedAlbumPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/DeletedAlbum'}}
+        nextCursor: {type: [string, 'null'], maxLength: 2048}
+    AlbumSyncGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: {type: boolean, const: true, description: Grant enabled; revoke using DELETE.}
+    AlbumSyncGrantStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, libraryId, permission, granted]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        permission: {type: string, enum: [album-write, album-delete]}
+        granted: {type: boolean}
+    AlbumSyncGrantList:
+      type: object
+      additionalProperties: false
+      required: [grants]
+      properties:
+        grants: {type: array, items: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}
+    AlbumSyncPeerStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, pendingEvents, lastErrorCode]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        pendingEvents: {type: integer, minimum: 0}
+        lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
     NodeDiagnostics:
       type: object
       additionalProperties: false
@@ -1177,7 +1442,7 @@ components:
         version: {type: integer, const: 1}
         hostPeerId: {type: string}
         addresses: {type: array, items: {type: string}}
-        inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+        inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
         secret: {type: string, minLength: 43, maxLength: 43}
         expiresAt: {type: string, format: date-time}
         qrDataUrl: {type: string, pattern: '^data:image/png;base64,'}
@@ -1193,7 +1458,7 @@ components:
             version: {type: integer, const: 1}
             hostPeerId: {type: string}
             addresses: {type: array, maxItems: 32, items: {type: string, maxLength: 512}}
-            inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+            inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
             secret: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
             expiresAt: {type: string, format: date-time}
         label: {type: string, maxLength: 80}

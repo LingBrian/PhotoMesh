@@ -83,6 +83,12 @@ const routes: RouteCase[] = [
   { template: '/v1/pairing/peers', method: 'get', path: '/v1/pairing/peers', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/libraries/{libraryId}/tag-writers', method: 'get', path: '/v1/pairing/libraries/lib/tag-writers', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/tag-sync-status', method: 'get', path: '/v1/pairing/peers/peer/tag-sync-status', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/album-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/album-write', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/album-write', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/album-write', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/album-delete', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/album-delete', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/album-delete', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/album-delete', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/libraries/{libraryId}/album-sync-grants', method: 'get', path: '/v1/pairing/libraries/lib/album-sync-grants', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/album-sync-status', method: 'get', path: '/v1/pairing/peers/peer/album-sync-status', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/tag-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/tag-write', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/tag-write', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/tag-write', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/approval', method: 'post', path: '/v1/pairing/peers/peer/approval', status: 403, error: 'forbidden' },
@@ -122,6 +128,9 @@ const routes: RouteCase[] = [
   { template: '/v1/libraries/{libraryId}/albums', method: 'post', path: '/v1/libraries/lib/albums', status: 403, error: 'forbidden', body: { title: 'Family' }, headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/libraries/{libraryId}/albums', method: 'post', path: '/v1/libraries/lib/albums', status: 400, error: 'invalid_request', body: {}, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/libraries/{libraryId}/albums', method: 'post', path: '/v1/libraries/lib/albums', status: 201, authorization: 'Bearer contract-admin', body: { title: 'Family' }, requestHeaders: { 'idempotency-key': '123e4567-e89b-42d3-a456-426614174000' }, expectedAlbum: { albumId: 'album-1', libraryId: 'lib', title: 'Family', createdByPeerId: 'node-local', createdAt: '2026-10-28T00:00:00.000Z' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/deletion', method: 'post', path: '/v1/libraries/lib/albums/album-1/deletion', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/deleted', method: 'get', path: '/v1/libraries/lib/albums/deleted?scope=all', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/restore', method: 'post', path: '/v1/libraries/lib/albums/album-1/restore', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/libraries/{libraryId}/albums/{albumId}/members', method: 'get', path: '/v1/libraries/lib/albums/album-1/members', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/libraries/{libraryId}/albums/{albumId}/members', method: 'get', path: '/v1/libraries/lib/albums/album-1/members', status: 200, authorization: 'Bearer contract-admin', expectedMembers: [{ assetId: 'asset' }], headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}', method: 'put', path: '/v1/libraries/lib/albums/album-1/members/asset', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
@@ -238,6 +247,44 @@ describe('implemented Node HTTP API contract', () => {
     expect(contract.components.parameters.AlbumIdempotencyKey).toMatchObject({
       name: 'Idempotency-Key', in: 'header', required: true
     });
+  });
+
+  it('documents PM-045 album soft-delete, restore, and separated sync grants', async () => {
+    const contract = await loadContract();
+    const paths = contract.paths;
+    const deletion = paths['/v1/libraries/{libraryId}/albums/{albumId}/deletion']?.post;
+    const deleted = paths['/v1/libraries/{libraryId}/albums/deleted']?.get;
+    const restore = paths['/v1/libraries/{libraryId}/albums/{albumId}/restore']?.post;
+    expect(deletion).toBeDefined();
+    expect(deleted).toBeDefined();
+    expect(restore).toBeDefined();
+    expect(deletion?.parameters).toContainEqual({ $ref: '#/components/parameters/AlbumIdempotencyKey' });
+    expect(deletion?.requestBody?.content?.['application/json']?.schema).toEqual({ $ref: '#/components/schemas/AlbumDeletionRequest' });
+    expect(restore?.requestBody?.content?.['application/json']?.schema).toEqual({ $ref: '#/components/schemas/AlbumRestoreRequest' });
+    expect(deleted?.parameters?.map(({ name }) => name)).toEqual(expect.arrayContaining(['scope', 'cursor', 'limit']));
+
+    const schemas = contract.components.schemas as Record<string, {
+      additionalProperties?: boolean;
+      properties?: Record<string, { type?: string | string[]; enum?: string[]; minItems?: number; maxItems?: number; uniqueItems?: boolean }>;
+    }>;
+    for (const name of ['AlbumDeletionRequest', 'AlbumRestoreRequest', 'DeletedAlbumPage', 'DeletedAlbum', 'AlbumSyncGrantRequest', 'AlbumSyncGrantStatus']) {
+      expect(schemas[name], `schema ${name}`).toBeDefined();
+      expect(schemas[name]?.additionalProperties).toBe(false);
+    }
+    expect(schemas.AlbumDeletionRequest?.properties?.scope?.enum).toEqual(['local', 'global']);
+    expect(schemas.DeletedAlbum?.properties?.scopes).toMatchObject({ type: 'array', minItems: 1, maxItems: 2, uniqueItems: true });
+    expect(schemas.DeletedAlbumPage?.properties?.items?.maxItems).toBe(200);
+    expect(deletion?.responses['204']).toBeDefined();
+    expect(restore?.responses['204']).toBeDefined();
+
+    for (const permission of ['album-write', 'album-delete']) {
+      const path = `/v1/pairing/peers/{peerId}/libraries/{libraryId}/${permission}`;
+      expect(paths[path]?.put, `${path} grant`).toBeDefined();
+      expect(paths[path]?.delete, `${path} revoke`).toBeDefined();
+      expect(paths[path]?.put?.requestBody?.content?.['application/json']?.schema).toEqual({ $ref: '#/components/schemas/AlbumSyncGrantRequest' });
+    }
+    expect(paths['/v1/pairing/libraries/{libraryId}/album-sync-grants']?.get).toBeDefined();
+    expect(paths['/v1/pairing/peers/{peerId}/album-sync-status']?.get).toBeDefined();
   });
 
   it('declares an open error envelope and a request-id header for every response', async () => {
