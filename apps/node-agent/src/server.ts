@@ -6,8 +6,9 @@ import { getDiagnostics, getHealth, type HealthDiagnosticsSource } from './healt
 import { UploadError, UploadService, type CreateUploadRequest } from './uploads/service.js';
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
-import type { AssetTagMutationResult, TrustedPeerRecord } from './db/repository.js';
+import { RepositoryConflictError, type AlbumMemberMutationResult, type AlbumMemberPage, type AlbumPage, type AlbumRecord, type AssetTagMutationResult, type TrustedPeerRecord } from './db/repository.js';
 import { maxAssetTagUtf8Bytes } from './asset-tag-limits.js';
+import { decodeAlbumCursor, InvalidAlbumCursorError, normalizeAlbumTitle, type AlbumCursorScope } from './albums/album-utils.js';
 import type { Readable } from 'node:stream';
 import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage, MediaVersionView } from './media/media-version-service.js';
 import type { ThumbnailContent } from './media/thumbnail-service.js';
@@ -34,6 +35,7 @@ export interface NodeAgentServerOptions {
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
+  albums?: AlbumServerControl;
   assetTags?: AssetTagServerControl;
   tagSync?: boolean;
   mediaVersions?: MediaVersionServerControl;
@@ -41,6 +43,22 @@ export interface NodeAgentServerOptions {
   pairingControl?: PairingServerControl;
   allowedWebOrigins?: readonly string[];
   maxRequestBytes?: number;
+}
+
+export interface AlbumMutationRequest {
+  operationId: string;
+  principalId: string;
+  requestFingerprint: string;
+  libraryId: string;
+  createdAt: string;
+}
+
+export interface AlbumServerControl {
+  listAlbums(libraryId: string, cursor: string | undefined, limit: number): AlbumPage | undefined | Promise<AlbumPage | undefined>;
+  createAlbum(input: AlbumMutationRequest & { title: string }): AlbumRecord | 'writer_limit' | undefined | Promise<AlbumRecord | 'writer_limit' | undefined>;
+  listMembers(libraryId: string, albumId: string, cursor: string | undefined, limit: number): AlbumMemberPage | undefined | Promise<AlbumMemberPage | undefined>;
+  addMember(input: AlbumMutationRequest & { albumId: string; assetId: string }): AlbumMemberMutationResult | Promise<AlbumMemberMutationResult>;
+  removeMember(input: AlbumMutationRequest & { albumId: string; assetId: string }): AlbumMemberMutationResult | Promise<AlbumMemberMutationResult>;
 }
 
 const unavailableDiagnostics: HealthDiagnosticsSource = {
@@ -120,6 +138,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       ...(options.mediaVersions ? ['mediaVersions'] : []),
       ...(options.thumbnails ? ['thumbnails'] : []),
       ...(options.assetTags ? ['assetTags'] : []),
+      ...(options.albums ? ['virtualAlbums'] : []),
       ...(options.tagSync ? ['tagSync'] : [])
     ];
     sendJson(response, 200, getHealth(capabilities));
@@ -141,6 +160,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { items: options.gallery?.listLibraries() ?? [] });
     return;
   }
+
+  if (await handleAlbumRequest(request, response, options, requestId, url)) return;
 
   const thumbnailPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/thumbnail$/);
   if (request.method === 'GET' && thumbnailPath?.[1] && thumbnailPath[2]) {
@@ -439,6 +460,220 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
 
   sendJson(response, 404, { error: 'not_found', requestId });
+}
+
+async function handleAlbumRequest(
+  request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string, url: URL
+): Promise<boolean> {
+  const collection = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums$/);
+  const members = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/members$/);
+  const member = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/members\/([^/]+)$/);
+  const route = collection || members || member;
+  if (!route) return false;
+  response.setHeader('cache-control', 'private, no-store');
+  const allowed = collection
+    ? request.method === 'GET' || request.method === 'POST'
+    : members ? request.method === 'GET' : request.method === 'PUT' || request.method === 'DELETE';
+  if (!allowed) return false;
+
+  const token = bearerToken(request);
+  if (!options.authorizePairingAdmin?.(token)) {
+    sendJson(response, 403, { error: 'forbidden', requestId });
+    return true;
+  }
+  const libraryId = decodePathSegment(route[1]);
+  const albumId = members || member ? decodePathSegment(route[2]) : undefined;
+  const assetId = member ? decodePathSegment(route[3]) : undefined;
+  if (!libraryId || (members || member) && !albumId || member && !assetId) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  const principalId = await options.authorizeLibraryRead?.(token, libraryId);
+  if (!principalId || !options.gallery?.listLibraries().some((library) => library.libraryId === libraryId)) {
+    sendJson(response, 404, { error: 'not_found', requestId });
+    return true;
+  }
+  if (request.method !== 'GET' && [...url.searchParams.keys()].length > 0) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  const control = options.albums;
+  if (!control) {
+    sendJson(response, 503, { error: 'capability_unavailable', requestId });
+    return true;
+  }
+
+  if (request.method === 'GET') {
+    const scope: AlbumCursorScope = albumId === undefined
+      ? { collection: 'albums', libraryId }
+      : { collection: 'members', libraryId, albumId };
+    const page = parseAlbumPageQuery(url.searchParams, scope);
+    if (!page) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    try {
+      const result = albumId === undefined
+        ? await control.listAlbums(libraryId, page.cursor, page.limit)
+        : await control.listMembers(libraryId, albumId, page.cursor, page.limit);
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, albumId === undefined
+        ? projectAlbumPage(result as AlbumPage, libraryId, page.limit)
+        : projectAlbumMemberPage(result as AlbumMemberPage, libraryId, albumId, page.limit));
+    } catch (error) {
+      if (error instanceof InvalidAlbumCursorError) sendJson(response, 400, { error: 'invalid_request', requestId });
+      else throw error;
+    }
+    return true;
+  }
+
+  const operationId = readAlbumOperationId(request);
+  if (!operationId) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  const createdAt = new Date().toISOString();
+  if (request.method === 'POST') {
+    if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['title'])) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    const title = normalizeAlbumTitle(body.title);
+    if (!title) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    try {
+      const created = await control.createAlbum({
+        libraryId, title, operationId, principalId,
+        requestFingerprint: albumRequestFingerprint(principalId, 'POST', libraryId, undefined, undefined, { title }),
+        createdAt
+      });
+      if (created === 'writer_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+      else if (!created) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 201, projectAlbumRecord(created, libraryId));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
+
+  const bytes = await readBytes(request, 16 * 1024);
+  if (bytes.byteLength > 0) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  try {
+    const method = request.method === 'PUT' ? 'PUT' : 'DELETE';
+    const input = {
+      libraryId, albumId: albumId!, assetId: assetId!, operationId, principalId,
+      requestFingerprint: albumRequestFingerprint(principalId, method, libraryId, albumId, assetId, null),
+      createdAt
+    };
+    const result = method === 'PUT' ? await control.addMember(input) : await control.removeMember(input);
+    if (result.status === 'not_found') {
+      sendJson(response, 404, { error: 'not_found', requestId });
+      return true;
+    }
+    if (result.status === 'writer_limit') {
+      sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+      return true;
+    }
+    if (!['added', 'already_present', 'removed', 'unchanged'].includes(result.status)) throw new Error('invalid album mutation result');
+    response.writeHead(204);
+    response.end();
+  } catch (error) {
+    if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+    else throw error;
+  }
+  return true;
+}
+
+function parseAlbumPageQuery(searchParams: URLSearchParams, scope: AlbumCursorScope): { cursor: string | undefined; limit: number } | undefined {
+  if ([...searchParams.keys()].some((key) => key !== 'cursor' && key !== 'limit')) return undefined;
+  const limitValues = searchParams.getAll('limit');
+  const cursorValues = searchParams.getAll('cursor');
+  if (limitValues.length > 1 || cursorValues.length > 1) return undefined;
+  const rawLimit = limitValues[0] ?? '50';
+  if (!/^\d+$/.test(rawLimit)) return undefined;
+  const limit = Number(rawLimit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) return undefined;
+  const cursor = cursorValues[0];
+  if (cursor !== undefined) {
+    if (cursor.length > 2048) return undefined;
+    try { decodeAlbumCursor(cursor, scope); } catch { return undefined; }
+  }
+  return { cursor, limit };
+}
+
+function projectAlbumRecord(value: AlbumRecord, libraryId: string): AlbumRecord {
+  if (!isPlainRecord(value) || value.libraryId !== libraryId || !isValidAlbumIdentifier(value.albumId) ||
+    typeof value.title !== 'string' || normalizeAlbumTitle(value.title) !== value.title ||
+    !isValidAlbumIdentifier(value.createdByPeerId) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt))) {
+    throw new Error('album control returned an invalid resource');
+  }
+  return {
+    albumId: value.albumId, libraryId: value.libraryId, title: value.title,
+    createdByPeerId: value.createdByPeerId, createdAt: value.createdAt
+  };
+}
+
+function projectAlbumPage(value: AlbumPage, libraryId: string, limit: number): AlbumPage {
+  if (!isPlainRecord(value) || !Array.isArray(value.items) || value.items.length > limit ||
+    !(value.nextCursor === null || typeof value.nextCursor === 'string')) {
+    throw new Error('album control returned an invalid page');
+  }
+  const items = value.items.map((item) => projectAlbumRecord(item as AlbumRecord, libraryId));
+  if (new Set(items.map((item) => item.albumId)).size !== items.length) throw new Error('album control returned duplicate records');
+  const nextCursor = validateAlbumOutputCursor(value.nextCursor, { collection: 'albums', libraryId }, items.length, limit);
+  return { items, nextCursor };
+}
+
+function projectAlbumMemberPage(value: AlbumMemberPage, libraryId: string, albumId: string, limit: number): AlbumMemberPage {
+  if (!isPlainRecord(value) || !Array.isArray(value.items) || value.items.length > limit ||
+    !(value.nextCursor === null || typeof value.nextCursor === 'string')) {
+    throw new Error('album control returned an invalid member page');
+  }
+  const items = value.items.map((item) => {
+    if (!isPlainRecord(item) || !isValidAlbumIdentifier(item.assetId)) throw new Error('album control returned an invalid member');
+    return { assetId: item.assetId };
+  });
+  if (new Set(items.map((item) => item.assetId)).size !== items.length) throw new Error('album control returned duplicate members');
+  const nextCursor = validateAlbumOutputCursor(value.nextCursor, { collection: 'members', libraryId, albumId }, items.length, limit);
+  return { items, nextCursor };
+}
+
+function validateAlbumOutputCursor(
+  cursor: string | null, scope: AlbumCursorScope, itemCount: number, limit: number
+): string | null {
+  if (cursor === null) return null;
+  if (itemCount !== limit) throw new Error('album control returned a cursor for an incomplete page');
+  try { decodeAlbumCursor(cursor, scope); } catch { throw new Error('album control returned an invalid cursor'); }
+  return cursor;
+}
+
+function isValidAlbumIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\\/\0]/.test(value);
+}
+
+function readAlbumOperationId(request: IncomingMessage): string | undefined {
+  const header = request.headers['idempotency-key'];
+  if (typeof header !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(header)) return undefined;
+  return header.toLowerCase();
+}
+
+function albumRequestFingerprint(
+  principalId: string, method: string, libraryId: string, albumId: string | undefined, assetId: string | undefined, body: unknown
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    apiVersion: 1, principalId, method, libraryId, albumId: albumId ?? null, assetId: assetId ?? null, body
+  })).digest('hex');
 }
 
 async function handlePairingRequest(

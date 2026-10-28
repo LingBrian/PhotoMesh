@@ -531,5 +531,127 @@ export const migrations: readonly Migration[] = [
       INSERT INTO asset_tag_legacy_seeds (library_id, asset_id, tag, created_at, state, seed_event_id)
         SELECT library_id, asset_id, tag, created_at, 'pending', NULL FROM asset_tags;
     `
+  },
+  {
+    id: '0007_virtual_albums',
+    sql: `
+      CREATE TABLE albums (
+        album_id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL,
+        title TEXT NOT NULL CHECK (
+          length(CAST(title AS BLOB)) BETWEEN 1 AND 256 AND
+          title = trim(title, char(9) || char(10) || char(11) || char(12) || char(13) || char(32) || char(160) || char(5760) ||
+            char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) ||
+            char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288) || char(65279))
+        ),
+        created_by_peer_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (library_id, album_id)
+      );
+      CREATE INDEX albums_library_order_idx ON albums (library_id, album_id COLLATE BINARY);
+      CREATE TRIGGER albums_library_guard BEFORE INSERT ON albums
+      WHEN NOT EXISTS (SELECT 1 FROM assets WHERE library_id = NEW.library_id
+        UNION ALL SELECT 1 FROM sync_asset_projection WHERE library_id = NEW.library_id)
+      BEGIN SELECT RAISE(ABORT, 'album_library_not_found'); END;
+      CREATE TRIGGER albums_no_update BEFORE UPDATE ON albums
+      BEGIN SELECT RAISE(ABORT, 'albums are immutable'); END;
+      CREATE TRIGGER albums_no_delete BEFORE DELETE ON albums
+      BEGIN SELECT RAISE(ABORT, 'albums are retained'); END;
+
+      CREATE TABLE album_operations (
+        operation_id TEXT PRIMARY KEY CHECK (length(operation_id) = 36),
+        principal_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        asset_id TEXT,
+        operation_type TEXT NOT NULL CHECK (operation_type IN ('album.created', 'member.added', 'member.add.noop', 'member.removed', 'member.remove.noop')),
+        request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+        result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (library_id, album_id) REFERENCES albums(library_id, album_id) ON DELETE RESTRICT,
+        UNIQUE (operation_id, library_id, album_id, asset_id, operation_type, author_peer_id),
+        CHECK ((operation_type = 'album.created' AND asset_id IS NULL) OR
+          (operation_type <> 'album.created' AND asset_id IS NOT NULL))
+      );
+      CREATE INDEX album_operations_author_idx ON album_operations (library_id, author_peer_id, operation_type);
+      CREATE INDEX album_operations_resource_idx ON album_operations (library_id, album_id, asset_id, created_at, operation_id);
+      CREATE TRIGGER album_operations_author_limit BEFORE INSERT ON album_operations
+      WHEN NOT EXISTS (SELECT 1 FROM album_operations WHERE library_id = NEW.library_id AND author_peer_id = NEW.author_peer_id)
+        AND (SELECT count(DISTINCT author_peer_id) FROM album_operations WHERE library_id = NEW.library_id) >= 64
+      BEGIN SELECT RAISE(ABORT, 'album_author_limit'); END;
+      CREATE TRIGGER album_operations_scope_guard BEFORE INSERT ON album_operations
+      WHEN NOT EXISTS (SELECT 1 FROM albums a WHERE a.library_id = NEW.library_id AND a.album_id = NEW.album_id
+        AND ((NEW.operation_type = 'album.created' AND a.created_by_peer_id = NEW.author_peer_id) OR NEW.operation_type <> 'album.created'))
+        OR (NEW.operation_type <> 'album.created' AND NOT EXISTS (
+          SELECT 1 FROM assets a WHERE a.library_id = NEW.library_id AND a.asset_id = NEW.asset_id
+            AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+          UNION ALL
+          SELECT 1 FROM sync_asset_projection p WHERE p.library_id = NEW.library_id AND p.asset_id = NEW.asset_id
+            AND p.tombstone_event_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+        ))
+      BEGIN SELECT RAISE(ABORT, 'album_operation_scope_mismatch'); END;
+      CREATE TRIGGER album_operations_no_update BEFORE UPDATE ON album_operations
+      BEGIN SELECT RAISE(ABORT, 'album operations are immutable'); END;
+      CREATE TRIGGER album_operations_no_delete BEFORE DELETE ON album_operations
+      BEGIN SELECT RAISE(ABORT, 'album operations are retained'); END;
+
+      CREATE TABLE album_memberships (
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        add_operation_id TEXT NOT NULL UNIQUE REFERENCES album_operations(operation_id) ON DELETE RESTRICT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (library_id, album_id, asset_id, author_peer_id),
+        FOREIGN KEY (library_id, album_id) REFERENCES albums(library_id, album_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX album_memberships_page_idx ON album_memberships (library_id, album_id, asset_id COLLATE BINARY, author_peer_id);
+      CREATE TRIGGER album_memberships_add_guard BEFORE INSERT ON album_memberships
+      WHEN NOT EXISTS (SELECT 1 FROM album_operations o WHERE o.operation_id = NEW.add_operation_id
+        AND o.operation_type = 'member.added' AND o.library_id = NEW.library_id AND o.album_id = NEW.album_id
+        AND o.asset_id = NEW.asset_id AND o.author_peer_id = NEW.author_peer_id)
+        OR NOT EXISTS (
+          SELECT 1 FROM assets a WHERE a.library_id = NEW.library_id AND a.asset_id = NEW.asset_id
+            AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+          UNION ALL
+          SELECT 1 FROM sync_asset_projection p WHERE p.library_id = NEW.library_id AND p.asset_id = NEW.asset_id
+            AND p.tombstone_event_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+        )
+      BEGIN SELECT RAISE(ABORT, 'album_membership_scope_mismatch'); END;
+      CREATE TRIGGER album_memberships_no_update BEFORE UPDATE ON album_memberships
+      BEGIN SELECT RAISE(ABORT, 'album membership projections are immutable'); END;
+
+      CREATE TABLE album_membership_remove_targets (
+        remove_operation_id TEXT NOT NULL REFERENCES album_operations(operation_id) ON DELETE RESTRICT,
+        observed_add_operation_id TEXT NOT NULL REFERENCES album_operations(operation_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        PRIMARY KEY (remove_operation_id, observed_add_operation_id)
+      );
+      CREATE INDEX album_membership_remove_add_idx ON album_membership_remove_targets (observed_add_operation_id);
+      CREATE TRIGGER album_membership_remove_target_guard BEFORE INSERT ON album_membership_remove_targets
+      WHEN NOT EXISTS (
+        SELECT 1 FROM album_operations r JOIN album_operations a
+          ON a.operation_id = NEW.observed_add_operation_id AND a.operation_type = 'member.added'
+          AND a.library_id = NEW.library_id AND a.album_id = NEW.album_id AND a.asset_id = NEW.asset_id
+        WHERE r.operation_id = NEW.remove_operation_id AND r.operation_type = 'member.removed'
+          AND r.library_id = NEW.library_id AND r.album_id = NEW.album_id AND r.asset_id = NEW.asset_id
+      )
+      BEGIN SELECT RAISE(ABORT, 'album_remove_target_mismatch'); END;
+      CREATE TRIGGER album_membership_remove_targets_no_update BEFORE UPDATE ON album_membership_remove_targets
+      BEGIN SELECT RAISE(ABORT, 'album remove targets are immutable'); END;
+      CREATE TRIGGER album_membership_remove_targets_no_delete BEFORE DELETE ON album_membership_remove_targets
+      BEGIN SELECT RAISE(ABORT, 'album remove targets are retained'); END;
+      CREATE TRIGGER album_memberships_delete_guard BEFORE DELETE ON album_memberships
+      WHEN NOT EXISTS (SELECT 1 FROM album_membership_remove_targets t
+        JOIN album_operations r ON r.operation_id = t.remove_operation_id AND r.operation_type = 'member.removed'
+        WHERE t.observed_add_operation_id = OLD.add_operation_id AND t.library_id = OLD.library_id
+          AND t.album_id = OLD.album_id AND t.asset_id = OLD.asset_id)
+      BEGIN SELECT RAISE(ABORT, 'album membership remove target required'); END;
+    `
   }
 ];

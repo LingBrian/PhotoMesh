@@ -95,6 +95,137 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /v1/libraries/{libraryId}/albums:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 管理员分页读取图库中的手动虚拟相册
+      description: 当前 Node HTTP API 仅开放给本机管理员。列表不包含删除状态；按 albumId 二进制顺序 keyset 分页，cursor 不代表 MVCC 快照。
+      parameters:
+        - in: query
+          name: cursor
+          schema: {type: string, maxLength: 2048}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Album page
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumPage'}}}
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: Invalid/repeated/unknown query parameter or cursor, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown/unauthorized library, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    post:
+      summary: 创建手动虚拟相册
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateAlbumRequest'}}}
+      responses:
+        '201':
+          description: Album created; same idempotency key and canonical request replays this original resource.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Album'}}}
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: Invalid body/title/idempotency key, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Body exceeds the album request limit, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown/unauthorized library, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Global idempotency key conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/members:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 分页读取相册中可见资产 ID
+      description: 仅返回 {assetId} allowlist；过滤 tombstone 后分页。Keyset cursor 非快照，改动后客户端可从第一页刷新。
+      parameters:
+        - in: query
+          name: cursor
+          schema: {type: string, maxLength: 2048}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Member page with no total count
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumMemberPage'}}}
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: Invalid/repeated/unknown query parameter or cursor, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Unauthorized/unknown library, missing/cross-library album', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: 幂等添加虚拟相册成员
+      description: Requires a globally unique Idempotency-Key UUID. Same-author active add is a no-op; a new author contributes an observed add token.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      responses:
+        '204':
+          description: Member is present after the operation.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: 'Invalid/repeated idempotency key, body or query', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Body exceeds the album request limit, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Unauthorized/unknown library, missing/cross-library album or asset, or tombstone', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      summary: 幂等移除已观察的相册成员 add 操作
+      description: Remove operation atomically records every currently observed add ID (maximum 64); an unseen concurrent add remains active.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      responses:
+        '204':
+          description: Observed member adds have been removed; replays have no additional effect.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: 'Invalid/repeated idempotency key, body or query', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Body exceeds the album request limit, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Unauthorized/unknown library, missing/cross-library album or asset, or tombstone', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/assets:
     get:
       summary: 授权范围内的游标分页时间线
@@ -957,7 +1088,58 @@ components:
       type: http
       scheme: bearer
       bearerFormat: node-admin-token
+  parameters:
+    AlbumIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID operation ID globally unique across libraries, resources and mutation types; retained durably for replay.
+      schema: {type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
   schemas:
+    Album:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, title, createdByPeerId, createdAt]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        title:
+          type: string
+          minLength: 1
+          description: Leading/trailing ECMAScript WhiteSpace/LineTerminator code points are trimmed; UTF-8 byte length is 1..256. No NFC/NFD or case normalization.
+          x-maxUtf8Bytes: 256
+        createdByPeerId: {type: string, minLength: 1, maxLength: 128}
+        createdAt: {type: string, format: date-time}
+    CreateAlbumRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          description: Leading/trailing ECMAScript WhiteSpace/LineTerminator code points are trimmed; UTF-8 byte length is 1..256. No NFC/NFD or case normalization.
+          x-maxUtf8Bytes: 256
+    AlbumPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/Album'}}
+        nextCursor: {type: [string, 'null'], maxLength: 2048}
+    AlbumMember:
+      type: object
+      additionalProperties: false
+      required: [assetId]
+      properties:
+        assetId: {type: string, minLength: 1, maxLength: 128}
+    AlbumMemberPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AlbumMember'}}
+        nextCursor: {type: [string, 'null'], maxLength: 2048}
     NodeDiagnostics:
       type: object
       additionalProperties: false
@@ -986,7 +1168,7 @@ components:
           maxItems: 8
           items:
             type: string
-            enum: [rest, mediaVersions, thumbnails, assetTags, tagSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
+            enum: [rest, mediaVersions, thumbnails, assetTags, virtualAlbums, tagSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
     PairingInvite:
       type: object
       required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]
@@ -1211,7 +1393,7 @@ components:
           type: string
           minLength: 1
           description: Stable machine-readable error code; unknown values are possible. This example list is not closed.
-          examples: [invalid_request, forbidden, not_found, capability_unavailable, thumbnail_invalid, source_offline, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
+          examples: [invalid_request, forbidden, not_found, capability_unavailable, writer_limit_reached, thumbnail_invalid, source_offline, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
         requestId:
           type: string
           minLength: 1

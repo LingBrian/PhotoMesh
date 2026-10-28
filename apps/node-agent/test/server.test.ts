@@ -4,7 +4,7 @@ import { Readable } from 'node:stream';
 import { createNodeAgentServer, type MediaVersionServerControl, type NodeAgentServerOptions, type PairingServerControl } from '../src/server.js';
 import { MediaThumbnailService } from '../src/media/thumbnail-service.js';
 import type { MediaThumbnailTransformer } from '../src/media/image-transformer.js';
-import type { MediaVersionSourceRecord } from '../src/db/repository.js';
+import { RepositoryConflictError, type MediaVersionSourceRecord } from '../src/db/repository.js';
 
 const servers: ReturnType<typeof createNodeAgentServer>[] = [];
 
@@ -33,6 +33,16 @@ describe('node-agent health endpoint', () => {
   it('advertises tag-sync capability independently from tag API availability', async () => {
     const response = await request('/v1/health', { assetTags: { addAssetTag: () => 'added', removeAssetTag: () => 'removed' }, tagSync: true });
     expect((await response.json() as { capabilities: string[] }).capabilities).toEqual(['assetTags', 'tagSync']);
+  });
+
+  it('advertises virtual albums only when the album service is configured', async () => {
+    const unavailable = await request('/v1/health');
+    expect((await unavailable.json() as { capabilities: string[] }).capabilities).not.toContain('virtualAlbums');
+    const available = await request('/v1/health', { albums: {
+      listAlbums: () => ({ items: [], nextCursor: null }), createAlbum: () => undefined,
+      listMembers: () => undefined, addMember: () => ({ status: 'not_found' }), removeMember: () => ({ status: 'not_found' })
+    } });
+    expect((await available.json() as { capabilities: string[] }).capabilities).toContain('virtualAlbums');
   });
 
   it('protects component diagnostics and omits internal error details', async () => {
@@ -618,6 +628,152 @@ describe('pairing and library authorization endpoints', () => {
       method: 'POST', headers: { authorization: 'Bearer admin-secret', 'content-type': 'application/json' }, body: JSON.stringify({ approved: 'yes' })
     });
     expect(badApproval.status).toBe(400);
+  });
+});
+
+describe('virtual albums HTTP API', () => {
+  const albumRecord = { albumId: 'album-1', libraryId: 'family', title: 'Family', createdByPeerId: 'node-local', createdAt: '2026-10-28T00:00:00.000Z' };
+  const operationKey = '123e4567-e89b-42d3-a456-426614174000';
+
+  function albumOptions(overrides: Partial<NonNullable<NodeAgentServerOptions['albums']>> = {}): NodeAgentServerOptions {
+    const albums: NonNullable<NodeAgentServerOptions['albums']> = {
+      listAlbums: vi.fn(() => ({ items: [], nextCursor: null })),
+      createAlbum: vi.fn(() => albumRecord),
+      listMembers: vi.fn(() => ({ items: [{ assetId: 'asset-1' }], nextCursor: null })),
+      addMember: vi.fn(() => ({ status: 'added' as const })),
+      removeMember: vi.fn(() => ({ status: 'removed' as const, observedAddIds: ['add-1'] })),
+      ...overrides
+    };
+    return {
+      authorizePairingAdmin: (token) => token === 'admin-secret',
+      authorizeLibraryRead: (token, libraryId) => token === 'admin-secret' && libraryId !== 'denied' ? 'local-admin' : undefined,
+      gallery: {
+        listLibraries: () => [{ libraryId: 'family', title: 'family' }],
+        listAssets: () => ({ items: [], nextCursor: null }), getOriginal: async () => undefined,
+        openOriginal: () => undefined, listTombstones: () => [], restoreTombstone: async () => 'not_found'
+      } as NonNullable<NodeAgentServerOptions['gallery']>,
+      albums
+    };
+  }
+
+  const adminHeaders = { authorization: 'Bearer admin-secret' };
+
+  it('authenticates admin first, validates library scope/existence, and masks resource failures as 404', async () => {
+    const listAlbums = vi.fn(() => ({ items: [], nextCursor: null }));
+    const authorizeLibraryRead = vi.fn((token: string | undefined, libraryId: string) =>
+      token === 'admin-secret' && libraryId !== 'denied' ? 'local-admin' : undefined);
+    const options = albumOptions({ listAlbums });
+    options.authorizeLibraryRead = authorizeLibraryRead;
+
+    const unauthenticated = await request('/v1/libraries/family/albums', options);
+    expect(unauthenticated.status).toBe(403);
+    expect(authorizeLibraryRead).not.toHaveBeenCalled();
+    expect(unauthenticated.headers.get('cache-control')).toBe('private, no-store');
+
+    const deniedScope = await request('/v1/libraries/denied/albums', options, { headers: adminHeaders });
+    const unknownLibrary = await request('/v1/libraries/unknown/albums', options, { headers: adminHeaders });
+    expect(deniedScope.status).toBe(404);
+    expect(unknownLibrary.status).toBe(404);
+    expect(await deniedScope.json()).toMatchObject({ error: 'not_found' });
+    expect(await unknownLibrary.json()).toMatchObject({ error: 'not_found' });
+
+    const emptyList = await request('/v1/libraries/family/albums', options, { headers: adminHeaders });
+    expect(emptyList.status).toBe(200);
+    expect(await emptyList.json()).toEqual({ items: [], nextCursor: null });
+    expect(listAlbums).toHaveBeenCalledOnce();
+    expect(emptyList.headers.get('cache-control')).toBe('private, no-store');
+    expect(emptyList.headers.get('x-request-id')).toBeTruthy();
+  });
+
+  it('validates keyset query parameters and hides missing/cross-library albums and assets', async () => {
+    const listAlbums = vi.fn(() => ({ items: [], nextCursor: null }));
+    const listMembers = vi.fn(() => undefined);
+    const options = albumOptions({ listAlbums, listMembers });
+    for (const query of ['?limit=0', '?limit=201', '?limit=1&limit=2', '?unknown=x', '?cursor=not-a-cursor']) {
+      const response = await request(`/v1/libraries/family/albums${query}`, options, { headers: adminHeaders });
+      expect(response.status, query).toBe(400);
+      expect(response.headers.get('cache-control')).toBe('private, no-store');
+    }
+    const missingAlbum = await request('/v1/libraries/family/albums/missing/members', options, { headers: adminHeaders });
+    expect(missingAlbum.status).toBe(404);
+    expect(await missingAlbum.json()).toMatchObject({ error: 'not_found' });
+    expect(listMembers).toHaveBeenCalledOnce();
+    expect(listAlbums).not.toHaveBeenCalled();
+  });
+
+  it('projects provider results through strict public DTO allowlists', async () => {
+    const options = albumOptions({
+      listAlbums: () => ({ items: [{ ...albumRecord, sourcePath: 'D:\\private\\photo.jpg' }], nextCursor: null, totalCount: 99 } as never),
+      createAlbum: () => ({ ...albumRecord, storageRef: 'objects/private' }),
+      listMembers: () => ({ items: [{ assetId: 'asset-1', sourcePath: 'D:\\private\\photo.jpg', exif: { gps: 'private' } }], nextCursor: null, totalCount: 1 } as never)
+    });
+    const list = await request('/v1/libraries/family/albums', options, { headers: adminHeaders });
+    expect(await list.json()).toEqual({ items: [albumRecord], nextCursor: null });
+    const created = await request('/v1/libraries/family/albums', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json', 'idempotency-key': operationKey },
+      body: JSON.stringify({ title: 'Family' })
+    });
+    expect(await created.json()).toEqual(albumRecord);
+    const members = await request('/v1/libraries/family/albums/album-1/members', options, { headers: adminHeaders });
+    expect(await members.json()).toEqual({ items: [{ assetId: 'asset-1' }], nextCursor: null });
+  });
+
+  it('normalizes title, requires a UUID idempotency key, and keeps mutation responses private', async () => {
+    const createAlbum = vi.fn(() => albumRecord);
+    const options = albumOptions({ createAlbum });
+    const missingKey = await request('/v1/libraries/family/albums', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Family' })
+    });
+    expect(missingKey.status).toBe(400);
+
+    const invalidTitle = await request('/v1/libraries/family/albums', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json', 'idempotency-key': operationKey }, body: JSON.stringify({ title: '\u00a0\u3000' })
+    });
+    expect(invalidTitle.status).toBe(400);
+
+    const response = await request('/v1/libraries/family/albums', options, {
+      method: 'POST', headers: { ...adminHeaders, 'content-type': 'application/json', 'idempotency-key': operationKey.toUpperCase() },
+      body: JSON.stringify({ title: '\u2000 Family trip \u00a0' })
+    });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual(albumRecord);
+    expect(createAlbum).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Family trip', operationId: operationKey, principalId: 'local-admin', libraryId: 'family'
+    }));
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('x-request-id')).toBeTruthy();
+  });
+
+  it('requires operation keys for membership writes and maps idempotency/writer conflicts', async () => {
+    const addMember = vi.fn(() => ({ status: 'added' as const }));
+    const removeMember = vi.fn(() => ({ status: 'removed' as const, observedAddIds: ['add-1'] }));
+    const options = albumOptions({ addMember, removeMember });
+    const missingKey = await request('/v1/libraries/family/albums/album-1/members/asset-1', options, {
+      method: 'PUT', headers: adminHeaders
+    });
+    expect(missingKey.status).toBe(400);
+    const added = await request('/v1/libraries/family/albums/album-1/members/asset-1', options, {
+      method: 'PUT', headers: { ...adminHeaders, 'idempotency-key': operationKey }
+    });
+    expect(added.status).toBe(204);
+    expect(added.headers.get('cache-control')).toBe('private, no-store');
+    expect(addMember).toHaveBeenCalledWith(expect.objectContaining({ operationId: operationKey, principalId: 'local-admin' }));
+    const removed = await request('/v1/libraries/family/albums/album-1/members/asset-1', options, {
+      method: 'DELETE', headers: { ...adminHeaders, 'idempotency-key': '223e4567-e89b-42d3-a456-426614174000' }
+    });
+    expect(removed.status).toBe(204);
+    expect(removeMember).toHaveBeenCalledOnce();
+
+    const conflict = await request('/v1/libraries/family/albums/album-1/members/asset-1', albumOptions({
+      addMember: () => { throw new RepositoryConflictError('idempotency conflict'); }
+    }), { method: 'PUT', headers: { ...adminHeaders, 'idempotency-key': operationKey } });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ error: 'idempotency_conflict' });
+    const writerLimit = await request('/v1/libraries/family/albums/album-1/members/asset-1', albumOptions({
+      addMember: () => ({ status: 'writer_limit' as const })
+    }), { method: 'PUT', headers: { ...adminHeaders, 'idempotency-key': '323e4567-e89b-42d3-a456-426614174000' } });
+    expect(writerLimit.status).toBe(409);
+    expect(await writerLimit.json()).toMatchObject({ error: 'writer_limit_reached' });
   });
 });
 

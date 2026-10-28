@@ -116,6 +116,54 @@ describe('SQLite repository and migrations', () => {
     db.close();
   });
 
+  it('upgrades a populated 0006 database additively and refuses backupless or old-binary downgrade', async () => {
+    const db = new Database(':memory:');
+    const beforeAlbums = migrations.slice(0, 6);
+    const beforeTagSync = migrations.slice(0, 5);
+    const oldRepository = new SqliteRepository(db);
+    await oldRepository.migrate(beforeTagSync);
+    db.prepare('INSERT INTO assets (asset_id, library_id, origin_node_id, kind, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run('local-asset', 'family', 'node-local', 'photo', '2026-10-28T00:00:00.000Z');
+    db.prepare('INSERT INTO asset_tags (library_id, asset_id, tag, created_at) VALUES (?, ?, ?, ?)')
+      .run('family', 'local-asset', 'legacy', '2026-10-28T00:00:00.000Z');
+    db.prepare(`INSERT INTO sync_event_log (event_id, library_id, author_peer_id, author_sequence, protocol_version,
+      schema_version, event_type, causal_parents_json, payload_json, created_at, signature, envelope_json, state)
+      VALUES ('projection-event', 'family', 'remote-node', 1, 1, 1, 'asset.indexed', '[]', '{}', ?, 'sig', '{}', 'ready')`)
+      .run('2026-10-28T00:00:00.000Z');
+    db.prepare(`INSERT INTO sync_asset_projection (library_id, asset_id, origin_node_id, kind, sha256, byte_length,
+      metadata_json, tombstone_event_id, restored_by_event_id, last_event_id)
+      VALUES ('family', 'projected-asset', 'remote-node', 'photo', ?, 4, '{}', NULL, NULL, 'projection-event')`)
+      .run('a'.repeat(64));
+    const addingTagSync = new SqliteRepository(db, { backupBeforeMigration: async () => undefined });
+    await addingTagSync.migrate(beforeAlbums);
+    const checksumsBefore = db.prepare('SELECT migration_id, checksum FROM schema_migrations ORDER BY migration_id').all();
+    const tagCountBefore = db.prepare('SELECT count(*) AS count FROM asset_tags').get();
+    const legacySeedsBefore = db.prepare('SELECT * FROM asset_tag_legacy_seeds ORDER BY library_id, asset_id, tag').all();
+    const projectionCountBefore = db.prepare('SELECT count(*) AS count FROM sync_asset_projection').get();
+
+    const backupless = new SqliteRepository(db);
+    await expect(backupless.migrate(migrations)).rejects.toThrow('database backup is required');
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='albums'").get()).toBeUndefined();
+    expect(db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id').all())
+      .toEqual(checksumsBefore.map((row) => ({ migration_id: (row as { migration_id: string }).migration_id })));
+    expect(db.prepare('SELECT count(*) AS count FROM asset_tags').get()).toEqual(tagCountBefore);
+    expect(db.prepare('SELECT * FROM asset_tag_legacy_seeds ORDER BY library_id, asset_id, tag').all()).toEqual(legacySeedsBefore);
+    expect(db.prepare('SELECT count(*) AS count FROM sync_asset_projection').get()).toEqual(projectionCountBefore);
+
+    let backups = 0;
+    const migrating = new SqliteRepository(db, { backupBeforeMigration: async () => { backups += 1; } });
+    await migrating.migrate(migrations);
+    expect(backups).toBe(1);
+    expect(db.prepare('SELECT migration_id, checksum FROM schema_migrations WHERE migration_id < ? ORDER BY migration_id').all('0007_virtual_albums'))
+      .toEqual(checksumsBefore);
+    expect(db.prepare('SELECT count(*) AS count FROM asset_tags').get()).toEqual(tagCountBefore);
+    expect(db.prepare('SELECT * FROM asset_tag_legacy_seeds ORDER BY library_id, asset_id, tag').all()).toEqual(legacySeedsBefore);
+    expect(db.prepare('SELECT count(*) AS count FROM sync_asset_projection').get()).toEqual(projectionCountBefore);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='albums'").get()).toEqual({ name: 'albums' });
+    await expect(new SqliteRepository(db).migrate(beforeAlbums)).rejects.toThrow('unknown migration');
+    db.close();
+  });
+
   it('rolls back invalid migration and refuses changed checksums', async () => {
     const db = new Database(':memory:');
     const repository = new SqliteRepository(db);

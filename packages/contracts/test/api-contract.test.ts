@@ -23,6 +23,10 @@ interface RouteCase {
   headers?: Record<string, string>;
   authorization?: string;
   expectedTags?: string[];
+  expectedAlbum?: { albumId: string; libraryId: string; title: string; createdByPeerId: string; createdAt: string };
+  expectedAlbums?: Array<{ albumId: string; libraryId: string; title: string; createdByPeerId: string; createdAt: string }>;
+  expectedMembers?: Array<{ assetId: string }>;
+  requestHeaders?: Record<string, string>;
 }
 
 interface ContractAssetPage {
@@ -37,6 +41,8 @@ interface ContractResponse {
 interface ContractOperation {
   responses: Record<string, ContractResponse>;
   security?: unknown[];
+  parameters?: Array<{ name?: string; in?: string; required?: boolean; $ref?: string }>;
+  requestBody?: { required?: boolean; content?: Record<string, { schema?: unknown }> };
 }
 
 interface ApiErrorSchema {
@@ -52,7 +58,10 @@ interface ApiErrorSchema {
 interface OpenApiContract {
   paths: Record<string, Record<string, ContractOperation>>;
   security?: unknown[];
-  components: { schemas: Record<string, ApiErrorSchema> };
+  components: {
+    schemas: Record<string, unknown> & { ApiError: ApiErrorSchema };
+    parameters: Record<string, unknown>;
+  };
 }
 
 const routes: RouteCase[] = [
@@ -107,7 +116,20 @@ const routes: RouteCase[] = [
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', expectedTags: ['summer'] },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'delete', path: '/v1/libraries/lib/assets/asset/tags/%20summer%20', status: 204, authorization: 'Bearer contract-admin' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'delete', path: '/v1/libraries/lib/assets/asset/tags/summer', status: 204, authorization: 'Bearer contract-admin' },
-  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', expectedTags: [] }
+  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', expectedTags: [] },
+  { template: '/v1/libraries/{libraryId}/albums', method: 'get', path: '/v1/libraries/lib/albums', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums', method: 'get', path: '/v1/libraries/lib/albums', status: 200, authorization: 'Bearer contract-admin', expectedAlbums: [{ albumId: 'album-1', libraryId: 'lib', title: 'Family', createdByPeerId: 'node-local', createdAt: '2026-10-28T00:00:00.000Z' }], headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums', method: 'post', path: '/v1/libraries/lib/albums', status: 403, error: 'forbidden', body: { title: 'Family' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums', method: 'post', path: '/v1/libraries/lib/albums', status: 400, error: 'invalid_request', body: {}, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums', method: 'post', path: '/v1/libraries/lib/albums', status: 201, authorization: 'Bearer contract-admin', body: { title: 'Family' }, requestHeaders: { 'idempotency-key': '123e4567-e89b-42d3-a456-426614174000' }, expectedAlbum: { albumId: 'album-1', libraryId: 'lib', title: 'Family', createdByPeerId: 'node-local', createdAt: '2026-10-28T00:00:00.000Z' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members', method: 'get', path: '/v1/libraries/lib/albums/album-1/members', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members', method: 'get', path: '/v1/libraries/lib/albums/album-1/members', status: 200, authorization: 'Bearer contract-admin', expectedMembers: [{ assetId: 'asset' }], headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}', method: 'put', path: '/v1/libraries/lib/albums/album-1/members/asset', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}', method: 'put', path: '/v1/libraries/lib/albums/album-1/members/asset', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}', method: 'put', path: '/v1/libraries/lib/albums/album-1/members/asset', status: 204, authorization: 'Bearer contract-admin', requestHeaders: { 'idempotency-key': '223e4567-e89b-42d3-a456-426614174000' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}', method: 'delete', path: '/v1/libraries/lib/albums/album-1/members/asset', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}', method: 'delete', path: '/v1/libraries/lib/albums/album-1/members/asset', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}', method: 'delete', path: '/v1/libraries/lib/albums/album-1/members/asset', status: 204, authorization: 'Bearer contract-admin', requestHeaders: { 'idempotency-key': '323e4567-e89b-42d3-a456-426614174000' }, headers: { 'Cache-Control': 'private, no-store' } }
 ];
 
 const tagKey = 'lib:asset';
@@ -127,11 +149,19 @@ const server = createNodeAgentServer({
   pairingControl: { dialManualIp: async () => { throw new Error('peer unavailable'); } } as unknown as PairingServerControl,
   uploadService: {} as unknown as UploadService,
   gallery: {
+    listLibraries: () => [{ libraryId: 'lib', title: 'lib' }],
     listAssets: (libraryId: string) => ({
       items: [{ assetId: 'asset', libraryId, tags: [...(visibleAssetTags.get(`${libraryId}:asset`) ?? [])].sort() }], nextCursor: null
     }),
     getOriginal: async () => undefined
   } as unknown as GalleryServerControl,
+  albums: {
+    listAlbums: () => ({ items: [{ albumId: 'album-1', libraryId: 'lib', title: 'Family', createdByPeerId: 'node-local', createdAt: '2026-10-28T00:00:00.000Z' }], nextCursor: null }),
+    createAlbum: () => ({ albumId: 'album-1', libraryId: 'lib', title: 'Family', createdByPeerId: 'node-local', createdAt: '2026-10-28T00:00:00.000Z' }),
+    listMembers: () => ({ items: [{ assetId: 'asset' }], nextCursor: null }),
+    addMember: () => ({ status: 'added' }),
+    removeMember: () => ({ status: 'removed', observedAddIds: ['add-1'] })
+  },
   assetTags: {
     addAssetTag: (libraryId: string, assetId: string, tag: string) => {
       const key = `${libraryId}:${assetId}`;
@@ -171,6 +201,45 @@ describe('implemented Node HTTP API contract', () => {
     expect(contract.paths['/v1/health']!.get!.security).toEqual([]);
   });
 
+  it('defines bounded, strict album DTOs and private album responses', async () => {
+    const contract = await loadContract();
+    const schemas = contract.components.schemas as Record<string, {
+      additionalProperties?: boolean;
+      required?: string[];
+      properties?: Record<string, { type?: string | string[]; maxItems?: number; items?: { $ref?: string }; 'x-maxUtf8Bytes'?: number }>;
+    }>;
+    expect(schemas.Album?.additionalProperties).toBe(false);
+    expect(Object.keys(schemas.Album?.properties ?? {}).sort()).toEqual(['albumId', 'createdAt', 'createdByPeerId', 'libraryId', 'title']);
+    expect(schemas.CreateAlbumRequest?.additionalProperties).toBe(false);
+    expect(schemas.CreateAlbumRequest?.properties?.title?.['x-maxUtf8Bytes']).toBe(256);
+    expect(schemas.AlbumPage?.properties?.items?.maxItems).toBe(200);
+    expect(schemas.AlbumPage?.properties?.nextCursor?.type).toEqual(['string', 'null']);
+    expect(schemas.AlbumMemberPage?.properties?.totalCount).toBeUndefined();
+    expect(schemas.AlbumMember?.additionalProperties).toBe(false);
+    expect(Object.keys(schemas.AlbumMember?.properties ?? {})).toEqual(['assetId']);
+
+    for (const template of [
+      '/v1/libraries/{libraryId}/albums',
+      '/v1/libraries/{libraryId}/albums/{albumId}/members',
+      '/v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}'
+    ]) {
+      const path = contract.paths[template]!;
+      for (const method of Object.keys(path).filter((key) => ['get', 'post', 'put', 'delete'].includes(key))) {
+        const operation = path[method]!;
+        for (const response of Object.values(operation.responses)) {
+          const cache = response.headers?.['Cache-Control'] as { schema?: { const?: string } } | undefined;
+          expect(cache?.schema?.const, `${method} ${template}`).toBe('private, no-store');
+        }
+        if (method === 'post' || method === 'put' || method === 'delete') {
+          expect(operation.parameters).toContainEqual({ $ref: '#/components/parameters/AlbumIdempotencyKey' });
+        }
+      }
+    }
+    expect(contract.components.parameters.AlbumIdempotencyKey).toMatchObject({
+      name: 'Idempotency-Key', in: 'header', required: true
+    });
+  });
+
   it('declares an open error envelope and a request-id header for every response', async () => {
     const contract = await loadContract();
     const errorSchema = contract.components.schemas.ApiError!;
@@ -205,7 +274,8 @@ describe('implemented Node HTTP API contract', () => {
       const headers = {
         'x-request-id': requestId,
         ...(route.authorization ? { authorization: route.authorization } : {}),
-        ...(route.body ? { 'content-type': 'application/json' } : {})
+        ...(route.body ? { 'content-type': 'application/json' } : {}),
+        ...(route.requestHeaders ?? {})
       };
       const response = await fetch(`http://127.0.0.1:${address.port}${route.path}`, {
         method: route.method.toUpperCase(), headers,
@@ -231,6 +301,9 @@ describe('implemented Node HTTP API contract', () => {
         const body: ContractAssetPage = await response.json() as ContractAssetPage;
         expect(body.items.find(({ assetId }) => assetId === 'asset')?.tags).toEqual(route.expectedTags);
       }
+      if (route.expectedAlbum) expect(await response.json()).toEqual(route.expectedAlbum);
+      if (route.expectedAlbums) expect(await response.json()).toEqual({ items: route.expectedAlbums, nextCursor: null });
+      if (route.expectedMembers) expect(await response.json()).toEqual({ items: route.expectedMembers, nextCursor: null });
     }
   });
 });

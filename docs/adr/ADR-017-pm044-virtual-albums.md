@@ -1,6 +1,6 @@
 # ADR-017：PM-044 服务端虚拟相册与成员关系
 
-- **状态：** 提案，等待用户批准后才修改 Node/SQLite schema 或实现 API。
+- **状态：** 用户于 2026-10-28 批准在隔离分支内实现、测试并本地提交 PM-044；实现及根级 lint/typecheck/test/contracts/build 验证通过；不授权生产迁移、push、merge 或 release。
 - **日期：** 2026-10-28
 - **路线图：** PM-044（虚拟相册服务端模型/API 与成员关系迁移）。
 - **依赖：** PM-041 / ADR-015（SQLite 迁移与图库 ACL）；PM-042 / ADR-016（读授权不得隐式授予写权限、OR-Set 观察删除语义）；PM-043（当前 Web 本地标签/相册行为）。
@@ -34,7 +34,7 @@ PM-043 将资产标签改为经授权 Node API 持久化，但 `GalleryApp.vue` 
 
 ### 2. API 与授权
 
-建议在现有 `/v1` 中增加：
+新增 `virtualAlbums` 健康能力，仅在 album service 已配置时宣告；未配置时相册 API 返回现有错误封套 `503 capability_unavailable`。建议在现有 `/v1` 中增加：
 
 - `GET /v1/libraries/{libraryId}/albums?cursor&limit`：按 `albumId` keyset 顺序分页返回相册；默认 `limit=50`、最大 `200`。PM-044 没有相册删除状态，列表包括所有已创建相册。
 - `POST /v1/libraries/{libraryId}/albums`：创建手动相册；响应包含服务端 album ID、规范化标题和创建时间。
@@ -46,7 +46,7 @@ PM-043 将资产标签改为经授权 Node API 持久化，但 `GalleryApp.vue` 
 
 分页仅允许 `cursor`、`limit`，重复/未知参数及无效 limit/cursor 返回 `400`；cursor 上限 2048 字节，版本化编码并校验库 ID、相册 ID/集合、排序版本和最后 ID。排序为 `albumId > lastAlbumId` 或 `assetId > lastAssetId`；每页重新校验授权，不承诺总数，不用 offset。Cursor 是 keyset continuation 而非 MVCC 快照：未变化的记录不会因 offset 位移而重复/漏页；并发新增/删除按每页当前状态体现，若新增排序键早于游标，客户端须从首屏刷新才能看到。墓碑过滤始终先于 page-size/nextCursor 计算。
 
-当前 `apps/node-agent/src/index.ts` 将 `authorizeLibraryRead`/`authorizeLibraryList` 与管理员 Bearer 都接到本机 `authorizePairingAdmin`，成功回传 principal `'local-admin'`，并不检查 `libraryId`；HTTP 尚无 Peer 读取/写入令牌，所以 PM-044 API 当前仅本机管理员可访问，不宣称 Peer 可读。每个路由先校验管理员身份（失败统一 `403 forbidden`），再调用 `authorizeLibraryRead(token, libraryId)`（成功表示 callback 认可的 principal，不表示图库存在），并通过 gallery library index 独立确认 `libraryId` 已存在；写路由同时要求 `authorizePairingAdmin` 和 library authorization。管理员有效但 callback 拒绝、图库未知/无权、相册缺失、album-library 不符、资产缺失/跨库/墓碑时，相关 list/member/write 路由统一返回同一 `404 not_found` 状态/封套，不暴露具体资源或数量。逐路由契约测试分别覆盖无效管理员、已认证但 callback 拒绝、未知图库、有效空相册列表、无相册/跨库相册、无资产/跨库/墓碑资产，证明不混淆且不枚举。未来若暴露 Peer API，必须实现真正的 library-scoped read ACL；Peer 写入还需单独 album-write grant、撤权及事件作者校验，不能复用 `library_grants.permission='read'` 或 PM-042 的 tag-write grant。OpenAPI 要明确每条路由的 schema、状态码、错误、响应头和 cursor 约束，先验证契约再实现。
+当前 `apps/node-agent/src/index.ts` 将 `authorizeLibraryRead`/`authorizeLibraryList` 与管理员 Bearer 都接到本机 `authorizePairingAdmin`，成功回传 principal `'local-admin'`，并不检查 `libraryId`；HTTP 尚无 Peer 读取/写入令牌，所以 PM-044 API 当前仅本机管理员可访问，不宣称 Peer 可读。每个路由先校验管理员身份（失败统一 `403 forbidden`），再调用 `authorizeLibraryRead(token, libraryId)`（成功表示 callback 认可的 principal，不表示图库存在），并通过 gallery library index 独立确认 `libraryId` 已存在；写路由同时要求 `authorizePairingAdmin` 和 library authorization。管理员有效但 callback 拒绝、图库未知/无权、相册缺失、album-library 不符、资产缺失/跨库/墓碑时，相关 list/member/write 路由统一返回同一 `404 not_found` 状态/封套，不暴露具体资源或数量。逐路由契约测试分别覆盖无效管理员、已认证但 callback 拒绝、未知图库、有效空相册列表、无相册/跨库相册、无资产/跨库/墓碑资产，证明不混淆且不枚举。未来若暴露 Peer API，必须实现真正的 library-scoped read ACL；Peer 写入还需单独 album-write grant、撤权及事件作者校验，不能复用 `library_grants.permission='read'` 或 PM-042 的 tag-write grant。所有相册 API 响应设置 `Cache-Control: private, no-store` 与 `X-Request-ID`；OpenAPI 要明确每条路由的 schema、状态码、错误、响应头和 cursor 约束，先验证契约再实现。
 
 ### 3. SQLite migration、兼容与恢复
 
@@ -65,6 +65,6 @@ PM-043 将资产标签改为经授权 Node API 持久化，但 `GalleryApp.vue` 
 6. 本地资产、活动同步投影、缺失/跨库/tombstone 资产的 SQL 约束与 API 拒绝测试；已存在成员随 asset tombstone 隐藏、恢复后重现；拒绝新增到 tombstone；源字节 SHA-256 与现有 IndexedDB 标签/相册值不变。
 7. 先验证 OpenAPI，再跑根级 install-frozen/lint/typecheck/test/contracts/build；不把生产迁移、P2P、多用户远端写、硬件验证记为通过。
 
-## 待批准范围
+## 批准范围与审批记录
 
-请批准上述 PM-044 范围和授权边界后再开始 schema/API 实现；如需允许只读 Peer 修改相册、自动迁移本地 tag-backed 相册、加入 rename/delete、或采用不同并发语义，必须先修订本 ADR。即使批准本 ADR，也不授权生产数据库迁移、push、merge 或 release。
+用户于 2026-10-28 批准上述 PM-044 范围和授权边界，仅限隔离分支实现、测试和本地提交。批准包括本机管理员 API、图库范围检查、仅追加 `0007_virtual_albums` migration 代码、手动相册与成员关系；不包括 Peer 写入/同步、自动迁移本地 tag-backed 相册、rename/delete 或生产数据库迁移。若后续需要这些范围，须另行修订 ADR 并取得审批。此批准不授权生产迁移、push、merge 或 release。

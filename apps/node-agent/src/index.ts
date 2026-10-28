@@ -53,6 +53,7 @@ let syncService: SyncService | undefined;
 let tagSyncRepository: TagSyncRepository | undefined;
 let tagSyncService: TagSyncService | undefined;
 let nodeId = process.env.PHOTOMESH_NODE_ID ?? 'local-node';
+let albumPeerId: string | undefined;
 try {
   const fixtureMode = process.env.PHOTOMESH_FIXTURE_MODE === 'true';
   const secretStore = fixtureMode && process.env.PHOTOMESH_FIXTURE_SECRET_DIR
@@ -60,6 +61,7 @@ try {
     : new SystemSecretStore();
   const identity = await loadOrCreateLocalIdentity(repository, secretStore);
   nodeId = identity.peerId;
+  albumPeerId = identity.peerId;
   pairing = new PairingService(repository, identity.peerId, pairingApprovals.request);
   tagSyncRepository = new TagSyncRepository(database);
   syncService = new SyncService(new SyncRepository(database), identity, pairing, undefined, (event) => {
@@ -172,6 +174,7 @@ const server = createNodeAgentServer({
       'rest',
       ...(mediaVersionService ? ['mediaVersions' as const] : []),
       ...(mediaThumbnailService ? ['thumbnails' as const] : []),
+      ...(albumPeerId ? ['virtualAlbums' as const] : []),
       ...(tagSyncService ? ['assetTags' as const] : [])
     ],
     storageCapabilities: (): DiagnosticCapability[] => ['managedFiles'],
@@ -195,6 +198,14 @@ const server = createNodeAgentServer({
     restoreTombstone: (libraryId, eventId) => restoreCoordinator.run(libraryId, eventId,
       () => restoreTombstoneOperation(libraryId, eventId, syncService, (id) => repository.listActiveTombstones(id)))
   },
+  ...(albumPeerId ? { albums: {
+    listAlbums: (libraryId: string, cursor: string | undefined, limit: number) => repository.listAlbums(libraryId, cursor, limit),
+    createAlbum: (input) => repository.createAlbum({ ...input, authorPeerId: albumPeerId! }),
+    listMembers: (libraryId: string, albumId: string, cursor: string | undefined, limit: number) =>
+      repository.listAlbumMembers(libraryId, albumId, cursor, limit),
+    addMember: (input) => repository.addAlbumMember({ ...input, authorPeerId: albumPeerId! }),
+    removeMember: (input) => repository.removeAlbumMember({ ...input, authorPeerId: albumPeerId! })
+  } } : {}),
   tagSync: Boolean(tagSyncService),
   ...(tagSyncService ? { assetTags: {
     addAssetTag: (libraryId: string, assetId: string, tag: string, createdAt: string) =>

@@ -2,6 +2,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { migrations, type Migration } from './migrations.js';
 import { maxAssetTagsPerAsset } from '../asset-tag-limits.js';
+import { decodeAlbumCursor, encodeAlbumCursor, type AlbumCursorScope } from '../albums/album-utils.js';
 import { SyncRepository } from '../sync/sync-repository.js';
 import type { EventDraftFactory } from '../sync/event-envelope.js';
 
@@ -111,6 +112,37 @@ export interface GalleryAssetRecord extends LibraryIndexAsset {
 }
 
 export type AssetTagMutationResult = 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'limit_reached';
+
+export interface AlbumRecord {
+  albumId: string;
+  libraryId: string;
+  title: string;
+  createdByPeerId: string;
+  createdAt: string;
+}
+
+export interface AlbumPage {
+  items: AlbumRecord[];
+  nextCursor: string | null;
+}
+
+export interface AlbumMemberPage {
+  items: Array<{ assetId: string }>;
+  nextCursor: string | null;
+}
+
+export interface AlbumOperationContext {
+  operationId: string;
+  principalId: string;
+  authorPeerId: string;
+  libraryId: string;
+  requestFingerprint: string;
+  createdAt: string;
+}
+
+export type AlbumMemberMutationResult =
+  | { status: 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'writer_limit'; observedAddIds?: string[] };
+
 export interface GalleryMediaRecord {
   libraryId: string;
   filename: string;
@@ -204,6 +236,7 @@ export class RepositoryConflictError extends Error {
 export interface RepositoryFaults {
   beforeFinalize?: () => void;
   beforeRecordChunk?: () => void;
+  beforeAlbumOperationCommit?: () => void;
   backupBeforeMigration?: () => Promise<void>;
 }
 
@@ -484,6 +517,131 @@ export class SqliteRepository implements UploadRepository {
     return rows.map((row) => ({ libraryId: row.library_id, title: row.library_id }));
   }
 
+  createAlbum(input: AlbumOperationContext & { title: string }): AlbumRecord | 'writer_limit' | undefined {
+    const write = this.db.transaction((): AlbumRecord | 'writer_limit' | undefined => {
+      const replay = this.getAlbumOperationReplay<AlbumRecord>(input, ['album.created']);
+      if (replay !== undefined) return replay;
+      if (!this.hasGalleryLibrary(input.libraryId)) return undefined;
+      if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return 'writer_limit';
+      const album: AlbumRecord = {
+        albumId: randomUUID(), libraryId: input.libraryId, title: input.title,
+        createdByPeerId: input.authorPeerId, createdAt: input.createdAt
+      };
+      this.db.prepare(`INSERT INTO albums (album_id, library_id, title, created_by_peer_id, created_at)
+        VALUES (?, ?, ?, ?, ?)`).run(album.albumId, album.libraryId, album.title, album.createdByPeerId, album.createdAt);
+      this.insertAlbumOperation(input, album.albumId, null, 'album.created', album);
+      this.faults.beforeAlbumOperationCommit?.();
+      return album;
+    });
+    return write.immediate();
+  }
+
+  listAlbums(libraryId: string, cursor: string | undefined, limit: number): AlbumPage | undefined {
+    this.validateAlbumLimit(limit);
+    if (!this.hasGalleryLibrary(libraryId)) return undefined;
+    const scope: AlbumCursorScope = { collection: 'albums', libraryId };
+    const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, scope);
+    const rows = this.db.prepare(`SELECT album_id, library_id, title, created_by_peer_id, created_at FROM albums
+      WHERE library_id = ? ${lastId === undefined ? '' : 'AND album_id COLLATE BINARY > ?'}
+      ORDER BY album_id COLLATE BINARY LIMIT ?`).all(
+        libraryId, ...(lastId === undefined ? [] : [lastId]), limit + 1
+      ) as AlbumSqlRow[];
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(toAlbumRecord);
+    return {
+      items,
+      nextCursor: hasMore && items.length > 0 ? encodeAlbumCursor(scope, items[items.length - 1]!.albumId) : null
+    };
+  }
+
+  listAlbumMembers(libraryId: string, albumId: string, cursor: string | undefined, limit: number): AlbumMemberPage | undefined {
+    this.validateAlbumLimit(limit);
+    if (!this.hasAlbum(libraryId, albumId)) return undefined;
+    const scope: AlbumCursorScope = { collection: 'members', libraryId, albumId };
+    const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, scope);
+    const rows = this.db.prepare(`SELECT DISTINCT m.asset_id FROM album_memberships m
+      WHERE m.library_id = ? AND m.album_id = ? ${lastId === undefined ? '' : 'AND m.asset_id COLLATE BINARY > ?'}
+        AND EXISTS (
+          SELECT 1 FROM assets a WHERE a.library_id = m.library_id AND a.asset_id = m.asset_id
+            AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id
+              AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+          UNION ALL
+          SELECT 1 FROM sync_asset_projection p WHERE p.library_id = m.library_id AND p.asset_id = m.asset_id
+            AND p.tombstone_event_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+        )
+      ORDER BY m.asset_id COLLATE BINARY LIMIT ?`).all(
+        libraryId, albumId, ...(lastId === undefined ? [] : [lastId]), limit + 1
+      ) as Array<{ asset_id: string }>;
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map((row) => ({ assetId: row.asset_id }));
+    return {
+      items,
+      nextCursor: hasMore && items.length > 0 ? encodeAlbumCursor(scope, items[items.length - 1]!.assetId) : null
+    };
+  }
+
+  addAlbumMember(input: AlbumOperationContext & { albumId: string; assetId: string }): AlbumMemberMutationResult {
+    const write = this.db.transaction((): AlbumMemberMutationResult => {
+      const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.added', 'member.add.noop']);
+      if (replay !== undefined) return replay;
+      if (!this.hasAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
+        return { status: 'not_found' };
+      }
+      if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return { status: 'writer_limit' };
+      const active = this.db.prepare(`SELECT add_operation_id FROM album_memberships
+        WHERE library_id = ? AND album_id = ? AND asset_id = ? AND author_peer_id = ?`)
+        .get(input.libraryId, input.albumId, input.assetId, input.authorPeerId) as { add_operation_id: string } | undefined;
+      if (active) {
+        const result: AlbumMemberMutationResult = { status: 'already_present' };
+        this.insertAlbumOperation(input, input.albumId, input.assetId, 'member.add.noop', result);
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      const result: AlbumMemberMutationResult = { status: 'added' };
+      this.insertAlbumOperation(input, input.albumId, input.assetId, 'member.added', result);
+      this.db.prepare(`INSERT INTO album_memberships
+        (library_id, album_id, asset_id, author_peer_id, add_operation_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(input.libraryId, input.albumId, input.assetId,
+          input.authorPeerId, input.operationId, input.createdAt);
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
+  removeAlbumMember(input: AlbumOperationContext & { albumId: string; assetId: string }): AlbumMemberMutationResult {
+    const write = this.db.transaction((): AlbumMemberMutationResult => {
+      const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.removed', 'member.remove.noop']);
+      if (replay !== undefined) return replay;
+      if (!this.hasAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
+        return { status: 'not_found' };
+      }
+      if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return { status: 'writer_limit' };
+      const targets = this.db.prepare(`SELECT add_operation_id FROM album_memberships
+        WHERE library_id = ? AND album_id = ? AND asset_id = ? ORDER BY add_operation_id COLLATE BINARY`)
+        .all(input.libraryId, input.albumId, input.assetId) as Array<{ add_operation_id: string }>;
+      if (targets.length > 64) return { status: 'writer_limit' };
+      const observedAddIds = targets.map((target) => target.add_operation_id);
+      const result: AlbumMemberMutationResult = targets.length > 0
+        ? { status: 'removed', observedAddIds }
+        : { status: 'unchanged', observedAddIds: [] };
+      const operationType = targets.length > 0 ? 'member.removed' : 'member.remove.noop';
+      this.insertAlbumOperation(input, input.albumId, input.assetId, operationType, result);
+      for (const target of targets) {
+        this.db.prepare(`INSERT INTO album_membership_remove_targets
+          (remove_operation_id, observed_add_operation_id, library_id, album_id, asset_id)
+          VALUES (?, ?, ?, ?, ?)`).run(input.operationId, target.add_operation_id,
+            input.libraryId, input.albumId, input.assetId);
+        this.db.prepare(`DELETE FROM album_memberships WHERE library_id = ? AND album_id = ? AND asset_id = ?
+          AND add_operation_id = ?`).run(input.libraryId, input.albumId, input.assetId, target.add_operation_id);
+      }
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
   addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string): AssetTagMutationResult {
     const write = this.db.transaction((): AssetTagMutationResult => {
       if (!this.hasVisibleGalleryAsset(libraryId, assetId)) return 'not_found';
@@ -507,6 +665,60 @@ export class SqliteRepository implements UploadRepository {
       return removed.changes === 1 ? 'removed' : 'unchanged';
     });
     return write.immediate();
+  }
+
+  private hasGalleryLibrary(libraryId: string): boolean {
+    const row = this.db.prepare(`SELECT EXISTS (
+      SELECT 1 FROM assets WHERE library_id = ?
+      UNION ALL SELECT 1 FROM sync_asset_projection WHERE library_id = ?
+    ) AS present`).get(libraryId, libraryId) as { present: number };
+    return row.present === 1;
+  }
+
+  private hasAlbum(libraryId: string, albumId: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM albums WHERE library_id = ? AND album_id = ?').get(libraryId, albumId));
+  }
+
+  private canAuthorAlbumOperation(libraryId: string, authorPeerId: string): boolean {
+    const known = this.db.prepare('SELECT 1 FROM album_operations WHERE library_id = ? AND author_peer_id = ? LIMIT 1')
+      .get(libraryId, authorPeerId);
+    if (known) return true;
+    const count = this.db.prepare('SELECT count(DISTINCT author_peer_id) AS count FROM album_operations WHERE library_id = ?')
+      .get(libraryId) as { count: number };
+    return count.count < 64;
+  }
+
+  private validateAlbumLimit(limit: number): void {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new RangeError('invalid album page limit');
+  }
+
+  private insertAlbumOperation(
+    input: AlbumOperationContext,
+    albumId: string,
+    assetId: string | null,
+    operationType: 'album.created' | 'member.added' | 'member.add.noop' | 'member.removed' | 'member.remove.noop',
+    result: unknown
+  ): void {
+    this.db.prepare(`INSERT INTO album_operations
+      (operation_id, principal_id, author_peer_id, library_id, album_id, asset_id, operation_type,
+       request_fingerprint, result_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        input.operationId, input.principalId, input.authorPeerId, input.libraryId, albumId, assetId,
+        operationType, input.requestFingerprint, JSON.stringify(result), input.createdAt
+      );
+  }
+
+  private getAlbumOperationReplay<T>(input: AlbumOperationContext, allowedTypes: readonly string[]): T | undefined {
+    const row = this.db.prepare(`SELECT principal_id, request_fingerprint, operation_type, result_json
+      FROM album_operations WHERE operation_id = ?`).get(input.operationId) as {
+        principal_id: string; request_fingerprint: string; operation_type: string; result_json: string;
+      } | undefined;
+    if (!row) return undefined;
+    if (row.principal_id !== input.principalId || row.request_fingerprint !== input.requestFingerprint ||
+      !allowedTypes.includes(row.operation_type)) {
+      throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+    }
+    return JSON.parse(row.result_json) as T;
   }
 
   private hasVisibleGalleryAsset(libraryId: string, assetId: string): boolean {
@@ -868,6 +1080,21 @@ export class SqliteRepository implements UploadRepository {
 function safeHashEquals(left: string, right: string): boolean {
   if (!/^[0-9a-f]{64}$/.test(left) || !/^[0-9a-f]{64}$/.test(right)) return false;
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
+}
+
+interface AlbumSqlRow {
+  album_id: string;
+  library_id: string;
+  title: string;
+  created_by_peer_id: string;
+  created_at: string;
+}
+
+function toAlbumRecord(row: AlbumSqlRow): AlbumRecord {
+  return {
+    albumId: row.album_id, libraryId: row.library_id, title: row.title,
+    createdByPeerId: row.created_by_peer_id, createdAt: row.created_at
+  };
 }
 
 interface GalleryAssetSqlRow {
