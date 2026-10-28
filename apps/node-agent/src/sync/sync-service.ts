@@ -41,7 +41,7 @@ export interface SyncTransport {
 const SUPPORTED_CAPABILITIES = ['asset.indexed', 'asset.metadata.updated', 'asset.tombstoned', 'asset.restored', 'causal-cursors'];
 
 export function negotiateProtocol(local: SyncHello, remote: SyncHello): { protocol: number; schemaVersion: number; capabilities: string[] } {
-  if (!isHello(local) || !isHello(remote)) throw new SyncProtocolConflictError('invalid protocol hello');
+  if (!isSyncHello(local) || !isSyncHello(remote)) throw new SyncProtocolConflictError('invalid protocol hello');
   const minimum = Math.max(local.protocolMin, remote.protocolMin);
   const maximum = Math.min(local.protocolMax, remote.protocolMax);
   if (minimum > maximum) throw new SyncProtocolConflictError('no common event sync protocol version');
@@ -52,18 +52,27 @@ export function negotiateProtocol(local: SyncHello, remote: SyncHello): { protoc
 }
 
 export class SyncService {
+  private readonly peerCapabilities = new Map<string, Set<string>>();
+
   constructor(
     readonly repository: SyncRepository,
     private readonly identity: LocalIdentity,
     private readonly pairing: PairingService,
-    private readonly now: () => string = () => new Date().toISOString()
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly onEventApplied?: (event: EventEnvelope) => void,
+    private readonly tagSyncAvailable = false
   ) {}
 
   hello(): SyncHello {
     return {
       nodeId: this.identity.peerId, protocolMin: SYNC_PROTOCOL_MIN, protocolMax: SYNC_PROTOCOL_MAX,
-      schemaVersions: [EVENT_SCHEMA_VERSION], capabilities: SUPPORTED_CAPABILITIES
+      schemaVersions: [EVENT_SCHEMA_VERSION],
+      capabilities: [...SUPPORTED_CAPABILITIES, ...(this.tagSyncAvailable ? ['asset-tags-v1'] : [])]
     };
+  }
+
+  peerSupportsCapability(peerId: string, capability: string): boolean {
+    return this.peerCapabilities.get(peerId)?.has(capability) ?? false;
   }
 
   async createLocalEvent(input: { libraryId: string; eventType: SyncEventType; payload: JsonValue; createdAt?: string; causalParents?: string[] }, requireActiveTombstoneId?: string): Promise<EventEnvelope> {
@@ -80,6 +89,7 @@ export class SyncService {
       const signed = await signEvent(unsigned, this.identity);
       try {
         this.repository.appendLocalEvent(signed, requireActiveTombstoneId);
+        this.onEventApplied?.(signed);
         return signed;
       } catch (error) {
         if (!(error instanceof SyncProtocolConflictError) || attempt === 3) throw error;
@@ -98,7 +108,9 @@ export class SyncService {
 
   async signPendingLocalEvents(): Promise<void> {
     for (const draft of this.repository.getUnsignedLocalDrafts(this.identity.peerId)) {
-      await this.repository.completeLocalDraft(await signEvent(draft, this.identity));
+      const signed = await signEvent(draft, this.identity);
+      await this.repository.completeLocalDraft(signed);
+      this.onEventApplied?.(signed);
     }
   }
 
@@ -129,6 +141,7 @@ export class SyncService {
       const author = this.pairing.listPeers().find((peer) => peer.peerId === event.authorPeerId && peer.trustState === 'trusted');
       if (!author || !(await verifyEvent(event, author.publicKey))) throw new SyncProtocolConflictError('event signature or author identity is invalid');
       const result = this.repository.ingest(remotePeerId, event);
+      this.notifyAppliedEvents(result.appliedEventIds);
       results.push({ eventId: event.eventId, status: result.status });
     }
     const grantedLibraryIds = this.repository.listGrantedLibraries(remotePeerId);
@@ -158,6 +171,7 @@ export class SyncService {
       if (response.agreedProtocol !== negotiation.protocol || response.schemaVersion !== negotiation.schemaVersion) {
         throw new SyncProtocolConflictError('peer returned an inconsistent protocol negotiation');
       }
+      this.peerCapabilities.set(peerId, new Set(response.hello.capabilities));
       if (!isStringArray(response.grantedLibraryIds, 256) || !Array.isArray(response.cursors) || !Array.isArray(response.events) ||
           response.events.length > SYNC_BATCH_LIMIT) throw new SyncProtocolConflictError('invalid sync response');
       this.repository.setRemoteLibraries(peerId, response.grantedLibraryIds);
@@ -167,7 +181,8 @@ export class SyncService {
         if (!response.grantedLibraryIds.includes(event.libraryId)) throw new SyncAuthorizationError();
         const author = this.pairing.listPeers().find((peer) => peer.peerId === event.authorPeerId && peer.trustState === 'trusted');
         if (!author || !(await verifyEvent(event, author.publicKey))) throw new SyncProtocolConflictError('event signature or author identity is invalid');
-        this.repository.ingest(peerId, event);
+        const result = this.repository.ingest(peerId, event);
+        this.notifyAppliedEvents(result.appliedEventIds);
         received += 1;
       }
       sent += events.length;
@@ -178,19 +193,27 @@ export class SyncService {
     throw new SyncProtocolConflictError('sync did not converge within the round limit');
   }
 
+  private notifyAppliedEvents(eventIds: readonly string[]): void {
+    if (!this.onEventApplied) return;
+    for (const eventId of eventIds) {
+      const event = this.repository.getEventEnvelope(eventId);
+      if (event) this.onEventApplied(event);
+    }
+  }
+
   private remoteLibraryIds(peerId: string): string[] {
     return this.repository.getRemoteLibraries(peerId);
   }
 }
 
 export function isSyncExchangeRequest(value: unknown): value is SyncExchangeRequest {
-  if (!isRecord(value) || !isHello(value.hello) || !isStringArray(value.grantedLibraryIds, 256) ||
+  if (!isRecord(value) || !isSyncHello(value.hello) || !isStringArray(value.grantedLibraryIds, 256) ||
       !Array.isArray(value.cursors) || value.cursors.length > 4096 || !Array.isArray(value.events) || value.events.length > SYNC_BATCH_LIMIT) return false;
   if (Buffer.byteLength(JSON.stringify(value), 'utf8') > MAX_EVENT_BYTES * SYNC_BATCH_LIMIT) return false;
   return value.cursors.every(isCursor) && value.events.every((event) => isRecord(event));
 }
 
-function isHello(value: unknown): value is SyncHello {
+export function isSyncHello(value: unknown): value is SyncHello {
   return isRecord(value) && typeof value.nodeId === 'string' && value.nodeId.length <= 128 &&
     Number.isSafeInteger(value.protocolMin) && Number(value.protocolMin) > 0 &&
     Number.isSafeInteger(value.protocolMax) && Number(value.protocolMax) >= Number(value.protocolMin) &&

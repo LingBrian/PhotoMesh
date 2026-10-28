@@ -12,6 +12,8 @@ export type DiagnosticCapability =
   | 'rest'
   | 'mediaVersions'
   | 'thumbnails'
+  | 'assetTags'
+  | 'tagSync'
   | 'sqlite'
   | 'managedFiles'
   | 'nodeIdentity'
@@ -43,7 +45,7 @@ export interface HealthDiagnosticsSource {
 }
 
 const knownCapabilities = new Set<DiagnosticCapability>([
-  'rest', 'mediaVersions', 'thumbnails', 'sqlite', 'managedFiles', 'nodeIdentity', 'eventSigning', 'lanPairing'
+  'rest', 'mediaVersions', 'thumbnails', 'assetTags', 'tagSync', 'sqlite', 'managedFiles', 'nodeIdentity', 'eventSigning', 'lanPairing'
 ]);
 
 export function getHealth(capabilities: readonly string[] = []): HealthResponse {

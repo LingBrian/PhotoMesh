@@ -167,12 +167,21 @@ describe('source contracts', () => {
     };
     expect(api.components.schemas.Asset).toMatchObject({
       required: expect.arrayContaining(['tags']),
-      properties: { tags: { type: 'array', maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 128 } } }
+      properties: { tags: { type: 'array', maxItems: 4096, items: { type: 'string', minLength: 1, maxLength: 128 } } }
     });
     expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}']).toMatchObject({
       put: { responses: { '204': { headers: { 'X-Request-ID': { $ref: '#/components/headers/XRequestId' } } }, '400': {}, '403': {}, '404': {}, '503': {} } },
       delete: { responses: { '204': { headers: { 'X-Request-ID': { $ref: '#/components/headers/XRequestId' } } }, '400': {}, '403': {}, '404': {}, '503': {} } }
     });
+    expect(api.paths['/v1/pairing/peers/{peerId}/libraries/{libraryId}/tag-write']).toMatchObject({
+      put: { responses: { '204': {}, '403': {}, '409': {}, '503': {} } },
+      delete: { responses: {
+        '200': { content: { 'application/json': { schema: { required: ['status', 'replicatedEventsRemain'], properties: { replicatedEventsRemain: { const: true } } } } } },
+        '403': {}, '503': {}
+      } }
+    });
+    expect(api.paths['/v1/pairing/libraries/{libraryId}/tag-writers']).toMatchObject({ get: { responses: { '200': {}, '403': {}, '503': {} } } });
+    expect(api.paths['/v1/pairing/peers/{peerId}/tag-sync-status']).toMatchObject({ get: { responses: { '200': {}, '403': {}, '503': {} } } });
   });
 
   it('documents the implemented security headers and non-success status codes', async () => {

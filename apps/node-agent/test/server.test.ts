@@ -30,6 +30,11 @@ describe('node-agent health endpoint', () => {
     expect(await response.json()).toEqual({ status: 'degraded', protocolMin: 0, protocolMax: 0, capabilities: [] });
   });
 
+  it('advertises tag-sync capability independently from tag API availability', async () => {
+    const response = await request('/v1/health', { assetTags: { addAssetTag: () => 'added', removeAssetTag: () => 'removed' }, tagSync: true });
+    expect((await response.json() as { capabilities: string[] }).capabilities).toEqual(['assetTags', 'tagSync']);
+  });
+
   it('protects component diagnostics and omits internal error details', async () => {
     const sensitivePath = 'D:\\\\Users\\\\private\\\\photos';
     const checkDatabase = vi.fn(() => { throw new Error(sensitivePath); });
@@ -561,6 +566,45 @@ describe('pairing and library authorization endpoints', () => {
     expect(joined.status).toBe(200);
     expect(await joined.json()).toEqual({ hostPeerId: 'host-peer-123456' });
     expect(pairWithInvite).toHaveBeenCalledWith(body.invite, 'Laptop', undefined);
+  });
+
+  it('protects tag-writer grants and exposes per-peer tag sync status to local admins', async () => {
+    const grantTagWrite = vi.fn(() => true);
+    const revokeTagWrite = vi.fn(() => true);
+    const options: NodeAgentServerOptions = {
+      pairingControl: pairingControl({
+        grantTagWrite, revokeTagWrite, listTagWriters: () => ['peer-writer'],
+        getTagSyncStatus: () => ({ pending: 2, lastError: 'peer_missing_asset_tags_v1' })
+      }),
+      authorizePairingAdmin: (token) => token === 'admin-secret'
+    };
+    const denied = await request('/v1/pairing/peers/peer-writer/libraries/family/tag-write', options, { method: 'PUT' });
+    expect(denied.status).toBe(403);
+    expect(grantTagWrite).not.toHaveBeenCalled();
+
+    const granted = await request('/v1/pairing/peers/peer-writer/libraries/family/tag-write', options, {
+      method: 'PUT', headers: { authorization: 'Bearer admin-secret', 'x-request-id': 'tag-grant-request' }
+    });
+    expect(granted.status).toBe(204);
+    expect(granted.headers.get('x-request-id')).toBe('tag-grant-request');
+    expect(grantTagWrite).toHaveBeenCalledWith('peer-writer', 'family');
+
+    const writers = await request('/v1/pairing/libraries/family/tag-writers', options, {
+      headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(writers.status).toBe(200);
+    expect(await writers.json()).toEqual({ writers: ['peer-writer'] });
+    const status = await request('/v1/pairing/peers/peer-writer/tag-sync-status', options, {
+      headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(await status.json()).toEqual({ pending: 2, lastError: 'peer_missing_asset_tags_v1' });
+
+    const revoked = await request('/v1/pairing/peers/peer-writer/libraries/family/tag-write', options, {
+      method: 'DELETE', headers: { authorization: 'Bearer admin-secret' }
+    });
+    expect(revoked.status).toBe(200);
+    expect(await revoked.json()).toEqual({ status: 'revoked', replicatedEventsRemain: true });
+    expect(revokeTagWrite).toHaveBeenCalledWith('peer-writer', 'family');
   });
 
   it('validates local approval payloads and bounds library pagination', async () => {

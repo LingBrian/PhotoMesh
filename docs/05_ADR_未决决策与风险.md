@@ -146,7 +146,8 @@
 
 ## ADR-016：PM-042 标签 OR-Set 事件同步、授权与兼容性
 
-- **状态：** 草案，待用户明确批准；在批准前不修改 P2P 协议、ACL 或数据库 schema。完整方案见 [`ADR-016`](adr/ADR-016-pm042-asset-tag-sync.md)。
-- **核心提案：** 标签采用 observed-remove set；add 的事件 ID 是唯一操作 ID，remove 只移除已观察到的 add ID，未观察的并发 add 保留。现有 `asset_tags` 保持为物化视图，PM-041 既有标签经本地签名事件幂等引导。
-- **安全/版本提案：** 维持现有 read grant 只读含义，新增默认拒绝的逐图库 tag-write 授权；使用独立 `asset-tags-v1` 事件流，避免旧 N-1 节点因未知事件阻塞既有元数据同步。
-- **待批准事项：** 独立 tag stream/N-1 行为、显式写权限及其用户可见管理入口、OR-Set 与现存标签 bootstrap 语义。
+- **状态：** 用户于 2026-10-27 批准 ADR-016；仅覆盖隔离分支 PM-042 的协议/API/schema/UI 实现、测试及本地提交，不授权生产迁移、push、merge 或 release。详见 [`ADR-016`](adr/ADR-016-pm042-asset-tag-sync.md)。
+- **决定：** 标签用 observed-remove set；remove 只移除已观察 add ID，未观察的并发 add 保留；PM-041 标签以本地签名事件幂等引导；原 `asset_tags` 为物化视图。
+- **安全/兼容：** 现有 read grant 仍只读，逐图库 tag-write 默认拒绝；采用独立 `asset-tags-v1` 事件流，N-1 节点仍可同步旧元数据，并明确显示未同步标签操作。
+- **容量澄清（用户批准）：** 每个写入者每资产最多64个活动标签；每图库最多64个唯一标签事件作者（含本机，撤权不释放名额）；OR-Set 合并集及 `Asset.tags` 契约上限为4096。
+- **回滚：** `0006` 为追加迁移；旧二进制需恢复迁移前备份。生产迁移和发布必须另行审批。

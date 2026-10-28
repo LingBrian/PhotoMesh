@@ -3,6 +3,7 @@ import canonicalize from 'canonicalize';
 import { publicKeyFromProtobuf } from '@libp2p/crypto/keys';
 import { peerIdFromPublicKey } from '@libp2p/peer-id';
 import type { LocalIdentity } from '../auth/local-identity.js';
+import { validateTagOperationPayload } from './tag-orset.js';
 
 export const EVENT_PROTOCOL_VERSION = 1;
 export const EVENT_SCHEMA_VERSION = 1;
@@ -10,6 +11,8 @@ export const MAX_EVENT_BYTES = 256 * 1024;
 const SIGNING_DOMAIN = 'PhotoMesh.EventEnvelope.v1\n';
 
 export type SyncEventType = 'asset.indexed' | 'asset.metadata.updated' | 'asset.tombstoned' | 'asset.restored';
+export type TagSyncEventType = 'asset.tag.added' | 'asset.tag.removed';
+export type AnyEventType = SyncEventType | TagSyncEventType;
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface EventEnvelope {
@@ -35,7 +38,7 @@ export function makeUnsignedEvent(input: {
   authorPeerId: string;
   authorSequence: number;
   causalParents: readonly string[];
-  eventType: SyncEventType;
+  eventType: AnyEventType;
   payload: JsonValue;
   createdAt: string;
   eventId?: string;
@@ -47,8 +50,7 @@ export function makeUnsignedEvent(input: {
     causalParents: [...new Set(input.causalParents)].sort(), eventType: input.eventType,
     payload: input.payload, createdAt: input.createdAt
   };
-  if (input.eventType !== 'asset.indexed' && input.eventType !== 'asset.metadata.updated' &&
-      input.eventType !== 'asset.tombstoned' && input.eventType !== 'asset.restored') throw new Error('unsupported local event type');
+  if (!isSupportedEventType(input.eventType) && !isTagSyncEventType(input.eventType)) throw new Error('unsupported local event type');
   validateUnsignedEvent(event);
   return event;
 }
@@ -108,6 +110,7 @@ function validateUnsignedEvent(event: UnsignedEventEnvelope): void {
     throw new Error('invalid event envelope');
   }
   if (isSupportedEventType(event.eventType)) validatePayload(event.eventType, event.payload);
+  else if (isTagSyncEventType(event.eventType)) validateTagOperationPayload(event.eventType, event.payload);
   if (Buffer.byteLength(JSON.stringify(event), 'utf8') > MAX_EVENT_BYTES) throw new Error('event exceeds maximum size');
 }
 
@@ -143,8 +146,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isSupportedEventType(value: string): value is SyncEventType {
+export function isSupportedEventType(value: string): value is SyncEventType {
   return value === 'asset.indexed' || value === 'asset.metadata.updated' || value === 'asset.tombstoned' || value === 'asset.restored';
+}
+
+export function isTagSyncEventType(value: string): value is TagSyncEventType {
+  return value === 'asset.tag.added' || value === 'asset.tag.removed';
 }
 
 function isSafeId(value: unknown, maxLength: number): value is string {

@@ -11,11 +11,13 @@ import { parseJsonWithoutDuplicateKeys } from './strict-json.js';
 import type { LocalIdentity } from './local-identity.js';
 import { PAIRING_PROTOCOL_VERSION, PairingRejectedError, PairingService, type PairingQrPayload } from './pairing-service.js';
 import { isSyncExchangeRequest, SYNC_PROTOCOL, SyncService, type SyncExchangeRequest, type SyncExchangeResponse, type SyncTransport } from '../sync/sync-service.js';
+import { isTagSyncExchangeRequest, TAG_SYNC_CAPABILITY, TAG_SYNC_PROTOCOL, TagSyncService, type TagSyncExchangeRequest, type TagSyncExchangeResponse, type TagSyncTransport } from '../sync/tag-sync-service.js';
 
 const PAIR_PROTOCOL = '/photomesh/pairing/1.0.0';
 const INDEX_PROTOCOL = '/photomesh/library-index/1.0.0';
 const MAX_FRAME_BYTES = 32 * 1024;
 const MAX_SYNC_FRAME_BYTES = 18 * 1024 * 1024;
+const MAX_TAG_SYNC_FRAME_BYTES = 18 * 1024 * 1024;
 
 export interface DiscoveredPeer { peerId: string; addresses: string[] }
 
@@ -26,18 +28,28 @@ export interface LanNodeOptions {
   listenAddresses: readonly string[];
   listenPort?: number;
   syncService?: SyncService;
+  tagSyncService?: TagSyncService;
 }
 
-export class LanPairingNode implements SyncTransport {
+export class LanPairingNode implements SyncTransport, TagSyncTransport {
   private readonly discovered = new Map<string, Set<string>>();
   private readonly syncTasks = new Map<string, Promise<{ rounds: number; received: number; sent: number }>>();
   private syncTimer: ReturnType<typeof setInterval> | undefined;
   private stopping = false;
   private stopPromise: Promise<void> | undefined;
 
-  private constructor(private readonly node: Libp2p, private readonly pairing: PairingService, private readonly publicKey: Uint8Array, private readonly syncService?: SyncService) {}
+  private constructor(
+    private readonly node: Libp2p,
+    private readonly pairing: PairingService,
+    private readonly publicKey: Uint8Array,
+    private readonly syncService?: SyncService,
+    private readonly tagSyncService?: TagSyncService
+  ) {}
 
   static async start(options: LanNodeOptions): Promise<LanPairingNode> {
+    if (options.tagSyncService && !options.syncService) throw new Error('tag sync requires event sync capability negotiation');
+    const advertisesTagSync = options.syncService?.hello().capabilities.includes(TAG_SYNC_CAPABILITY) ?? false;
+    if (advertisesTagSync !== Boolean(options.tagSyncService)) throw new Error('tag sync capability must match its transport handler');
     const privateAddresses = [...new Set(options.listenAddresses)].map(normalizePrivateLanAddress);
     if (privateAddresses.length === 0) throw new Error('explicit private LAN listen addresses are required');
     const node = await createLibp2p({
@@ -45,7 +57,7 @@ export class LanPairingNode implements SyncTransport {
       addresses: { listen: privateAddresses.map((address) => `${address}/tcp/${options.listenPort ?? 0}`) },
       transports: [tcp()], connectionEncrypters: [noise()], streamMuxers: [yamux()], peerDiscovery: [mdns()]
     });
-    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey, options.syncService);
+    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey, options.syncService, options.tagSyncService);
     node.addEventListener('peer:discovery', (event) => {
       const detail = event.detail as { id: { toString(): string }; multiaddrs?: Array<{ toString(): string }> };
       const peerId = detail.id.toString();
@@ -99,6 +111,16 @@ export class LanPairingNode implements SyncTransport {
         await writeFrame(stream, { ...response }, MAX_SYNC_FRAME_BYTES);
       } catch {
         await writeFrame(stream, { ok: false, error: 'sync_rejected' }, MAX_SYNC_FRAME_BYTES).catch(() => undefined);
+      }
+    });
+    if (options.tagSyncService) node.handle(TAG_SYNC_PROTOCOL, async (stream, connection) => {
+      try {
+        const message = await readFrame(stream, MAX_TAG_SYNC_FRAME_BYTES);
+        if (!isTagSyncExchangeRequest(message)) throw new Error('invalid tag sync request');
+        const response = await options.tagSyncService!.handleExchange(connection.remotePeer.toString(), message);
+        await writeFrame(stream, { ...response }, MAX_TAG_SYNC_FRAME_BYTES);
+      } catch {
+        await writeFrame(stream, { ok: false, error: 'tag_sync_rejected' }, MAX_TAG_SYNC_FRAME_BYTES).catch(() => undefined);
       }
     });
     await node.start();
@@ -171,12 +193,30 @@ export class LanPairingNode implements SyncTransport {
     return response as unknown as SyncExchangeResponse;
   }
 
+  async exchangeTags(peerId: string, request: TagSyncExchangeRequest): Promise<TagSyncExchangeResponse> {
+    const stream = await this.node.dialProtocol(peerIdFromString(peerId), TAG_SYNC_PROTOCOL);
+    await writeFrame(stream, { ...request }, MAX_TAG_SYNC_FRAME_BYTES);
+    const response = await readFrame(stream, MAX_TAG_SYNC_FRAME_BYTES);
+    if (response.ok === false || typeof response.hello !== 'object' || response.hello === null) throw new Error('peer rejected tag sync exchange');
+    return response as unknown as TagSyncExchangeResponse;
+  }
+
   async syncWithPeer(peerId: string): Promise<{ rounds: number; received: number; sent: number }> {
     if (this.stopping) throw new Error('LAN node is stopping');
     if (!this.syncService) throw new Error('event sync is not configured');
     const running = this.syncTasks.get(peerId);
     if (running) return running;
-    const task = this.syncService.syncWithPeer(peerId, this).finally(() => this.syncTasks.delete(peerId));
+    const task = (async () => {
+      const result = await this.syncService!.syncWithPeer(peerId, this);
+      if (this.tagSyncService) {
+        if (this.syncService!.peerSupportsCapability(peerId, TAG_SYNC_CAPABILITY)) {
+          await this.tagSyncService.syncWithPeer(peerId, this);
+        } else {
+          this.tagSyncService.markPeerUnsupported(peerId);
+        }
+      }
+      return result;
+    })().finally(() => this.syncTasks.delete(peerId));
     this.syncTasks.set(peerId, task);
     return task;
   }

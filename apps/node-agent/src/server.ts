@@ -35,6 +35,7 @@ export interface NodeAgentServerOptions {
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
   assetTags?: AssetTagServerControl;
+  tagSync?: boolean;
   mediaVersions?: MediaVersionServerControl;
   thumbnails?: ThumbnailServerControl;
   pairingControl?: PairingServerControl;
@@ -73,8 +74,8 @@ export interface ThumbnailServerControl {
 }
 
 export interface AssetTagServerControl {
-  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string): AssetTagMutationResult;
-  removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult;
+  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
+  removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
 }
 
 export interface PairingServerControl {
@@ -85,6 +86,10 @@ export interface PairingServerControl {
   decide(peerId: string, approval: PairingApproval): boolean;
   revokePeer(peerId: string): Promise<boolean>;
   grantLibraryRead(peerId: string, libraryId: string): void;
+  grantTagWrite?(peerId: string, libraryId: string): boolean;
+  revokeTagWrite?(peerId: string, libraryId: string): boolean;
+  listTagWriters?(libraryId: string): string[];
+  getTagSyncStatus?(peerId: string): { pending: number; lastError: string | null };
   readLibraryIndex(peerId: string, libraryId: string): unknown[] | undefined;
   listDiscoveredPeers(): Array<{ peerId: string; addresses: string[] }>;
   dialManualIp(host: string, port: number, peerId: string): Promise<{ peerId: string; addresses: string[] }>;
@@ -113,7 +118,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (request.method === 'GET' && url.pathname === '/v1/health') {
     const capabilities = [
       ...(options.mediaVersions ? ['mediaVersions'] : []),
-      ...(options.thumbnails ? ['thumbnails'] : [])
+      ...(options.thumbnails ? ['thumbnails'] : []),
+      ...(options.assetTags ? ['assetTags'] : []),
+      ...(options.tagSync ? ['tagSync'] : [])
     ];
     sendJson(response, 200, getHealth(capabilities));
     return;
@@ -342,8 +349,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const control = options.assetTags;
     if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
     const result = request.method === 'PUT'
-      ? control.addAssetTag(libraryId, assetId, tag, new Date().toISOString())
-      : control.removeAssetTag(libraryId, assetId, tag);
+      ? await control.addAssetTag(libraryId, assetId, tag, new Date().toISOString())
+      : await control.removeAssetTag(libraryId, assetId, tag);
     if (result === 'not_found') { sendJson(response, 404, { error: 'not_found', requestId }); return; }
     if (result === 'limit_reached') { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
     const successful = request.method === 'PUT'
@@ -464,6 +471,18 @@ async function handlePairingRequest(
     sendJson(response, 200, { peers: control.listPeers(), pending: control.listPending() });
     return true;
   }
+  const tagWritersPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/tag-writers$/);
+  if (request.method === 'GET' && tagWritersPath?.[1]) {
+    if (!control.listTagWriters) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    sendJson(response, 200, { writers: control.listTagWriters(decodeURIComponent(tagWritersPath[1])) });
+    return true;
+  }
+  const tagStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/tag-sync-status$/);
+  if (request.method === 'GET' && tagStatusPath?.[1]) {
+    if (!control.getTagSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    sendJson(response, 200, control.getTagSyncStatus(decodeURIComponent(tagStatusPath[1])));
+    return true;
+  }
   if (request.method === 'GET' && pathname === '/v1/pairing/discovered') {
     sendJson(response, 200, { peers: control.listDiscoveredPeers() });
     return true;
@@ -485,6 +504,23 @@ async function handlePairingRequest(
     if (!isPairingApproval(body)) { sendJson(response, 400, { error: 'invalid_request', requestId }); return true; }
     const approved = control.decide(decodeURIComponent(approvalPath[1]), body);
     sendJson(response, approved ? 200 : 404, approved ? { status: 'decided' } : { error: 'pending_request_not_found', requestId });
+    return true;
+  }
+  const tagWritePath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/tag-write$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && tagWritePath?.[1] && tagWritePath[2]) {
+    const change = request.method === 'PUT' ? control.grantTagWrite : control.revokeTagWrite;
+    if (!change) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    try {
+      change.call(control, decodeURIComponent(tagWritePath[1]), decodeURIComponent(tagWritePath[2]));
+      if (request.method === 'DELETE') {
+        sendJson(response, 200, { status: 'revoked', replicatedEventsRemain: true });
+      } else {
+        response.writeHead(204, { 'X-Request-ID': requestId });
+        response.end();
+      }
+    } catch {
+      sendJson(response, 409, { error: 'tag_write_grant_rejected', requestId });
+    }
     return true;
   }
   const grantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)$/);

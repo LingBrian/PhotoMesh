@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
-async function setUpNode(page: Page): Promise<void> {
-  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1 } }));
+async function setUpNode(page: Page, options: { capabilities?: string[] } = {}): Promise<void> {
+  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: options.capabilities ?? [] } }));
   await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [{ libraryId: 'library-1', title: 'Family library' }] } }));
   await page.route('**/v1/assets?*', (route) => route.fulfill({ status: 200, json: { items: [], nextCursor: null } }));
   await page.goto('/');
@@ -66,6 +66,7 @@ test('requires explicit approval and separate library read grant', async ({ page
 
   await setUpNode(page);
   await page.getByRole('button', { name: 'Node settings' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Tag P2P sync is unavailable on this node' })).toBeVisible();
   await expect(page.getByText('Verified Peer ID: peer-verified-1')).toBeVisible();
   page.once('dialog', async (dialog) => {
     expect(dialog.message()).toContain('No library access will be granted');
@@ -79,19 +80,65 @@ test('requires explicit approval and separate library read grant', async ({ page
   expect(libraryGrantPath).toContain('/v1/pairing/peers/peer-verified-1/libraries/library-1');
 });
 
-test('keeps Tauri node connections limited to loopback endpoints', async ({ page }) => {
+test('manages per-library tag-writer grants and explains revocation limits', async ({ page }, testInfo) => {
+  const peerId = 'peer-verified-1';
+  let writerEnabled = false;
+  const grantMethods: string[] = [];
+  await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: {
+    peers: [{ peerId, label: 'Phone', trustState: 'trusted' }], pending: []
+  } }));
+  await page.route(`**/v1/pairing/peers/${peerId}/tag-sync-status`, (route) => route.fulfill({ status: 200, json: {
+    pending: 2, lastError: 'peer_missing_asset_tags_v1'
+  } }));
+  await page.route('**/v1/pairing/libraries/library-1/tag-writers', (route) => route.fulfill({
+    status: 200, json: { writers: writerEnabled ? [peerId] : [] }
+  }));
+  await page.route(`**/v1/pairing/peers/${peerId}/libraries/library-1/tag-write`, async (route) => {
+    grantMethods.push(route.request().method());
+    if (route.request().method() === 'PUT') {
+      writerEnabled = true;
+      await route.fulfill({ status: 204 });
+    } else {
+      writerEnabled = false;
+      await route.fulfill({ status: 200, json: { status: 'revoked', replicatedEventsRemain: true } });
+    }
+  });
+
+  const healthResponsePromise = page.waitForResponse((response) => response.url().endsWith('/v1/health'));
+  await setUpNode(page, { capabilities: ['tagSync'] });
+  expect(await (await healthResponsePromise).json()).toMatchObject({ capabilities: ['tagSync'] });
+  await page.getByRole('button', { name: 'Node settings' }).click();
+  await expect(page.getByRole('button', { name: 'Grant tag writing' })).toBeVisible();
+  await expect(page.locator('.peer-sync-status')).toContainText('2 tag events pending');
+  await expect(page.locator('.peer-sync-status')).toContainText('Peer lacks asset-tags-v1');
+  await page.getByRole('button', { name: 'Grant tag writing' }).click();
+  await expect(page.getByRole('button', { name: 'Revoke tag writing' })).toBeVisible();
+  await page.getByRole('button', { name: 'Revoke tag writing' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'already replicated to trusted peers cannot be retracted' })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('pm042-tag-writer-settings.png') });
+  expect(grantMethods).toEqual(['PUT', 'DELETE']);
+});
+
+test('requires explicit trust before Tauri sends credentials to a remote HTTPS node', async ({ page }) => {
   await page.addInitScript(() => { Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {} }); });
   let healthRequests = 0;
   await page.route('**/v1/health', async (route) => {
     healthRequests += 1;
     await route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1 } });
   });
+  await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [{ libraryId: 'library-1', title: 'Family library' }] } }));
+  await page.route('**/v1/assets?*', (route) => route.fulfill({ status: 200, json: { items: [], nextCursor: null } }));
+  await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [], pending: [] } }));
   await page.goto('/');
   await page.getByLabel('Node address').fill('https://remote.example.com');
   await page.getByLabel('Admin access token').fill('fixture-token');
   await page.getByRole('button', { name: 'Connect node' }).click();
-  await expect(page.getByRole('alert')).toContainText('This desktop build connects only to a local node');
+  await expect(page.getByRole('alert')).toContainText('Confirm that you trust this remote HTTPS node');
   expect(healthRequests).toBe(0);
+  await page.locator('.remote-node-trust input').check();
+  await page.getByRole('button', { name: 'Connect node' }).click();
+  await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
+  expect(healthRequests).toBe(1);
 });
 
 test('requires HTTPS for remote Web node credentials', async ({ page }) => {
@@ -111,8 +158,10 @@ test('requires HTTPS for remote Web node credentials', async ({ page }) => {
   expect(healthRequests).toBe(0);
 
   await page.getByLabel('Node address').fill('https://remote.example.com');
+  await page.getByLabel('Admin access token').fill('fixture-token');
   await page.getByRole('button', { name: 'Connect node' }).click();
-  await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save and connect' })).toBeVisible();
+  await expect(page.getByRole('main').getByText('Online', { exact: true })).toBeVisible();
   expect(healthRequests).toBe(1);
 });
 

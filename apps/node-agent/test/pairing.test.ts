@@ -155,7 +155,10 @@ describe('local node identity and LAN pairing', () => {
     const pairing = new PairingService(repository, identity.peerId, async () => ({ approved: false }));
     let finishSync!: (result: { rounds: number; received: number; sent: number }) => void;
     const syncResult = new Promise<{ rounds: number; received: number; sent: number }>((resolve) => { finishSync = resolve; });
-    const syncService = { syncWithPeer: vi.fn(() => syncResult) } as unknown as SyncService;
+    const syncService = {
+      hello: () => ({ nodeId: identity.peerId, protocolMin: 1, protocolMax: 1, schemaVersions: [1], capabilities: [] }),
+      syncWithPeer: vi.fn(() => syncResult)
+    } as unknown as SyncService;
     const node = await LanPairingNode.start({
       identity, pairing, listenAddresses: ['127.0.0.1'], listenPort: 0, syncService
     });

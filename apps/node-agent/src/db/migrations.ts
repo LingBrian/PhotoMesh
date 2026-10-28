@@ -373,5 +373,163 @@ export const migrations: readonly Migration[] = [
       CREATE TRIGGER asset_tags_no_update BEFORE UPDATE ON asset_tags
       BEGIN SELECT RAISE(ABORT, 'asset tags are immutable; use delete and insert'); END;
     `
+  },
+  {
+    id: '0006_asset_tag_sync',
+    sql: `
+      CREATE TABLE library_tag_write_grants (
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        granted_at TEXT NOT NULL,
+        revoked_at TEXT,
+        PRIMARY KEY (peer_id, library_id)
+      );
+      CREATE INDEX library_tag_write_grants_library_idx ON library_tag_write_grants (library_id, peer_id, revoked_at);
+
+      CREATE TABLE tag_sync_author_registry (
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        PRIMARY KEY (library_id, author_peer_id)
+      );
+
+      CREATE TABLE tag_sync_event_log (
+        event_id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        author_sequence INTEGER NOT NULL CHECK (author_sequence > 0),
+        protocol_version INTEGER NOT NULL CHECK (protocol_version > 0),
+        schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+        event_type TEXT NOT NULL CHECK (event_type IN ('asset.tag.added', 'asset.tag.removed')),
+        causal_parents_json TEXT NOT NULL CHECK (json_valid(causal_parents_json)),
+        payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+        created_at TEXT NOT NULL,
+        signature TEXT,
+        envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json)),
+        state TEXT NOT NULL CHECK (state IN ('signing', 'ready')),
+        CHECK ((state = 'signing' AND signature IS NULL) OR (state = 'ready' AND signature IS NOT NULL)),
+        UNIQUE (library_id, author_peer_id, author_sequence)
+      );
+      CREATE INDEX tag_sync_event_log_library_idx ON tag_sync_event_log (library_id, author_peer_id, author_sequence);
+      CREATE TRIGGER tag_sync_event_log_identity_guard BEFORE UPDATE ON tag_sync_event_log
+      WHEN NEW.event_id IS NOT OLD.event_id OR NEW.library_id IS NOT OLD.library_id OR
+        NEW.author_peer_id IS NOT OLD.author_peer_id OR NEW.author_sequence IS NOT OLD.author_sequence OR
+        NEW.protocol_version IS NOT OLD.protocol_version OR NEW.schema_version IS NOT OLD.schema_version OR
+        NEW.event_type IS NOT OLD.event_type OR NEW.causal_parents_json IS NOT OLD.causal_parents_json OR
+        NEW.payload_json IS NOT OLD.payload_json OR NEW.created_at IS NOT OLD.created_at OR
+        OLD.state <> 'signing' OR NEW.state <> 'ready'
+      BEGIN SELECT RAISE(ABORT, 'tag sync event identity is immutable'); END;
+      CREATE TRIGGER tag_sync_event_log_no_delete BEFORE DELETE ON tag_sync_event_log
+      BEGIN SELECT RAISE(ABORT, 'tag sync event deletion is disabled'); END;
+
+      CREATE TABLE tag_sync_author_heads (
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        author_sequence INTEGER NOT NULL CHECK (author_sequence > 0),
+        event_id TEXT NOT NULL REFERENCES tag_sync_event_log(event_id) ON DELETE RESTRICT,
+        ready INTEGER NOT NULL DEFAULT 1 CHECK (ready IN (0, 1)),
+        PRIMARY KEY (library_id, author_peer_id)
+      );
+
+      CREATE TABLE tag_sync_outbox (
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        event_id TEXT NOT NULL REFERENCES tag_sync_event_log(event_id) ON DELETE RESTRICT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        next_attempt_at TEXT NOT NULL,
+        last_error TEXT,
+        PRIMARY KEY (peer_id, event_id)
+      );
+      CREATE INDEX tag_sync_outbox_due_idx ON tag_sync_outbox (peer_id, next_attempt_at, event_id);
+
+      CREATE TABLE tag_sync_inbox (
+        event_id TEXT PRIMARY KEY,
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        author_sequence INTEGER NOT NULL CHECK (author_sequence > 0),
+        envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json)),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'unsupported', 'conflict')),
+        error_code TEXT,
+        received_at TEXT NOT NULL,
+        applied_at TEXT,
+        UNIQUE (library_id, author_peer_id, author_sequence)
+      );
+      CREATE INDEX tag_sync_inbox_pending_idx ON tag_sync_inbox (library_id, state, author_peer_id, author_sequence);
+
+      CREATE TABLE tag_sync_peer_cursors (
+        library_id TEXT NOT NULL,
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        author_peer_id TEXT NOT NULL,
+        contiguous_sequence INTEGER NOT NULL DEFAULT 0 CHECK (contiguous_sequence >= 0),
+        event_id TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (library_id, peer_id, author_peer_id)
+      );
+
+      CREATE TABLE asset_tag_adds (
+        library_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        tag TEXT NOT NULL CHECK (length(CAST(tag AS BLOB)) BETWEEN 1 AND 128 AND tag = trim(tag)),
+        add_event_id TEXT NOT NULL REFERENCES tag_sync_event_log(event_id) ON DELETE RESTRICT,
+        PRIMARY KEY (library_id, asset_id, tag, add_event_id)
+      );
+      CREATE INDEX asset_tag_adds_asset_idx ON asset_tag_adds (library_id, asset_id, tag, add_event_id);
+
+      CREATE TABLE asset_tag_remove_observations (
+        library_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        tag TEXT NOT NULL CHECK (length(CAST(tag AS BLOB)) BETWEEN 1 AND 128 AND tag = trim(tag)),
+        add_event_id TEXT NOT NULL REFERENCES tag_sync_event_log(event_id) ON DELETE RESTRICT,
+        remove_event_id TEXT NOT NULL REFERENCES tag_sync_event_log(event_id) ON DELETE RESTRICT,
+        PRIMARY KEY (library_id, asset_id, tag, add_event_id, remove_event_id)
+      );
+      CREATE INDEX asset_tag_remove_add_idx ON asset_tag_remove_observations (library_id, asset_id, tag, add_event_id);
+      CREATE TRIGGER asset_tag_add_event_guard BEFORE INSERT ON asset_tag_adds
+      WHEN NOT EXISTS (
+        SELECT 1 FROM tag_sync_event_log e
+        JOIN json_each(e.causal_parents_json) parent ON EXISTS (
+          SELECT 1 FROM sync_event_log metadata WHERE metadata.event_id = parent.value AND metadata.library_id = e.library_id
+            AND metadata.state = 'ready' AND metadata.event_type IN ('asset.indexed', 'asset.metadata.updated', 'asset.tombstoned', 'asset.restored')
+            AND json_extract(metadata.payload_json, '$.assetId') = NEW.asset_id
+            AND (NOT EXISTS (SELECT 1 FROM sync_inbox i WHERE i.event_id = metadata.event_id)
+              OR EXISTS (SELECT 1 FROM sync_inbox i WHERE i.event_id = metadata.event_id AND i.state = 'applied'))
+        )
+        WHERE e.event_id = NEW.add_event_id AND e.library_id = NEW.library_id AND e.event_type = 'asset.tag.added'
+          AND json_extract(e.payload_json, '$.assetId') = NEW.asset_id AND json_extract(e.payload_json, '$.tag') = NEW.tag
+      )
+      BEGIN SELECT RAISE(ABORT, 'asset_tag_add_event_mismatch'); END;
+      CREATE TRIGGER asset_tag_remove_observation_guard BEFORE INSERT ON asset_tag_remove_observations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM tag_sync_event_log r
+        JOIN asset_tag_adds a ON a.add_event_id = NEW.add_event_id
+          AND a.library_id = NEW.library_id AND a.asset_id = NEW.asset_id AND a.tag = NEW.tag
+        JOIN json_each(r.payload_json, '$.observedAddEventIds') observed ON observed.value = NEW.add_event_id
+        JOIN json_each(r.causal_parents_json) parent ON parent.value = NEW.add_event_id
+        WHERE r.event_id = NEW.remove_event_id AND r.library_id = NEW.library_id AND r.event_type = 'asset.tag.removed'
+          AND json_extract(r.payload_json, '$.assetId') = NEW.asset_id AND json_extract(r.payload_json, '$.tag') = NEW.tag
+      )
+      BEGIN SELECT RAISE(ABORT, 'asset_tag_remove_event_mismatch'); END;
+      CREATE TRIGGER asset_tag_adds_no_update BEFORE UPDATE ON asset_tag_adds
+      BEGIN SELECT RAISE(ABORT, 'asset tag add operations are immutable'); END;
+      CREATE TRIGGER asset_tag_adds_no_delete BEFORE DELETE ON asset_tag_adds
+      BEGIN SELECT RAISE(ABORT, 'asset tag add operations are retained'); END;
+      CREATE TRIGGER asset_tag_remove_observations_no_update BEFORE UPDATE ON asset_tag_remove_observations
+      BEGIN SELECT RAISE(ABORT, 'asset tag remove operations are immutable'); END;
+      CREATE TRIGGER asset_tag_remove_observations_no_delete BEFORE DELETE ON asset_tag_remove_observations
+      BEGIN SELECT RAISE(ABORT, 'asset tag remove operations are retained'); END;
+
+      CREATE TABLE asset_tag_legacy_seeds (
+        library_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        tag TEXT NOT NULL CHECK (length(CAST(tag AS BLOB)) BETWEEN 1 AND 128 AND tag = trim(tag)),
+        created_at TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'queued', 'complete')),
+        seed_event_id TEXT REFERENCES tag_sync_event_log(event_id) ON DELETE RESTRICT,
+        PRIMARY KEY (library_id, asset_id, tag),
+        CHECK ((state = 'pending' AND seed_event_id IS NULL) OR (state IN ('queued', 'complete') AND seed_event_id IS NOT NULL))
+      );
+      INSERT INTO asset_tag_legacy_seeds (library_id, asset_id, tag, created_at, state, seed_event_id)
+        SELECT library_id, asset_id, tag, created_at, 'pending', NULL FROM asset_tags;
+    `
   }
 ];

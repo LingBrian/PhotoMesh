@@ -23,6 +23,8 @@ import { createAdminTokenAuthorizer } from './auth/admin-token.js';
 import { isIP } from 'node:net';
 import { SyncRepository } from './sync/sync-repository.js';
 import { SyncService } from './sync/sync-service.js';
+import { TagSyncRepository } from './sync/tag-sync-repository.js';
+import { TagSyncService } from './sync/tag-sync-service.js';
 import { TombstoneRestoreCoordinator } from './sync/restore-coordinator.js';
 import { restoreTombstoneOperation } from './sync/restore-operation.js';
 
@@ -48,6 +50,8 @@ const pairingApprovals = new PairingApprovalQueue();
 let pairing: PairingService | undefined;
 let lanNode: LanPairingNode | undefined;
 let syncService: SyncService | undefined;
+let tagSyncRepository: TagSyncRepository | undefined;
+let tagSyncService: TagSyncService | undefined;
 let nodeId = process.env.PHOTOMESH_NODE_ID ?? 'local-node';
 try {
   const fixtureMode = process.env.PHOTOMESH_FIXTURE_MODE === 'true';
@@ -57,13 +61,24 @@ try {
   const identity = await loadOrCreateLocalIdentity(repository, secretStore);
   nodeId = identity.peerId;
   pairing = new PairingService(repository, identity.peerId, pairingApprovals.request);
-  syncService = new SyncService(new SyncRepository(database), identity, pairing);
+  tagSyncRepository = new TagSyncRepository(database);
+  syncService = new SyncService(new SyncRepository(database), identity, pairing, undefined, (event) => {
+    const payload = event.payload;
+    if (typeof payload === 'object' && payload !== null && !Array.isArray(payload) &&
+        ['asset.indexed', 'asset.tombstoned', 'asset.restored'].includes(event.eventType) &&
+        typeof payload.assetId === 'string') {
+      tagSyncRepository!.rebuildAssetTagProjection(event.libraryId, payload.assetId);
+    }
+    tagSyncRepository!.reconcilePendingEvents(event.libraryId);
+  }, true);
+  tagSyncService = new TagSyncService(tagSyncRepository, identity, pairing, () => syncService!.hello());
   await syncService.signPendingLocalEvents();
   await syncService.reconcileLocalAssets();
+  await tagSyncService.reconcileLegacyTagSeeds();
   const listenAddresses = (process.env.PHOTOMESH_LAN_BIND_ADDRESSES ?? '').split(',').map((value) => value.trim()).filter(Boolean);
   if (listenAddresses.length > 0) {
     lanNode = await LanPairingNode.start({
-      identity, pairing, listenAddresses, syncService,
+      identity, pairing, listenAddresses, syncService, tagSyncService,
       listenPort: Number(process.env.PHOTOMESH_P2P_PORT ?? 0)
     });
     process.stdout.write(`PhotoMesh LAN pairing enabled on ${listenAddresses.length} configured interface(s)\n`);
@@ -117,7 +132,7 @@ const uploadService = new UploadService({
   } : {})
 });
 
-const pairingControl: PairingServerControl | undefined = pairing ? {
+const pairingControl: PairingServerControl | undefined = pairing && tagSyncRepository ? {
   createInvite: () => {
     if (!lanNode) throw new Error('LAN pairing is not listening on a configured private interface');
     return lanNode.createInvite();
@@ -131,6 +146,10 @@ const pairingControl: PairingServerControl | undefined = pairing ? {
   decide: (peerId, approval) => pairingApprovals.decide(peerId, approval),
   revokePeer: async (peerId) => lanNode ? lanNode.revokePeer(peerId) : pairing!.revokePeer(peerId),
   grantLibraryRead: (peerId, libraryId) => pairing!.grantLibraryRead(peerId, libraryId),
+  grantTagWrite: (peerId, libraryId) => tagSyncRepository!.grantTagWriter(libraryId, peerId, nodeId, new Date().toISOString()),
+  revokeTagWrite: (peerId, libraryId) => tagSyncRepository!.revokeTagWriter(libraryId, peerId, new Date().toISOString()),
+  listTagWriters: (libraryId) => tagSyncRepository!.listTagWriters(libraryId),
+  getTagSyncStatus: (peerId) => tagSyncRepository!.getPeerSyncStatus(peerId),
   readLibraryIndex: (peerId, libraryId) => pairing!.readLibraryIndex(peerId, libraryId),
   listDiscoveredPeers: () => lanNode?.listDiscoveredPeers() ?? [],
   dialManualIp: async (host, port, peerId) => {
@@ -152,12 +171,14 @@ const server = createNodeAgentServer({
     apiCapabilities: (): DiagnosticCapability[] => [
       'rest',
       ...(mediaVersionService ? ['mediaVersions' as const] : []),
-      ...(mediaThumbnailService ? ['thumbnails' as const] : [])
+      ...(mediaThumbnailService ? ['thumbnails' as const] : []),
+      ...(tagSyncService ? ['assetTags' as const] : [])
     ],
     storageCapabilities: (): DiagnosticCapability[] => ['managedFiles'],
     identityCapabilities: (): DiagnosticCapability[] => [
       ...(pairing ? ['nodeIdentity' as const] : []),
       ...(syncService ? ['eventSigning' as const] : []),
+      ...(tagSyncService ? ['tagSync' as const] : []),
       ...(lanNode ? ['lanPairing' as const] : [])
     ]
   },
@@ -174,10 +195,12 @@ const server = createNodeAgentServer({
     restoreTombstone: (libraryId, eventId) => restoreCoordinator.run(libraryId, eventId,
       () => restoreTombstoneOperation(libraryId, eventId, syncService, (id) => repository.listActiveTombstones(id)))
   },
-  assetTags: {
-    addAssetTag: (libraryId, assetId, tag, createdAt) => repository.addAssetTag(libraryId, assetId, tag, createdAt),
-    removeAssetTag: (libraryId, assetId, tag) => repository.removeAssetTag(libraryId, assetId, tag)
-  },
+  tagSync: Boolean(tagSyncService),
+  ...(tagSyncService ? { assetTags: {
+    addAssetTag: (libraryId: string, assetId: string, tag: string, createdAt: string) =>
+      tagSyncService!.addAssetTag(libraryId, assetId, tag, createdAt),
+    removeAssetTag: (libraryId: string, assetId: string, tag: string) => tagSyncService!.removeAssetTag(libraryId, assetId, tag)
+  } } : {}),
   ...(mediaVersionService ? { mediaVersions: mediaVersionService } : {}),
   ...(mediaThumbnailService ? { thumbnails: {
     readThumbnail: (libraryId: string, assetId: string, profile: string) =>

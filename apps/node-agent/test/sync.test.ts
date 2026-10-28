@@ -13,7 +13,7 @@ const databases: Database.Database[] = [];
 
 afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
-async function createNode() {
+async function createNode(tagSyncAvailable = false) {
   const database = new Database(':memory:');
   databases.push(database);
   const pairingRepository = new SqliteRepository(database);
@@ -24,7 +24,7 @@ async function createNode() {
   });
   const pairing = new PairingService(pairingRepository, identity.peerId, async () => ({ approved: true }));
   const syncRepository = new SyncRepository(database);
-  const sync = new SyncService(syncRepository, identity, pairing);
+  const sync = new SyncService(syncRepository, identity, pairing, undefined, undefined, tagSyncAvailable);
   return { database, pairingRepository, identity, pairing, syncRepository, sync };
 }
 
@@ -297,6 +297,25 @@ describe('P2P signed event synchronization', () => {
     expect(result.received).toBe(1);
     expect(a.syncRepository.getProjection('family', 'from-b')?.lastEventId).toBe(eventB.eventId);
     expect(b.syncRepository.getProjection('family', 'from-a')?.lastEventId).toBe(eventA.eventId);
+  });
+
+  it('advertises the tag-stream capability and remembers N-1 capability negotiation', async () => {
+    const local = await createNode(true);
+    const remote = await createNode(true);
+    await trustEachOther(local, remote);
+    expect(local.sync.hello().capabilities).toContain('asset-tags-v1');
+
+    const currentResponse = { exchange: async (_peerId: string, request: Parameters<SyncService['handleExchange']>[1]) =>
+      remote.sync.handleExchange(local.identity.peerId, request) };
+    await local.sync.syncWithPeer(remote.identity.peerId, currentResponse);
+    expect(local.sync.peerSupportsCapability(remote.identity.peerId, 'asset-tags-v1')).toBe(true);
+
+    const previousHello = { ...remote.sync.hello(), capabilities: remote.sync.hello().capabilities.filter((capability) => capability !== 'asset-tags-v1') };
+    const previousTransport = { exchange: async () => ({
+      hello: previousHello, agreedProtocol: 1, schemaVersion: 1, grantedLibraryIds: [], cursors: [], events: [], results: []
+    }) };
+    await local.sync.syncWithPeer(remote.identity.peerId, previousTransport);
+    expect(local.sync.peerSupportsCapability(remote.identity.peerId, 'asset-tags-v1')).toBe(false);
   });
 
   it('rejects a peer that reports a different negotiated protocol than its hello', async () => {

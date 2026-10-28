@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import { eventDigest, type EventEnvelope, type EventDraftFactory, type JsonValue, type SyncEventType, type UnsignedEventEnvelope } from './event-envelope.js';
+import { eventDigest, parseEventEnvelope, type EventEnvelope, type EventDraftFactory, type JsonValue, type SyncEventType, type UnsignedEventEnvelope } from './event-envelope.js';
 
 export interface EventContext { authorSequence: number; causalParents: string[] }
 export interface SyncCursor { libraryId: string; authorPeerId: string; sequence: number }
@@ -29,6 +29,12 @@ export class SyncRepository {
 
   getLocalEventContext(libraryId: string, authorPeerId: string): EventContext {
     return this.readLocalEventContext(libraryId, authorPeerId);
+  }
+
+  getEventEnvelope(eventId: string): EventEnvelope | undefined {
+    const row = this.db.prepare(`SELECT envelope_json FROM sync_event_log WHERE event_id = ? AND state = 'ready'`)
+      .get(eventId) as { envelope_json: string } | undefined;
+    return row ? parseEventEnvelope(JSON.parse(row.envelope_json)) : undefined;
   }
 
   getTombstoneState(libraryId: string, eventId: string): 'active' | 'inactive' | 'not_found' {

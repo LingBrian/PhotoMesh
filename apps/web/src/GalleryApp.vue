@@ -52,8 +52,11 @@ const restoringTombstones = ref<Record<string, boolean>>({});
 const peers = ref<Array<{ peerId: string; label: string; trustState: string }>>([]);
 const pendingPeers = ref<PendingPeerApproval[]>([]);
 const grantLibraryByPeer = ref<Record<string, string>>({});
+const tagWritersByLibrary = ref<Record<string, string[]>>({});
+const tagSyncStatusByPeer = ref<Record<string, { pending: number; lastError: string | null }>>({});
 const peersBusy = ref(false);
 const peersError = ref('');
+const tagWriteNotice = ref('');
 const invitation = ref<{ qrDataUrl: string; invite: unknown } | null>(null);
 const scannedInvite = ref('');
 const savedTheme = readPreference('photomesh-ui-theme');
@@ -70,6 +73,7 @@ const previewBusy = ref(false);
 const previewErrorCode = ref<GalleryPreviewErrorCode | null>(null);
 const mediaVersionsEnabled = ref(false);
 const thumbnailsEnabled = ref(false);
+const tagSyncEnabled = ref(false);
 const versions = ref<VersionCollection | null>(null);
 const versionsBusy = ref(false);
 const versionError = ref('');
@@ -181,10 +185,10 @@ function clearAuthorizedSession(clearCredentials = false): void {
   hasSession.value = false; connected.value = false; lastHealthCheck.value = null;
   libraries.value = []; libraryId.value = ''; assets.value = []; cursor.value = null;
   tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
-  peers.value = []; pendingPeers.value = []; peersError.value = ''; grantLibraryByPeer.value = {}; invitation.value = null; scannedInvite.value = '';
+  peers.value = []; pendingPeers.value = []; peersError.value = ''; tagWriteNotice.value = ''; grantLibraryByPeer.value = {}; tagWritersByLibrary.value = {}; tagSyncStatusByPeer.value = {}; invitation.value = null; scannedInvite.value = '';
   tags.value = {}; albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
   tagInput.value = ''; pendingIdempotencyKeys.clear();
-  mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false;
+  mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; tagSyncEnabled.value = false;
   closePreview(); clearThumbnailUrls();
   if (clearCredentials) { token.value = ''; tokenInput.value = ''; }
 }
@@ -256,6 +260,7 @@ async function connect(preserveSession = false): Promise<void> {
     const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
     mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
     thumbnailsEnabled.value = capabilities.includes('thumbnails');
+    tagSyncEnabled.value = capabilities.includes('tagSync');
     const result = await request<{ items: Library[] }>('/v1/libraries', { signal: controller.signal });
     if (generation !== connectionGeneration) return;
     libraries.value = result.items;
@@ -306,6 +311,7 @@ async function checkHealth(): Promise<void> {
       const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
       mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
       thumbnailsEnabled.value = capabilities.includes('thumbnails');
+      tagSyncEnabled.value = capabilities.includes('tagSync');
     }
     if (response.ok && !wasConnected && hasSession.value) {
       await loadPage(true, true);
@@ -314,7 +320,7 @@ async function checkHealth(): Promise<void> {
     }
   } catch (cause) {
     if (generation === healthGeneration && !isRequestAborted(cause)) {
-      connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false;
+      connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; tagSyncEnabled.value = false;
     }
   } finally { if (healthAbort === controller) healthAbort = undefined; }
 }
@@ -805,8 +811,50 @@ async function loadPeerList(): Promise<void> {
     for (const peer of peers.value) if (!grantLibraryByPeer.value[peer.peerId]) {
       grantLibraryByPeer.value[peer.peerId] = libraryId.value || libraries.value[0]?.libraryId || '';
     }
+    if (tagSyncEnabled.value) await Promise.all(peers.value.map((peer) => refreshPeerTagStatus(peer.peerId)));
   } catch (cause) { if (revision === sessionRevision) peersError.value = errorText(cause); }
   finally { if (revision === sessionRevision) peersBusy.value = false; }
+}
+async function refreshPeerTagStatus(peerId: string): Promise<void> {
+  if (!hasSession.value || !connected.value || !tagSyncEnabled.value) return;
+  const revision = sessionRevision;
+  const library = grantLibraryByPeer.value[peerId];
+  try {
+    const status = await request<{ pending: number; lastError: string | null }>(`/v1/pairing/peers/${encodeURIComponent(peerId)}/tag-sync-status`);
+    if (revision === sessionRevision) tagSyncStatusByPeer.value = { ...tagSyncStatusByPeer.value, [peerId]: status };
+  } catch { /* PM-042 endpoints are optional on older nodes. */ }
+  if (!library) return;
+  try {
+    const result = await request<{ writers: string[] }>(`/v1/pairing/libraries/${encodeURIComponent(library)}/tag-writers`);
+    if (revision === sessionRevision) tagWritersByLibrary.value = { ...tagWritersByLibrary.value, [library]: result.writers };
+  } catch { /* PM-042 endpoints are optional on older nodes. */ }
+}
+function onPeerLibraryChange(peerId: string): void {
+  tagWriteNotice.value = '';
+  void refreshPeerTagStatus(peerId);
+}
+function peerTagWriteEnabled(peerId: string): boolean {
+  const selectedLibrary = grantLibraryByPeer.value[peerId];
+  return selectedLibrary ? tagWritersByLibrary.value[selectedLibrary]?.includes(peerId) ?? false : false;
+}
+async function togglePeerTagWrite(peerId: string): Promise<void> {
+  const selectedLibrary = grantLibraryByPeer.value[peerId];
+  if (!selectedLibrary) { peersError.value = t('gallery.selectLibraryToGrant'); return; }
+  const method = peerTagWriteEnabled(peerId) ? 'DELETE' : 'PUT';
+  const revision = sessionRevision;
+  try {
+    const result = await request<{ replicatedEventsRemain?: boolean }>(`/v1/pairing/peers/${encodeURIComponent(peerId)}/libraries/${encodeURIComponent(selectedLibrary)}/tag-write`, { method });
+    if (revision === sessionRevision) {
+      tagWriteNotice.value = method === 'DELETE' && result.replicatedEventsRemain ? t('gallery.tagWriteRevocationWarning') : '';
+      await refreshPeerTagStatus(peerId);
+    }
+  } catch (cause) { if (revision === sessionRevision) peersError.value = errorText(cause); }
+}
+function tagSyncErrorLabel(errorCode: string | null): string {
+  if (errorCode === 'peer_missing_asset_tags_v1') return t('gallery.tagSyncNMinusOne');
+  if (errorCode === 'tag_write_denied') return t('gallery.tagSyncWriteDenied');
+  if (errorCode === 'remote_conflict') return t('gallery.tagSyncConflict');
+  return errorCode ?? '';
 }
 async function decidePeer(peer: PendingPeerApproval, approved: boolean): Promise<void> {
   const prompt = approved ? t('gallery.approvePeerConfirm') : t('gallery.rejectPeerConfirm');
@@ -1506,6 +1554,20 @@ async function idbClear(store: string): Promise<void> {
             >
               {{ peersError }}
             </div>
+            <p
+              v-if="tagWriteNotice"
+              class="muted"
+              role="status"
+            >
+              {{ tagWriteNotice }}
+            </p>
+            <p
+              v-if="hasSession && connected && !tagSyncEnabled"
+              class="muted"
+              role="status"
+            >
+              {{ t('gallery.tagSyncUnavailable') }}
+            </p>
             <div
               v-if="peersBusy"
               class="loading-row"
@@ -1538,6 +1600,7 @@ async function idbClear(store: string): Promise<void> {
                   v-model="grantLibraryByPeer[peer.peerId]"
                   class="field-select"
                   :disabled="!connected || !libraries.length"
+                  @change="onPeerLibraryChange(peer.peerId)"
                 >
                   <option
                     v-for="library in libraries"
@@ -1555,6 +1618,22 @@ async function idbClear(store: string): Promise<void> {
                 >
                   {{ t('gallery.grantLibrary') }}
                 </button>
+                <button
+                  v-if="tagSyncEnabled"
+                  type="button"
+                  class="secondary-button"
+                  :disabled="!connected || !libraries.length"
+                  @click="togglePeerTagWrite(peer.peerId)"
+                >
+                  {{ t(peerTagWriteEnabled(peer.peerId) ? 'gallery.revokeTagWrite' : 'gallery.grantTagWrite') }}
+                </button>
+                <small
+                  v-if="tagSyncEnabled && tagSyncStatusByPeer[peer.peerId]"
+                  class="peer-sync-status"
+                >
+                  {{ t('gallery.tagSyncPending', { count: tagSyncStatusByPeer[peer.peerId]?.pending ?? 0 }) }}
+                  <span v-if="tagSyncStatusByPeer[peer.peerId]?.lastError">· {{ tagSyncErrorLabel(tagSyncStatusByPeer[peer.peerId]?.lastError ?? null) }}</span>
+                </small>
                 <button
                   type="button"
                   class="text-button danger-text"

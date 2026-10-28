@@ -40,6 +40,19 @@ describe('signed EventEnvelope', () => {
       .toThrow('event exceeds maximum size');
   });
 
+  it('signs and validates tag OR-Set events as first-class envelopes', async () => {
+    const identity = await makeIdentity();
+    const add = makeUnsignedEvent({
+      libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 1, causalParents: [],
+      eventType: 'asset.tag.added', payload: { assetId: 'asset-1', tag: 'Summer' }, createdAt: '2026-10-27T00:00:00.000Z'
+    });
+    const signed = await signEvent(add, identity);
+    expect(await verifyEvent(signed, publicKeyText(identity))).toBe(true);
+    expect(parseEventEnvelope(signed)).toEqual(signed);
+    expect(() => makeUnsignedEvent({ ...add, eventType: 'asset.tag.added', payload: { assetId: 'asset-1', tag: ' Summer ' } })).toThrow();
+    expect(() => makeUnsignedEvent({ ...add, eventType: 'asset.tag.removed', payload: { assetId: 'asset-1', tag: 'Summer', observedAddEventIds: [] } })).toThrow();
+  });
+
   it('preserves a well-formed unknown event version for safe non-application', async () => {
     const identity = await makeIdentity();
     const known = await signEvent(makeUnsignedEvent({

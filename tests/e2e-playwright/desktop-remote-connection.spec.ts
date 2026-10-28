@@ -51,6 +51,7 @@ test('desktop requires explicit trust before sending credentials to a remote HTT
   expect(insecureRequests).toBe(0);
 
   await page.getByLabel('Node address').fill(remoteOrigin);
+  await page.getByLabel('Admin access token').fill('fixture-token');
   const trustCheckbox = page.locator('.remote-node-trust input');
   await expect(trustCheckbox).toBeVisible();
   await expect(trustCheckbox).not.toBeChecked();
@@ -59,12 +60,13 @@ test('desktop requires explicit trust before sending credentials to a remote HTT
   await expect(trustCheckbox).not.toBeChecked();
   await page.getByLabel('Node address').fill(remoteOrigin);
   await expect(trustCheckbox).not.toBeChecked();
+  await page.getByLabel('Admin access token').fill('fixture-token');
   await page.getByRole('button', { name: 'Connect node' }).click();
   await expect(page.getByRole('alert')).toContainText('Confirm that you trust this remote HTTPS node');
   expect(remoteRequests).toBe(0);
 
   await page.locator('.remote-node-trust input').check();
   await page.getByRole('button', { name: 'Connect node' }).click();
-  await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
+  await expect(page.getByRole('main').getByText('Online', { exact: true })).toBeVisible();
   expect(remoteRequests).toBeGreaterThan(0);
 });
