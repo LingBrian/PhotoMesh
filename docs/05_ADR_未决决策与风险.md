@@ -157,3 +157,10 @@
 - **状态：** 用户于2026-10-28批准 ADR-018 推荐默认项1–11；仅限隔离分支协议/API/schema实现、测试和本地提交。详见 [`ADR-018`](adr/ADR-018-pm045-virtual-album-sync.md)。生产迁移、push、merge、release未获授权。
 - **批准重点：** 独立 `virtual-albums-v1` stream；历史操作 bootstrap/no-op/key namespace；独立 album-write/album-delete grants；tombstone asset 的 history/projection 分离；local-only 与 global shared soft delete；N/N-1与错误序列恢复有界策略。
 - **剩余边界：** Q09 的回收站保留期限/到期可见性由PM-061设计；永久 purge/审批另由PM-063处理。PM-045不做物理清除，也不授权生产迁移/push/merge/release。
+
+## ADR-019：PM-046 图库级收藏语义与跨节点同步
+
+- **状态：** 用户于2026-10-28批准推荐默认。详见 [`ADR-019`](adr/ADR-019-pm046-library-favorites.md)。当前 Node principal 是 `local-admin`，Peer ID 是设备身份而非人类用户；不将其伪装成个人身份。
+- **决定：** 采用图库级共享收藏以保留 PRD §3.4 的事件同步要求；独立 `asset-favorites-v1` capability/stream；OR-Set observed-remove；新增默认拒绝 `favorite-write` grant；远端撤权拒绝新事件、已经持久接受的 pending event 按接收时授权继续；PM-047 单独处理评分。
+- **兼容/迁移：** append-only `0009_asset_favorites`，扩展全局 UUID registry 及所有 writer guards；N-1 不阻塞共同 streams；隔离 SQLite 做备份失败、历史 ID 冲突、旧 binary 和恢复测试。
+- **边界：** 批准仅限隔离 PM-046 分支的协议/API/schema实现、测试及本地提交；不运行生产迁移、不 push/merge/release。若将来改选个人收藏，须先补稳定的人类身份/ACL；改选 local-only 须先修订 PRD §3.4。
