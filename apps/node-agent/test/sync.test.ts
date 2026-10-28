@@ -55,6 +55,19 @@ describe('P2P signed event synchronization', () => {
     expect(second.createdAt).toBe('1990-01-01T00:00:00.000Z');
   });
 
+  it('does not echo a target peer’s own author stream while relaying third-party events', async () => {
+    const author = await createNode();
+    const relay = await createNode();
+    const target = await createNode();
+    await trustEachOther(relay, author);
+    await trustEachOther(relay, target);
+    const event = await indexAsset(author, 'asset-relayed');
+    relay.syncRepository.appendLocalEvent(event);
+
+    expect(relay.syncRepository.eventsMissingForPeer(author.identity.peerId, [])).toEqual([]);
+    expect(relay.syncRepository.eventsMissingForPeer(target.identity.peerId, [])).toEqual([event]);
+  });
+
   it('reconciles legacy local assets into signed index events idempotently without origin paths', async () => {
     const node = await createNode();
     node.database.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at)

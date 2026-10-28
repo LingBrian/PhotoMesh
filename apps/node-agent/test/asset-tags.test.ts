@@ -9,7 +9,7 @@ import { createNodeAgentServer } from '../src/server.js';
 
 const migrationIds = [
   '0001_upload_foundation', '0002_lan_pairing', '0003_sync_event_log',
-  '0004_media_versions', '0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync'
+  '0004_media_versions', '0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync', '0009_asset_favorites'
 ];
 
 function seedLocalAsset(db: Database.Database, libraryId: string, assetId: string): void {
@@ -42,7 +42,7 @@ describe('server-persisted asset tags', () => {
     await repository.migrate(migrations);
     expect(backupCalls).toBe(1);
     expect(db.prepare(`SELECT migration_id, checksum FROM schema_migrations
-      WHERE migration_id NOT IN ('0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync') ORDER BY migration_id`).all())
+      WHERE migration_id NOT IN ('0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync', '0009_asset_favorites') ORDER BY migration_id`).all())
       .toEqual(priorChecksums);
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'asset_tags'").get()).toEqual({ name: 'asset_tags' });
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'asset_tags_insert_guard'").get())

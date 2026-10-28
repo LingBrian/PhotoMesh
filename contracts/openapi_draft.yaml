@@ -349,6 +349,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /v1/libraries/{libraryId}/assets/{assetId}/favorite:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      operationId: setAssetFavorite
+      summary: Set the shared favorite state for an authorized library asset
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AssetFavoriteSetRequest'}
+      responses:
+        '200':
+          description: Resulting library-wide shared favorite state.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AssetFavoriteState'}
+        '400': {description: Malformed request, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Node administrator or library authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Asset is absent, tombstoned, or not visible in this library', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}:
     parameters:
       - in: path
@@ -1055,6 +1093,67 @@ paths:
         '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/favorite-write:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      operationId: grantFavoriteWrite
+      summary: Grant a trusted peer default-deny favorite-write authority for one library
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted or the 64-author limit is reached; revoked author slots remain reserved, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      operationId: revokeFavoriteWrite
+      summary: Revoke a peer's future favorite writes without retracting accepted events
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/libraries/{libraryId}/favorite-sync-grants:
+    get:
+      operationId: listFavoriteSyncGrants
+      summary: List active favorite-write grants for a library
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Active grant records only, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantList'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/favorite-sync-status:
+    get:
+      operationId: getFavoriteSyncStatus
+      summary: Get per-peer favorite sync queue count and enumerated last-error code
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Operational counters and fixed error code only, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncPeerStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/pairing/discovered:
     get:
       summary: 获取 mDNS 发现的未信任节点地址（发现不代表信任）
@@ -1405,6 +1504,47 @@ components:
         peerId: {type: string, minLength: 1, maxLength: 128}
         pendingEvents: {type: integer, minimum: 0}
         lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
+    AssetFavoriteSetRequest:
+       type: object
+       additionalProperties: false
+       required: [favorite]
+       properties:
+         favorite: {type: boolean, description: Set the shared state for the entire library, not a personal bookmark}
+    AssetFavoriteState:
+       type: object
+       additionalProperties: false
+       required: [favorite]
+       properties:
+         favorite: {type: boolean}
+    FavoriteSyncGrantRequest:
+       type: object
+       additionalProperties: false
+       required: [enabled]
+       properties:
+         enabled: {type: boolean, const: true}
+    FavoriteSyncGrantStatus:
+       type: object
+       additionalProperties: false
+       required: [peerId, libraryId, permission, granted]
+       properties:
+         peerId: {type: string, minLength: 1, maxLength: 128}
+         libraryId: {type: string, minLength: 1, maxLength: 128}
+         permission: {type: string, const: favorite-write}
+         granted: {type: boolean}
+    FavoriteSyncGrantList:
+       type: object
+       additionalProperties: false
+       required: [grants]
+       properties:
+         grants: {type: array, items: {$ref: '#/components/schemas/FavoriteSyncGrantStatus'}}
+    FavoriteSyncPeerStatus:
+       type: object
+       additionalProperties: false
+       required: [peerId, pendingEvents, lastErrorCode]
+       properties:
+         peerId: {type: string, minLength: 1, maxLength: 128}
+         pendingEvents: {type: integer, minimum: 0}
+         lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
     NodeDiagnostics:
       type: object
       additionalProperties: false
@@ -1433,7 +1573,7 @@ components:
           maxItems: 8
           items:
             type: string
-            enum: [rest, mediaVersions, thumbnails, assetTags, virtualAlbums, tagSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
+            enum: [rest, mediaVersions, thumbnails, assetTags, virtualAlbums, assetFavorites, favoriteSync, tagSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
     PairingInvite:
       type: object
       required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]
@@ -1530,6 +1670,9 @@ components:
             minLength: 1
             maxLength: 128
             description: Trimmed, case-sensitive tag text with a maximum of 128 UTF-8 bytes.
+        favorite:
+          type: boolean
+          description: Library-wide shared favorite state (not a personal bookmark); absent on pre-PM-046 Nodes without the assetFavorites diagnostic capability.
     AssetPage:
       type: object
       required: [items]

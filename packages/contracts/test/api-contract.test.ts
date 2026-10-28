@@ -26,11 +26,14 @@ interface RouteCase {
   expectedAlbum?: { albumId: string; libraryId: string; title: string; createdByPeerId: string; createdAt: string };
   expectedAlbums?: Array<{ albumId: string; libraryId: string; title: string; createdByPeerId: string; createdAt: string }>;
   expectedMembers?: Array<{ assetId: string }>;
+  expectedFavorite?: boolean;
+  expectedFavoriteGrant?: boolean;
+  expectedFavoritePending?: number;
   requestHeaders?: Record<string, string>;
 }
 
 interface ContractAssetPage {
-  items: Array<{ assetId: string; tags: string[] }>;
+  items: Array<{ assetId: string; tags: string[]; favorite?: boolean }>;
 }
 
 interface ContractResponse {
@@ -89,6 +92,10 @@ const routes: RouteCase[] = [
   { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/album-delete', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/album-delete', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/libraries/{libraryId}/album-sync-grants', method: 'get', path: '/v1/pairing/libraries/lib/album-sync-grants', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/album-sync-status', method: 'get', path: '/v1/pairing/peers/peer/album-sync-status', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/libraries/{libraryId}/favorite-sync-grants', method: 'get', path: '/v1/pairing/libraries/lib/favorite-sync-grants', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/favorite-sync-status', method: 'get', path: '/v1/pairing/peers/peer/favorite-sync-status', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/favorite-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/favorite-write', status: 403, error: 'forbidden' },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/favorite-write', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/favorite-write', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/tag-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/tag-write', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/tag-write', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/tag-write', status: 403, error: 'forbidden' },
   { template: '/v1/pairing/peers/{peerId}/approval', method: 'post', path: '/v1/pairing/peers/peer/approval', status: 403, error: 'forbidden' },
@@ -109,6 +116,12 @@ const routes: RouteCase[] = [
   { template: '/v1/uploads/{sessionId}', method: 'get', path: '/v1/uploads/session', status: 403, error: 'forbidden' },
   { template: '/v1/uploads/{sessionId}/chunks/{chunkIndex}', method: 'put', path: '/v1/uploads/session/chunks/0', status: 403, error: 'forbidden' },
   { template: '/v1/uploads/{sessionId}/complete', method: 'post', path: '/v1/uploads/session/complete', status: 403, error: 'forbidden' },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/favorite', method: 'put', path: '/v1/libraries/lib/assets/asset/favorite', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/favorite', method: 'put', path: '/v1/libraries/lib/assets/asset/favorite', status: 200, authorization: 'Bearer contract-admin', body: { favorite: true }, requestHeaders: { 'idempotency-key': '123e4567-e89b-42d3-a456-426614174123' }, expectedFavorite: true, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/favorite-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/favorite-write', status: 200, authorization: 'Bearer contract-admin', body: { enabled: true }, expectedFavoriteGrant: true },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/favorite-write', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/favorite-write', status: 200, authorization: 'Bearer contract-admin', expectedFavoriteGrant: false },
+  { template: '/v1/pairing/libraries/{libraryId}/favorite-sync-grants', method: 'get', path: '/v1/pairing/libraries/lib/favorite-sync-grants', status: 200, authorization: 'Bearer contract-admin' },
+  { template: '/v1/pairing/peers/{peerId}/favorite-sync-status', method: 'get', path: '/v1/pairing/peers/peer/favorite-sync-status', status: 200, authorization: 'Bearer contract-admin', expectedFavoritePending: 0 },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 403, error: 'forbidden' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
@@ -155,7 +168,13 @@ const server = createNodeAgentServer({
     storageCapabilities: () => [],
     identityCapabilities: () => []
   },
-  pairingControl: { dialManualIp: async () => { throw new Error('peer unavailable'); } } as unknown as PairingServerControl,
+  pairingControl: {
+    dialManualIp: async () => { throw new Error('peer unavailable'); },
+    grantFavoriteWrite: (peerId: string, libraryId: string) => ({ peerId, libraryId, permission: 'favorite-write', granted: true }),
+    revokeFavoriteWrite: (peerId: string, libraryId: string) => ({ peerId, libraryId, permission: 'favorite-write', granted: false }),
+    listFavoriteSyncGrants: (libraryId: string) => ({ grants: [{ peerId: 'peer', libraryId, permission: 'favorite-write', granted: true }] }),
+    getFavoriteSyncStatus: () => ({ pending: 0, lastError: null })
+  } as unknown as PairingServerControl,
   uploadService: {} as unknown as UploadService,
   gallery: {
     listLibraries: () => [{ libraryId: 'lib', title: 'lib' }],
@@ -186,7 +205,9 @@ const server = createNodeAgentServer({
       if (!visibleAssetTags.has(key)) return 'not_found';
       return visibleAssetTags.get(key)!.delete(tag) ? 'removed' : 'unchanged';
     }
-  }
+  },
+  assetFavorites: { setAssetFavorite: (input) => input.assetId === 'asset'
+    ? { status: 'changed', favorite: input.favorite } : 'not_found' }
 });
 
 afterAll(async () => {
@@ -348,6 +369,9 @@ describe('implemented Node HTTP API contract', () => {
         const body: ContractAssetPage = await response.json() as ContractAssetPage;
         expect(body.items.find(({ assetId }) => assetId === 'asset')?.tags).toEqual(route.expectedTags);
       }
+      if (route.expectedFavorite !== undefined) expect(await response.json()).toMatchObject({ favorite: route.expectedFavorite });
+      if (route.expectedFavoriteGrant !== undefined) expect(await response.json()).toMatchObject({ granted: route.expectedFavoriteGrant, permission: 'favorite-write' });
+      if (route.expectedFavoritePending !== undefined) expect(await response.json()).toMatchObject({ pendingEvents: route.expectedFavoritePending, lastErrorCode: null });
       if (route.expectedAlbum) expect(await response.json()).toEqual(route.expectedAlbum);
       if (route.expectedAlbums) expect(await response.json()).toEqual({ items: route.expectedAlbums, nextCursor: null });
       if (route.expectedMembers) expect(await response.json()).toEqual({ items: route.expectedMembers, nextCursor: null });

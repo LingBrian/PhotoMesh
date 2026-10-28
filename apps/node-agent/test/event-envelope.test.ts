@@ -70,6 +70,34 @@ describe('signed EventEnvelope', () => {
     expect(() => makeUnsignedEvent({ ...add, eventType: 'asset.tag.removed', payload: { assetId: 'asset-1', tag: 'Summer', observedAddEventIds: [] } })).toThrow();
   });
 
+  it('signs and validates library-favorite OR-Set envelopes', async () => {
+    const identity = await makeIdentity();
+    const assetIndexId = '123e4567-e89b-42d3-a456-426614174000';
+    const add = makeUnsignedEvent({ libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 1,
+      causalParents: [assetIndexId], eventType: 'asset.favorite.added', payload: { assetId: 'asset-1' },
+      createdAt: '2026-10-28T00:00:00.000Z' });
+    const signedAdd = await signEvent(add, identity);
+    expect(await verifyEvent(signedAdd, publicKeyText(identity))).toBe(true);
+    expect(parseEventEnvelope(signedAdd)).toEqual(signedAdd);
+    const observed = ['123e4567-e89b-42d3-a456-426614174001', '123e4567-e89b-42d3-a456-426614174002'];
+    const remove = makeUnsignedEvent({ libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 2,
+      causalParents: observed, eventType: 'asset.favorite.removed',
+      payload: { assetId: 'asset-1', observedAddEventIds: observed }, createdAt: '2026-10-28T00:00:01.000Z' });
+    expect(parseEventEnvelope(await signEvent(remove, identity))).toEqual({ ...remove, signature: expect.any(String) });
+    expect(() => makeUnsignedEvent({ libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 3,
+      causalParents: [], eventType: 'asset.favorite.added', payload: { assetId: 'asset-1' }, createdAt: '2026-10-28T00:00:02.000Z' })).toThrow();
+    expect(() => makeUnsignedEvent({ libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 3,
+      causalParents: [observed[0]!], eventType: 'asset.favorite.removed',
+      payload: { assetId: 'asset-1', observedAddEventIds: observed }, createdAt: '2026-10-28T00:00:02.000Z' })).toThrow();
+    expect(() => makeUnsignedEvent({ libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 3,
+      causalParents: [], eventType: 'asset.favorite.removed', payload: { assetId: 'asset-1', observedAddEventIds: [] },
+      createdAt: '2026-10-28T00:00:02.000Z' })).toThrow();
+    const tooMany = Array.from({ length: 65 }, (_, index) => `123e4567-e89b-42d3-a456-${(index + 10).toString(16).padStart(12, '0')}`);
+    expect(() => makeUnsignedEvent({ libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 3,
+      causalParents: tooMany, eventType: 'asset.favorite.removed', payload: { assetId: 'asset-1', observedAddEventIds: tooMany },
+      createdAt: '2026-10-28T00:00:02.000Z' })).toThrow();
+  });
+
   it('preserves a well-formed unknown event version for safe non-application', async () => {
     const identity = await makeIdentity();
     const known = await signEvent(makeUnsignedEvent({

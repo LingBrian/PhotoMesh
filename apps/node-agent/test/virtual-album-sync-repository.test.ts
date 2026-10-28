@@ -51,17 +51,20 @@ function addAsset(db: Database.Database): void {
 }
 
 describe('PM-045 migration and global identifier registry', () => {
-  it('adds the isolated virtual album stream and event-ID registry in append-only migration 0008', async () => {
+  it('preserves the isolated virtual album stream and event-ID registry after migration 0009', async () => {
     const db = new Database(':memory:');
     try {
       const repository = await migrateToLatest(db);
       const version = db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id DESC LIMIT 1').get() as { migration_id: string };
-      expect(version.migration_id).toBe('0008_virtual_album_sync');
+      expect(version.migration_id).toBe('0009_asset_favorites');
       for (const table of [
         'sync_global_id_registry', 'library_album_write_grants', 'library_album_delete_grants',
         'album_sync_event_log', 'album_sync_inbox', 'album_sync_outbox', 'album_sync_author_heads',
         'album_sync_peer_cursors', 'album_lifecycle_operations', 'album_visibility_operations',
-        'album_local_visibility', 'album_global_delete_tokens', 'album_global_restore_targets'
+        'album_local_visibility', 'album_global_delete_tokens', 'album_global_restore_targets',
+        'library_favorite_write_grants', 'favorite_sync_event_log', 'favorite_sync_inbox', 'favorite_sync_outbox',
+        'favorite_sync_author_heads', 'favorite_sync_peer_cursors', 'favorite_operations', 'favorite_add_tokens',
+        'favorite_remove_targets', 'asset_favorites'
       ]) {
         expect(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table), table).toBeDefined();
       }
@@ -122,13 +125,13 @@ describe('PM-045 migration and global identifier registry', () => {
     }
   });
 
-  it('refuses an old 0007 binary after 0008 has been applied', async () => {
+  it('refuses an old 0007 binary after current migrations have been applied', async () => {
     const db = new Database(':memory:');
     try {
       await migrateToLatest(db);
       const oldBinary = new SqliteRepository(db);
       await expect(oldBinary.migrate(migrations.slice(0, 7))).rejects.toThrow(/unknown migration 0008_virtual_album_sync/);
-      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 8 });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 9 });
       expect(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'album_sync_event_log'").get()).toBeDefined();
     } finally {
       db.close();

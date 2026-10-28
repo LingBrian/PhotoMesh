@@ -61,14 +61,16 @@ export class SyncService {
     private readonly now: () => string = () => new Date().toISOString(),
     private readonly onEventApplied?: (event: EventEnvelope) => void,
     private readonly tagSyncAvailable = false,
-    private readonly albumSyncAvailable = false
+    private readonly albumSyncAvailable = false,
+    private readonly favoriteSyncAvailable = false
   ) {}
 
   hello(): SyncHello {
     return {
       nodeId: this.identity.peerId, protocolMin: SYNC_PROTOCOL_MIN, protocolMax: SYNC_PROTOCOL_MAX,
       schemaVersions: [EVENT_SCHEMA_VERSION],
-      capabilities: [...SUPPORTED_CAPABILITIES, ...(this.tagSyncAvailable ? ['asset-tags-v1'] : []), ...(this.albumSyncAvailable ? ['virtual-albums-v1'] : [])]
+      capabilities: [...SUPPORTED_CAPABILITIES, ...(this.tagSyncAvailable ? ['asset-tags-v1'] : []),
+        ...(this.albumSyncAvailable ? ['virtual-albums-v1'] : []), ...(this.favoriteSyncAvailable ? ['asset-favorites-v1'] : [])]
     };
   }
 

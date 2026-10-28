@@ -109,6 +109,7 @@ export interface GalleryAssetRecord extends LibraryIndexAsset {
   byteSize: number;
   version: string;
   tags: string[];
+  favorite: boolean;
 }
 
 export type AssetTagMutationResult = 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'limit_reached';
@@ -1019,8 +1020,10 @@ export class SqliteRepository implements UploadRepository {
       : [position.capturedAt, position.capturedAt, position.assetId];
     const localRows = this.db.prepare(`SELECT a.asset_id, a.library_id, a.origin_node_id, a.kind, a.capture_ts AS captured_at,
         f.sha256, f.byte_size, COALESCE(l.original_filename, a.asset_id) AS filename, l.original_path AS source_path,
-        COALESCE(l.source_kind, 'import') AS source_kind, COALESCE(l.availability, 'missing') AS availability
+        COALESCE(l.source_kind, 'import') AS source_kind, COALESCE(l.availability, 'missing') AS availability,
+        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite
       FROM assets a LEFT JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
+      LEFT JOIN asset_favorites fav ON fav.library_id = a.library_id AND fav.asset_id = a.asset_id
       LEFT JOIN file_locations l ON l.location_id = (SELECT candidate.location_id FROM file_locations candidate
         WHERE candidate.file_id = f.file_id AND candidate.node_id = a.origin_node_id
         ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END LIMIT 1)
@@ -1039,8 +1042,10 @@ export class SqliteRepository implements UploadRepository {
         p.sha256, p.byte_length AS byte_size,
         COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id) AS filename,
         json_extract(p.metadata_json, '$.sourcePath') AS source_path,
-        COALESCE(json_extract(p.metadata_json, '$.sourceKind'), 'import') AS source_kind, 'missing' AS availability
-      FROM sync_asset_projection p WHERE p.library_id = ? AND p.tombstone_event_id IS NULL
+        COALESCE(json_extract(p.metadata_json, '$.sourceKind'), 'import') AS source_kind, 'missing' AS availability,
+        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite
+      FROM sync_asset_projection p LEFT JOIN asset_favorites fav ON fav.library_id = p.library_id AND fav.asset_id = p.asset_id
+      WHERE p.library_id = ? AND p.tombstone_event_id IS NULL
         AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
         AND (? = '' OR instr(lower(COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id)), lower(?)) > 0 OR
           instr(lower(p.asset_id), lower(?)) > 0 OR instr(lower(p.origin_node_id), lower(?)) > 0 OR
@@ -1380,6 +1385,7 @@ interface GalleryAssetSqlRow {
   source_path: unknown;
   source_kind: unknown;
   availability: GalleryAssetRecord['availability'];
+  favorite: number | boolean | null;
 }
 
 function toGalleryAsset(row: GalleryAssetSqlRow): GalleryAssetRecord {
@@ -1390,7 +1396,7 @@ function toGalleryAsset(row: GalleryAssetSqlRow): GalleryAssetRecord {
     filename: typeof row.filename === 'string' ? row.filename : row.asset_id,
     capturedAt, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
     sourceKind: row.source_kind === 'upload' ? 'upload' : 'import',
-    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id, tags: []
+    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id, tags: [], favorite: Boolean(row.favorite)
   };
 }
 

@@ -185,6 +185,8 @@ export class SyncRepository {
       const authors = this.db.prepare('SELECT author_peer_id FROM sync_author_heads WHERE library_id = ? AND ready = 1 ORDER BY author_peer_id')
         .all(libraryId) as Array<{ author_peer_id: string }>;
       for (const { author_peer_id: authorPeerId } of authors) {
+        // The target peer is already the origin of its own author stream; never echo its events back.
+        if (authorPeerId === peerId) continue;
         const after = cursorMap.get(`${libraryId}\0${authorPeerId}`) ?? 0;
         const remaining = maxEvents - events.length;
         if (remaining <= 0) return events;

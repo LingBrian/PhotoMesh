@@ -13,6 +13,7 @@ import type { Readable } from 'node:stream';
 import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage, MediaVersionView } from './media/media-version-service.js';
 import type { ThumbnailContent } from './media/thumbnail-service.js';
 import { maxThumbnailOutputBytes } from './media/image-transformer.js';
+import { FavoriteSyncConflictError } from './sync/favorite-sync-repository.js';
 
 export interface UploadAuthorizationRequest {
   token: string | undefined;
@@ -37,6 +38,7 @@ export interface NodeAgentServerOptions {
   gallery?: GalleryServerControl;
   albums?: AlbumServerControl;
   assetTags?: AssetTagServerControl;
+  assetFavorites?: AssetFavoriteServerControl;
   tagSync?: boolean;
   mediaVersions?: MediaVersionServerControl;
   thumbnails?: ThumbnailServerControl;
@@ -107,6 +109,20 @@ export interface AssetTagServerControl {
   removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
 }
 
+export interface AssetFavoriteMutationRequest {
+  operationId: string; principalId: string; requestFingerprint: string; libraryId: string; assetId: string;
+  favorite: boolean; createdAt: string;
+}
+export type AssetFavoriteMutationResult = { status: 'changed' | 'unchanged'; favorite: boolean } | 'not_found' | 'author_limit';
+export interface AssetFavoriteServerControl {
+  setAssetFavorite(input: AssetFavoriteMutationRequest): AssetFavoriteMutationResult | Promise<AssetFavoriteMutationResult>;
+}
+
+export type FavoriteSyncPermission = 'favorite-write';
+export interface FavoriteSyncGrantStatus { peerId: string; libraryId: string; permission: FavoriteSyncPermission; granted: boolean }
+export interface FavoriteSyncGrantList { grants: FavoriteSyncGrantStatus[] }
+export interface FavoriteSyncPeerStatus { peerId: string; pendingEvents: number; lastErrorCode: 'unauthorized' | 'unavailable' | 'conflict' | null }
+
 export type AlbumSyncPermission = 'album-write' | 'album-delete';
 export interface AlbumSyncGrantStatus { peerId: string; libraryId: string; permission: AlbumSyncPermission; granted: boolean }
 export interface AlbumSyncGrantList { grants: AlbumSyncGrantStatus[] }
@@ -130,6 +146,10 @@ export interface PairingServerControl {
   revokeAlbumDelete?(peerId: string, libraryId: string, revokedAt: string): AlbumSyncGrantStatus | undefined;
   listAlbumSyncGrants?(libraryId: string): AlbumSyncGrantList | undefined;
   getAlbumSyncStatus?(peerId: string): AlbumSyncPeerStatus | undefined;
+  grantFavoriteWrite?(peerId: string, libraryId: string, grantedAt: string): FavoriteSyncGrantStatus | undefined;
+  revokeFavoriteWrite?(peerId: string, libraryId: string, revokedAt: string): FavoriteSyncGrantStatus | undefined;
+  listFavoriteSyncGrants?(libraryId: string): FavoriteSyncGrantList | undefined;
+  getFavoriteSyncStatus?(peerId: string): { pending: number; lastError: string | null } | undefined;
   readLibraryIndex(peerId: string, libraryId: string): unknown[] | undefined;
   listDiscoveredPeers(): Array<{ peerId: string; addresses: string[] }>;
   dialManualIp(host: string, port: number, peerId: string): Promise<{ peerId: string; addresses: string[] }>;
@@ -402,6 +422,41 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (!successful) throw new Error('Asset tag operation failed');
     response.writeHead(204);
     response.end();
+    return;
+  }
+
+  const favoritePath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/favorite$/);
+  if (request.method === 'PUT' && favoritePath?.[1] && favoritePath[2]) {
+    response.setHeader('cache-control', 'private, no-store');
+    const libraryId = decodePathSegment(favoritePath[1]);
+    const assetId = decodePathSegment(favoritePath[2]);
+    if (!libraryId || !assetId || url.searchParams.size > 0) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const principalId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!principalId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    const control = options.assetFavorites;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const operationId = readFavoriteOperationId(request);
+    if (!operationId || !/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['favorite']) || typeof body.favorite !== 'boolean') {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    try {
+      const result = await control.setAssetFavorite({
+        operationId, principalId, libraryId, assetId, favorite: body.favorite,
+        requestFingerprint: favoriteRequestFingerprint(principalId, libraryId, assetId, body.favorite),
+        createdAt: new Date().toISOString()
+      });
+      if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+      else if (result === 'author_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+      else sendJson(response, 200, { favorite: result.favorite });
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof FavoriteSyncConflictError) {
+        sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      } else throw error;
+    }
     return;
   }
 
@@ -691,6 +746,28 @@ function projectAlbumSyncStatus(value: AlbumSyncPeerStatus): AlbumSyncPeerStatus
   return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
 }
 
+function projectFavoriteSyncGrantStatus(value: FavoriteSyncGrantStatus): FavoriteSyncGrantStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !isValidAlbumIdentifier(value.libraryId) ||
+      value.permission !== 'favorite-write' || typeof value.granted !== 'boolean') throw new Error('favorite sync control returned an invalid grant');
+  return { peerId: value.peerId, libraryId: value.libraryId, permission: value.permission, granted: value.granted };
+}
+
+function projectFavoriteSyncGrantList(value: FavoriteSyncGrantList): FavoriteSyncGrantList {
+  if (!isPlainRecord(value) || !Array.isArray(value.grants)) throw new Error('favorite sync control returned an invalid grant list');
+  const grants = value.grants.map((grant) => projectFavoriteSyncGrantStatus(grant));
+  const keys = grants.map((grant) => `${grant.peerId}\\0${grant.libraryId}\\0${grant.permission}`);
+  if (new Set(keys).size !== keys.length) throw new Error('favorite sync control returned duplicate grants');
+  return { grants };
+}
+
+function projectFavoriteSyncStatus(value: FavoriteSyncPeerStatus): FavoriteSyncPeerStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !Number.isSafeInteger(value.pendingEvents) || value.pendingEvents < 0 ||
+      !(value.lastErrorCode === null || ['unauthorized', 'unavailable', 'conflict'].includes(value.lastErrorCode))) {
+    throw new Error('favorite sync control returned an invalid status');
+  }
+  return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
+}
+
 function parseAlbumPageQuery(searchParams: URLSearchParams, scope: AlbumCursorScope): { cursor: string | undefined; limit: number } | undefined {
   if ([...searchParams.keys()].some((key) => key !== 'cursor' && key !== 'limit')) return undefined;
   const limitValues = searchParams.getAll('limit');
@@ -808,6 +885,16 @@ function albumRequestFingerprint(
   })).digest('hex');
 }
 
+function readFavoriteOperationId(request: IncomingMessage): string | undefined {
+  const header = request.headers['idempotency-key'];
+  if (typeof header !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(header)) return undefined;
+  return header.toLowerCase();
+}
+
+function favoriteRequestFingerprint(principalId: string, libraryId: string, assetId: string, favorite: boolean): string {
+  return createHash('sha256').update(JSON.stringify({ apiVersion: 1, principalId, method: 'PUT', libraryId, assetId, favorite })).digest('hex');
+}
+
 async function handlePairingRequest(
   request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string, pathname: string
 ): Promise<boolean> {
@@ -864,6 +951,49 @@ async function handlePairingRequest(
     const result = control.getAlbumSyncStatus(decodeURIComponent(albumStatusPath[1]));
     if (!result) sendJson(response, 404, { error: 'not_found', requestId });
     else sendJson(response, 200, projectAlbumSyncStatus(result));
+    return true;
+  }
+  const favoriteGrantListPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/favorite-sync-grants$/);
+  if (request.method === 'GET' && favoriteGrantListPath?.[1]) {
+    if (!control.listFavoriteSyncGrants) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.listFavoriteSyncGrants(decodeURIComponent(favoriteGrantListPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectFavoriteSyncGrantList(result));
+    return true;
+  }
+  const favoriteStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/favorite-sync-status$/);
+  if (request.method === 'GET' && favoriteStatusPath?.[1]) {
+    if (!control.getFavoriteSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.getFavoriteSyncStatus(decodeURIComponent(favoriteStatusPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectFavoriteSyncStatus({
+      peerId: decodeURIComponent(favoriteStatusPath[1]), pendingEvents: result.pending,
+      lastErrorCode: result.lastError === null ? null : /denied|unauthori[sz]ed|write/i.test(result.lastError)
+        ? 'unauthorized' : /conflict|invalid|sequence/i.test(result.lastError) ? 'conflict' : 'unavailable'
+    }));
+    return true;
+  }
+  const favoriteGrantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/favorite-write$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && favoriteGrantPath?.[1] && favoriteGrantPath[2]) {
+    const update = request.method === 'PUT' ? control.grantFavoriteWrite : control.revokeFavoriteWrite;
+    if (!update) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (request.method === 'PUT') {
+      if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+      const body = await readJsonBody(request, 8 * 1024);
+      if (!isPlainRecord(body) || !hasExactKeys(body, ['enabled']) || body.enabled !== true) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+    }
+    try {
+      const result = update.call(control, decodeURIComponent(favoriteGrantPath[1]), decodeURIComponent(favoriteGrantPath[2]), new Date().toISOString());
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, projectFavoriteSyncGrantStatus(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof FavoriteSyncConflictError) sendJson(response, 409, { error: 'conflict', requestId });
+      else throw error;
+    }
     return true;
   }
   const albumGrantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/(album-write|album-delete)$/);

@@ -14,8 +14,10 @@ const SIGNING_DOMAIN = 'PhotoMesh.EventEnvelope.v1\n';
 export type SyncEventType = 'asset.indexed' | 'asset.metadata.updated' | 'asset.tombstoned' | 'asset.restored';
 export type TagSyncEventType = 'asset.tag.added' | 'asset.tag.removed';
 export type AlbumSyncEventType = 'album.created' | 'album.member.added' | 'album.member.removed' | 'album.deleted' | 'album.restored';
-export type AnyEventType = SyncEventType | TagSyncEventType | AlbumSyncEventType;
+export type FavoriteSyncEventType = 'asset.favorite.added' | 'asset.favorite.removed';
+export type AnyEventType = SyncEventType | TagSyncEventType | AlbumSyncEventType | FavoriteSyncEventType;
 export const MAX_ALBUM_OBSERVED_IDS = 64;
+export const MAX_FAVORITE_OBSERVED_IDS = 64;
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface EventEnvelope {
@@ -53,7 +55,8 @@ export function makeUnsignedEvent(input: {
     causalParents: [...new Set(input.causalParents)].sort(), eventType: input.eventType,
     payload: input.payload, createdAt: input.createdAt
   };
-  if (!isSupportedEventType(input.eventType) && !isTagSyncEventType(input.eventType) && !isAlbumSyncEventType(input.eventType)) throw new Error('unsupported local event type');
+  if (!isSupportedEventType(input.eventType) && !isTagSyncEventType(input.eventType) && !isAlbumSyncEventType(input.eventType) &&
+      !isFavoriteSyncEventType(input.eventType)) throw new Error('unsupported local event type');
   validateUnsignedEvent(event);
   return event;
 }
@@ -125,6 +128,7 @@ function validateUnsignedEvent(event: UnsignedEventEnvelope): void {
   if (isSupportedEventType(event.eventType)) validatePayload(event.eventType, event.payload);
   else if (isTagSyncEventType(event.eventType)) validateTagOperationPayload(event.eventType, event.payload);
   else if (isAlbumSyncEventType(event.eventType)) validateAlbumEventPayload(event.eventType, event.payload);
+  else if (isFavoriteSyncEventType(event.eventType)) validateFavoriteEventPayload(event.eventType, event.payload, event.causalParents);
   if (Buffer.byteLength(JSON.stringify(event), 'utf8') > MAX_EVENT_BYTES) throw new Error('event exceeds maximum size');
 }
 
@@ -180,6 +184,21 @@ function validateAlbumEventPayload(type: AlbumSyncEventType, payload: Record<str
   if (!hasExactKeys(payload, ['albumId'])) throw new Error('invalid album delete payload');
 }
 
+function validateFavoriteEventPayload(type: FavoriteSyncEventType, payload: Record<string, unknown>, causalParents: readonly string[]): void {
+  if (!isSafeId(payload.assetId, 128)) throw new Error('invalid favorite asset payload');
+  if (type === 'asset.favorite.added') {
+    if (!hasExactKeys(payload, ['assetId']) || causalParents.length !== 1) throw new Error('favorite add must reference one asset index parent');
+    return;
+  }
+  const ids = payload.observedAddEventIds;
+  if (!hasExactKeys(payload, ['assetId', 'observedAddEventIds']) || !Array.isArray(ids) || ids.length < 1 ||
+      ids.length > MAX_FAVORITE_OBSERVED_IDS || !ids.every(isUuid) ||
+      ids.some((id, index) => index > 0 && String(ids[index - 1]) >= String(id)) ||
+      causalParents.length !== ids.length || causalParents.some((id, index) => id !== ids[index])) {
+    throw new Error('favorite remove must observe sorted unique add IDs as causal parents');
+  }
+}
+
 function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
@@ -205,6 +224,10 @@ export function isTagSyncEventType(value: string): value is TagSyncEventType {
 export function isAlbumSyncEventType(value: string): value is AlbumSyncEventType {
   return value === 'album.created' || value === 'album.member.added' || value === 'album.member.removed' ||
     value === 'album.deleted' || value === 'album.restored';
+}
+
+export function isFavoriteSyncEventType(value: string): value is FavoriteSyncEventType {
+  return value === 'asset.favorite.added' || value === 'asset.favorite.removed';
 }
 
 function isSafeId(value: unknown, maxLength: number): value is string {
