@@ -4,7 +4,9 @@ import { fileURLToPath } from 'node:url';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { parse } from 'yaml';
 import { afterAll, describe, expect, it } from 'vitest';
-import { createNodeAgentServer, type GalleryServerControl, type PairingServerControl } from '../../../apps/node-agent/src/server.js';
+import { createNodeAgentServer, type AssetRatingServerControl, type GalleryServerControl, type PairingServerControl } from '../../../apps/node-agent/src/server.js';
+import { RepositoryConflictError } from '../../../apps/node-agent/src/db/repository.js';
+import { RatingSyncConflictError } from '../../../apps/node-agent/src/sync/rating-sync-repository.js';
 import type { UploadService } from '../../../apps/node-agent/src/uploads/service.js';
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -29,11 +31,18 @@ interface RouteCase {
   expectedFavorite?: boolean;
   expectedFavoriteGrant?: boolean;
   expectedFavoritePending?: number;
+  expectedRating?: { rating: number | null; ratingConflict: boolean; ratingCandidates: Array<number | null> };
+  expectedRatingGrant?: boolean;
+  expectedRatingGrantList?: boolean;
+  expectedRatingPending?: number;
   requestHeaders?: Record<string, string>;
 }
 
 interface ContractAssetPage {
-  items: Array<{ assetId: string; tags: string[]; favorite?: boolean }>;
+  items: Array<{
+    assetId: string; tags: string[]; favorite?: boolean;
+    rating: number | null; ratingConflict: boolean; ratingCandidates: Array<number | null>;
+  }>;
 }
 
 interface ContractResponse {
@@ -122,6 +131,31 @@ const routes: RouteCase[] = [
   { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/favorite-write', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/favorite-write', status: 200, authorization: 'Bearer contract-admin', expectedFavoriteGrant: false },
   { template: '/v1/pairing/libraries/{libraryId}/favorite-sync-grants', method: 'get', path: '/v1/pairing/libraries/lib/favorite-sync-grants', status: 200, authorization: 'Bearer contract-admin' },
   { template: '/v1/pairing/peers/{peerId}/favorite-sync-status', method: 'get', path: '/v1/pairing/peers/peer/favorite-sync-status', status: 200, authorization: 'Bearer contract-admin', expectedFavoritePending: 0 },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 403, error: 'forbidden', body: { rating: 4 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174001' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 200, authorization: 'Bearer contract-admin', body: { rating: 4 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174002' }, expectedRating: { rating: 4, ratingConflict: false, ratingCandidates: [4] }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 200, authorization: 'Bearer contract-admin', body: { rating: null }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174003' }, expectedRating: { rating: null, ratingConflict: false, ratingCandidates: [null] }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { rating: 0 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174004' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { rating: 6 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174005' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { rating: 2.5 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174006' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { rating: true }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174012' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 200, authorization: 'Bearer contract-admin', body: { rating: 1 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174013' }, expectedRating: { rating: 1, ratingConflict: false, ratingCandidates: [1] }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 200, authorization: 'Bearer contract-admin', body: { rating: 5 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174014' }, expectedRating: { rating: 5, ratingConflict: false, ratingCandidates: [5] }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/conflict-value/rating', status: 200, authorization: 'Bearer contract-admin', body: { rating: 3 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174015' }, expectedRating: { rating: null, ratingConflict: true, ratingCandidates: [4, 5] }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { rating: 4, authorPeerId: 'should-not-be-accepted' }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174007' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { rating: 3 }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/asset/rating', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { rating: 3 }, requestHeaders: { 'idempotency-key': 'not-a-uuid' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/missing/rating', status: 404, error: 'not_found', authorization: 'Bearer contract-admin', body: { rating: 3 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174008' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/author-limit/rating', status: 409, error: 'writer_limit_reached', authorization: 'Bearer contract-admin', body: { rating: 3 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174009' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/conflict-limit/rating', status: 409, error: 'rating_conflict_limit', authorization: 'Bearer contract-admin', body: { rating: 3 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174010' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/libraries/{libraryId}/assets/{assetId}/rating', method: 'put', path: '/v1/libraries/lib/assets/idempotency-conflict/rating', status: 409, error: 'idempotency_conflict', authorization: 'Bearer contract-admin', body: { rating: 3 }, requestHeaders: { 'idempotency-key': '423e4567-e89b-42d3-a456-426614174011' }, headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/rating-write', status: 403, error: 'forbidden', body: { enabled: true } },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/rating-write', status: 400, error: 'invalid_request', authorization: 'Bearer contract-admin', body: { enabled: false } },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write', method: 'put', path: '/v1/pairing/peers/peer/libraries/lib/rating-write', status: 200, authorization: 'Bearer contract-admin', body: { enabled: true }, expectedRatingGrant: true },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write', method: 'put', path: '/v1/pairing/peers/no-read/libraries/lib/rating-write', status: 409, error: 'conflict', authorization: 'Bearer contract-admin', body: { enabled: true } },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write', method: 'put', path: '/v1/pairing/peers/not-trusted/libraries/lib/rating-write', status: 409, error: 'conflict', authorization: 'Bearer contract-admin', body: { enabled: true } },
+  { template: '/v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write', method: 'delete', path: '/v1/pairing/peers/peer/libraries/lib/rating-write', status: 200, authorization: 'Bearer contract-admin', expectedRatingGrant: false },
+  { template: '/v1/pairing/libraries/{libraryId}/rating-sync-grants', method: 'get', path: '/v1/pairing/libraries/lib/rating-sync-grants', status: 200, authorization: 'Bearer contract-admin', expectedRatingGrantList: true },
+  { template: '/v1/pairing/peers/{peerId}/rating-sync-status', method: 'get', path: '/v1/pairing/peers/peer/rating-sync-status', status: 200, authorization: 'Bearer contract-admin', expectedRatingPending: 0 },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 403, error: 'forbidden' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}', method: 'put', path: '/v1/libraries/lib/assets/asset/tags/Summer', status: 204, authorization: 'Bearer contract-admin' },
@@ -173,13 +207,22 @@ const server = createNodeAgentServer({
     grantFavoriteWrite: (peerId: string, libraryId: string) => ({ peerId, libraryId, permission: 'favorite-write', granted: true }),
     revokeFavoriteWrite: (peerId: string, libraryId: string) => ({ peerId, libraryId, permission: 'favorite-write', granted: false }),
     listFavoriteSyncGrants: (libraryId: string) => ({ grants: [{ peerId: 'peer', libraryId, permission: 'favorite-write', granted: true }] }),
-    getFavoriteSyncStatus: () => ({ pending: 0, lastError: null })
+    getFavoriteSyncStatus: () => ({ pending: 0, lastError: null }),
+    grantRatingWrite: (peerId: string, libraryId: string) => {
+      if (peerId === 'no-read') throw new RatingSyncConflictError('peer needs a library read grant before rating-write');
+      if (peerId === 'not-trusted') throw new RepositoryConflictError('peer is not trusted');
+      return { peerId, libraryId, permission: 'rating-write', granted: true };
+    },
+    revokeRatingWrite: (peerId: string, libraryId: string) => ({ peerId, libraryId, permission: 'rating-write', granted: false }),
+    listRatingSyncGrants: (libraryId: string) => ({ grants: [{ peerId: 'peer', libraryId, permission: 'rating-write', granted: true }] }),
+    getRatingSyncStatus: () => ({ pending: 0, lastError: null })
   } as unknown as PairingServerControl,
   uploadService: {} as unknown as UploadService,
   gallery: {
     listLibraries: () => [{ libraryId: 'lib', title: 'lib' }],
     listAssets: (libraryId: string) => ({
-      items: [{ assetId: 'asset', libraryId, tags: [...(visibleAssetTags.get(`${libraryId}:asset`) ?? [])].sort() }], nextCursor: null
+      items: [{ assetId: 'asset', libraryId, tags: [...(visibleAssetTags.get(`${libraryId}:asset`) ?? [])].sort(),
+        rating: 4, ratingConflict: false, ratingCandidates: [4] }], nextCursor: null
     }),
     getOriginal: async () => undefined
   } as unknown as GalleryServerControl,
@@ -207,7 +250,17 @@ const server = createNodeAgentServer({
     }
   },
   assetFavorites: { setAssetFavorite: (input) => input.assetId === 'asset'
-    ? { status: 'changed', favorite: input.favorite } : 'not_found' }
+    ? { status: 'changed', favorite: input.favorite } : 'not_found' },
+  assetRatings: {
+    setAssetRating: (input) => {
+      if (input.assetId === 'missing') return 'not_found';
+      if (input.assetId === 'author-limit') return 'author_limit';
+      if (input.assetId === 'conflict-limit') return 'conflict_limit';
+      if (input.assetId === 'idempotency-conflict') throw new RepositoryConflictError('operation ID reused with different request');
+      if (input.assetId === 'conflict-value') return { status: 'changed', rating: null, conflict: true, ratingCandidates: [4, 5] };
+      return { status: 'changed', rating: input.rating, conflict: false, ratingCandidates: [input.rating] };
+    }
+  } as AssetRatingServerControl
 });
 
 afterAll(async () => {
@@ -308,6 +361,56 @@ describe('implemented Node HTTP API contract', () => {
     expect(paths['/v1/pairing/peers/{peerId}/album-sync-status']?.get).toBeDefined();
   });
 
+  it('documents PM-047 rating DTOs, idempotency, and separate default-deny grant routes', async () => {
+    const contract = await loadContract();
+    const ratingPath = contract.paths['/v1/libraries/{libraryId}/assets/{assetId}/rating'];
+    const rating = ratingPath?.put;
+    expect(rating).toBeDefined();
+    expect(rating?.parameters).toContainEqual({ $ref: '#/components/parameters/RatingIdempotencyKey' });
+    expect(rating?.requestBody?.content?.['application/json']?.schema).toEqual({ $ref: '#/components/schemas/AssetRatingSetRequest' });
+    expect(rating?.responses['200']?.content?.['application/json']?.schema).toEqual({ $ref: '#/components/schemas/AssetRatingState' });
+    for (const status of ['400', '403', '404', '409']) expect(rating?.responses[status]).toBeDefined();
+    for (const [status, response] of Object.entries(rating?.responses ?? {})) {
+      const cache = response.headers?.['Cache-Control'] as { schema?: { const?: string } } | undefined;
+      expect(cache?.schema?.const, `rating response ${status}`).toBe('private, no-store');
+    }
+
+    const schemas = contract.components.schemas as Record<string, {
+      additionalProperties?: boolean;
+      required?: string[];
+      properties?: Record<string, { const?: unknown; type?: string | string[]; maxItems?: number; items?: unknown }>;
+      anyOf?: Array<{ type?: string; minimum?: number; maximum?: number }>;
+    }>;
+    expect(schemas.AssetRatingSetRequest?.additionalProperties).toBe(false);
+    expect(schemas.AssetRatingSetRequest?.required).toEqual(['rating']);
+    expect(schemas.AssetRatingState?.additionalProperties).toBe(false);
+    expect(schemas.AssetRatingState?.required).toEqual(['rating', 'ratingConflict', 'ratingCandidates']);
+    expect(Object.keys(schemas.AssetRatingState?.properties ?? {}).sort()).toEqual(['rating', 'ratingCandidates', 'ratingConflict']);
+    expect(schemas.AssetRatingState?.properties?.ratingCandidates?.maxItems).toBe(64);
+    expect(schemas.Asset?.required).toEqual(expect.arrayContaining(['rating', 'ratingConflict', 'ratingCandidates']));
+    expect(Object.keys(schemas.Asset?.properties ?? {})).toEqual(expect.arrayContaining(['rating', 'ratingConflict', 'ratingCandidates']));
+    expect(schemas.Asset?.properties?.ratingCandidates?.maxItems).toBe(64);
+    expect(schemas.NullableRatingValue?.anyOf).toEqual(expect.arrayContaining([
+      { type: 'integer', minimum: 1, maximum: 5 }, { type: 'null' }
+    ]));
+    expect(schemas.RatingSyncGrantRequest?.additionalProperties).toBe(false);
+    expect(schemas.RatingSyncGrantStatus?.properties?.permission?.const).toBe('rating-write');
+    expect(schemas.FavoriteSyncGrantStatus?.properties?.permission?.const).toBe('favorite-write');
+    expect(contract.components.parameters.RatingIdempotencyKey).toMatchObject({
+      name: 'Idempotency-Key', in: 'header', required: true
+    });
+
+    const grants = contract.paths['/v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write'];
+    expect(grants?.put).toBeDefined();
+    expect(grants?.delete).toBeDefined();
+    expect(grants?.put?.requestBody?.content?.['application/json']?.schema).toEqual({ $ref: '#/components/schemas/RatingSyncGrantRequest' });
+    expect(contract.paths['/v1/pairing/libraries/{libraryId}/rating-sync-grants']?.get).toBeDefined();
+    expect(contract.paths['/v1/pairing/peers/{peerId}/rating-sync-status']?.get).toBeDefined();
+
+    const diagnosticCapabilities = (schemas.DiagnosticComponent?.properties?.capabilities?.items as { enum?: string[] } | undefined)?.enum;
+    expect(diagnosticCapabilities).toEqual(expect.arrayContaining(['assetRatings', 'ratingSync', 'assetFavorites', 'favoriteSync']));
+  });
+
   it('declares an open error envelope and a request-id header for every response', async () => {
     const contract = await loadContract();
     const errorSchema = contract.components.schemas.ApiError!;
@@ -367,11 +470,23 @@ describe('implemented Node HTTP API contract', () => {
       }
       if (route.expectedTags) {
         const body: ContractAssetPage = await response.json() as ContractAssetPage;
-        expect(body.items.find(({ assetId }) => assetId === 'asset')?.tags).toEqual(route.expectedTags);
+        const asset = body.items.find(({ assetId }) => assetId === 'asset');
+        expect(asset?.tags).toEqual(route.expectedTags);
+        expect(asset).toMatchObject({ rating: 4, ratingConflict: false, ratingCandidates: [4] });
       }
       if (route.expectedFavorite !== undefined) expect(await response.json()).toMatchObject({ favorite: route.expectedFavorite });
       if (route.expectedFavoriteGrant !== undefined) expect(await response.json()).toMatchObject({ granted: route.expectedFavoriteGrant, permission: 'favorite-write' });
       if (route.expectedFavoritePending !== undefined) expect(await response.json()).toMatchObject({ pendingEvents: route.expectedFavoritePending, lastErrorCode: null });
+      if (route.expectedRating) {
+        const body = await response.json() as Record<string, unknown>;
+        expect(body).toEqual(route.expectedRating);
+        expect(Object.keys(body).sort()).toEqual(['rating', 'ratingCandidates', 'ratingConflict']);
+        expect(body).not.toHaveProperty('principalId');
+        expect(body).not.toHaveProperty('authorPeerId');
+      }
+      if (route.expectedRatingGrant !== undefined) expect(await response.json()).toMatchObject({ granted: route.expectedRatingGrant, permission: 'rating-write' });
+      if (route.expectedRatingGrantList) expect(await response.json()).toEqual({ grants: [{ peerId: 'peer', libraryId: 'lib', permission: 'rating-write', granted: true }] });
+      if (route.expectedRatingPending !== undefined) expect(await response.json()).toMatchObject({ peerId: 'peer', pendingEvents: route.expectedRatingPending, lastErrorCode: null });
       if (route.expectedAlbum) expect(await response.json()).toEqual(route.expectedAlbum);
       if (route.expectedAlbums) expect(await response.json()).toEqual({ items: route.expectedAlbums, nextCursor: null });
       if (route.expectedMembers) expect(await response.json()).toEqual({ items: route.expectedMembers, nextCursor: null });

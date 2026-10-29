@@ -1342,5 +1342,280 @@ export const migrations: readonly Migration[] = [
         NOT EXISTS (SELECT 1 FROM favorite_remove_targets r WHERE r.observed_add_event_id = a.event_id))
       BEGIN SELECT RAISE(ABORT, 'favorite projection has active add'); END;
     `
+  },
+  {
+    id: '0010_asset_ratings',
+    sql: `
+      DROP TRIGGER sync_global_id_registry_no_delete;
+      DROP TRIGGER sync_global_id_registry_update_guard;
+      DROP TRIGGER sync_event_global_id_guard; DROP TRIGGER sync_event_global_id_register;
+      DROP TRIGGER sync_inbox_global_id_guard; DROP TRIGGER sync_inbox_global_id_register;
+      DROP TRIGGER tag_sync_event_global_id_guard; DROP TRIGGER tag_sync_event_global_id_register;
+      DROP TRIGGER tag_sync_inbox_global_id_guard; DROP TRIGGER tag_sync_inbox_global_id_register;
+      DROP TRIGGER album_sync_event_global_id_guard; DROP TRIGGER album_sync_event_global_id_register;
+      DROP TRIGGER album_sync_inbox_global_id_guard; DROP TRIGGER album_sync_inbox_global_id_register;
+      DROP TRIGGER album_operations_global_id_guard; DROP TRIGGER album_operations_global_id_register;
+      DROP TRIGGER album_lifecycle_global_id_guard; DROP TRIGGER album_lifecycle_global_id_register;
+      DROP TRIGGER album_visibility_global_id_guard; DROP TRIGGER album_visibility_global_id_register;
+      DROP TRIGGER favorite_sync_event_global_id_guard; DROP TRIGGER favorite_sync_event_global_id_register;
+      DROP TRIGGER favorite_sync_inbox_global_id_guard; DROP TRIGGER favorite_sync_inbox_global_id_register;
+      DROP TRIGGER favorite_operations_global_id_guard; DROP TRIGGER favorite_operations_global_id_register;
+      CREATE TABLE sync_global_id_registry_0010 (
+        global_id TEXT PRIMARY KEY CHECK(length(global_id)=36),
+        event_stream TEXT CHECK(event_stream IN ('asset-metadata-v1','asset-tags-v1','virtual-albums-v1','asset-favorites-v1','asset-ratings-v1')),
+        operation_kind TEXT CHECK(operation_kind IN ('album-operation','album-lifecycle','album-visibility','favorite-operation','rating-operation')),
+        CHECK(event_stream IS NOT NULL OR operation_kind IS NOT NULL),
+        CHECK(event_stream IS NULL OR operation_kind IS NULL OR
+          (event_stream='virtual-albums-v1' AND operation_kind IN ('album-operation','album-lifecycle')) OR
+          (event_stream='asset-favorites-v1' AND operation_kind='favorite-operation') OR
+          (event_stream='asset-ratings-v1' AND operation_kind='rating-operation'))
+      );
+      INSERT INTO sync_global_id_registry_0010 SELECT global_id,event_stream,operation_kind FROM sync_global_id_registry;
+      DROP TABLE sync_global_id_registry;
+      ALTER TABLE sync_global_id_registry_0010 RENAME TO sync_global_id_registry;
+      CREATE TABLE library_rating_write_grants (
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT, library_id TEXT NOT NULL,
+        granted_at TEXT NOT NULL, revoked_at TEXT, PRIMARY KEY(peer_id,library_id)
+      );
+      CREATE INDEX library_rating_write_grants_library_idx ON library_rating_write_grants(library_id,peer_id,revoked_at);
+      CREATE TABLE rating_sync_author_registry(library_id TEXT NOT NULL,author_peer_id TEXT NOT NULL,first_seen_at TEXT NOT NULL,PRIMARY KEY(library_id,author_peer_id));
+      CREATE TABLE rating_sync_event_log(
+        event_id TEXT PRIMARY KEY CHECK(length(event_id)=36),library_id TEXT NOT NULL,author_peer_id TEXT NOT NULL,
+        author_sequence INTEGER NOT NULL CHECK(author_sequence>0),protocol_version INTEGER NOT NULL CHECK(protocol_version>0),
+        schema_version INTEGER NOT NULL CHECK(schema_version>0),event_type TEXT NOT NULL CHECK(event_type='asset.rating.set'),
+        causal_parents_json TEXT NOT NULL CHECK(json_valid(causal_parents_json)),payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+        created_at TEXT NOT NULL,signature TEXT,envelope_json TEXT NOT NULL CHECK(json_valid(envelope_json)),
+        state TEXT NOT NULL CHECK(state IN ('signing','ready')),
+        CHECK((state='signing' AND signature IS NULL) OR (state='ready' AND signature IS NOT NULL)),
+        UNIQUE(library_id,author_peer_id,author_sequence)
+      );
+      CREATE INDEX rating_sync_event_log_library_idx ON rating_sync_event_log(library_id,author_peer_id,author_sequence);
+      CREATE TABLE rating_sync_inbox(
+        event_id TEXT PRIMARY KEY CHECK(length(event_id)=36),peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,author_peer_id TEXT NOT NULL,author_sequence INTEGER NOT NULL CHECK(author_sequence>0),
+        envelope_json TEXT NOT NULL CHECK(json_valid(envelope_json)),state TEXT NOT NULL CHECK(state IN ('pending','applying','applied','unsupported','conflict','rejected')),
+        error_code TEXT,received_at TEXT NOT NULL,accepted_at TEXT,applied_at TEXT,attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
+        next_attempt_at TEXT NOT NULL,UNIQUE(library_id,author_peer_id,author_sequence)
+      );
+      CREATE INDEX rating_sync_inbox_pending_idx ON rating_sync_inbox(library_id,state,author_peer_id,author_sequence);
+      CREATE TABLE rating_sync_conflicts(
+        conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,relay_peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,
+        event_id TEXT NOT NULL,library_id TEXT NOT NULL,author_peer_id TEXT NOT NULL,author_sequence INTEGER NOT NULL CHECK(author_sequence>0),
+        envelope_json TEXT NOT NULL CHECK(json_valid(envelope_json)),error_code TEXT NOT NULL CHECK(length(error_code) BETWEEN 1 AND 64),
+        received_at TEXT NOT NULL,UNIQUE(library_id,author_peer_id)
+      );
+      CREATE INDEX rating_sync_conflicts_author_idx ON rating_sync_conflicts(library_id,author_peer_id,author_sequence);
+      CREATE TABLE rating_sync_outbox(
+        peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,event_id TEXT NOT NULL REFERENCES rating_sync_event_log(event_id) ON DELETE RESTRICT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),next_attempt_at TEXT NOT NULL,last_error TEXT,accepted_at TEXT,PRIMARY KEY(peer_id,event_id)
+      );
+      CREATE INDEX rating_sync_outbox_due_idx ON rating_sync_outbox(peer_id,next_attempt_at,event_id);
+      CREATE TABLE rating_sync_author_heads(
+        library_id TEXT NOT NULL,author_peer_id TEXT NOT NULL,author_sequence INTEGER NOT NULL CHECK(author_sequence>0),
+        event_id TEXT NOT NULL REFERENCES rating_sync_event_log(event_id) ON DELETE RESTRICT,ready INTEGER NOT NULL DEFAULT 1 CHECK(ready IN (0,1)),
+        PRIMARY KEY(library_id,author_peer_id)
+      );
+      CREATE TABLE rating_sync_peer_cursors(
+        library_id TEXT NOT NULL,peer_id TEXT NOT NULL REFERENCES trusted_peers(peer_id) ON DELETE RESTRICT,author_peer_id TEXT NOT NULL,
+        contiguous_sequence INTEGER NOT NULL DEFAULT 0 CHECK(contiguous_sequence>=0),event_id TEXT,updated_at TEXT NOT NULL,
+        PRIMARY KEY(library_id,peer_id,author_peer_id)
+      );
+      CREATE TABLE rating_operations(
+        operation_id TEXT PRIMARY KEY CHECK(length(operation_id)=36),principal_id TEXT NOT NULL,author_peer_id TEXT NOT NULL,
+        library_id TEXT NOT NULL,asset_id TEXT NOT NULL,operation_type TEXT NOT NULL CHECK(operation_type IN ('asset.rating.set','rating.noop')),
+        request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint)=64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+        result_json TEXT NOT NULL CHECK(json_valid(result_json)),created_at TEXT NOT NULL
+      );
+      CREATE INDEX rating_operations_asset_idx ON rating_operations(library_id,asset_id,operation_id);
+      CREATE TABLE rating_values(
+        event_id TEXT PRIMARY KEY REFERENCES rating_sync_event_log(event_id) ON DELETE RESTRICT,library_id TEXT NOT NULL,asset_id TEXT NOT NULL,
+        rating INTEGER CHECK(rating BETWEEN 1 AND 5 OR rating IS NULL),author_peer_id TEXT NOT NULL,created_at TEXT NOT NULL
+      );
+      CREATE INDEX rating_values_asset_idx ON rating_values(library_id,asset_id,event_id);
+      CREATE TABLE rating_observations(
+        event_id TEXT NOT NULL REFERENCES rating_values(event_id) ON DELETE RESTRICT,observed_event_id TEXT NOT NULL REFERENCES rating_values(event_id) ON DELETE RESTRICT,
+        library_id TEXT NOT NULL,asset_id TEXT NOT NULL,PRIMARY KEY(event_id,observed_event_id),CHECK(event_id<>observed_event_id)
+      );
+      CREATE INDEX rating_observations_observed_idx ON rating_observations(observed_event_id);
+      CREATE TABLE asset_rating_projection(
+        library_id TEXT NOT NULL,asset_id TEXT NOT NULL,rating INTEGER CHECK(rating BETWEEN 1 AND 5 OR rating IS NULL),
+        conflict INTEGER NOT NULL CHECK(conflict IN (0,1)),candidates_json TEXT NOT NULL CHECK(json_valid(candidates_json)),
+        PRIMARY KEY(library_id,asset_id)
+      );
+
+      CREATE TRIGGER sync_global_id_registry_no_delete BEFORE DELETE ON sync_global_id_registry
+      BEGIN SELECT RAISE(ABORT,'global event ID registry is retained'); END;
+      CREATE TRIGGER sync_global_id_registry_update_guard BEFORE UPDATE ON sync_global_id_registry
+      WHEN (OLD.event_stream IS NOT NULL AND NEW.event_stream IS NOT OLD.event_stream) OR (OLD.operation_kind IS NOT NULL AND NEW.operation_kind IS NOT OLD.operation_kind) OR
+        (NEW.event_stream IS NOT NULL AND NEW.operation_kind IS NOT NULL AND NOT (
+          (NEW.event_stream='virtual-albums-v1' AND NEW.operation_kind IN ('album-operation','album-lifecycle')) OR
+          (NEW.event_stream='asset-favorites-v1' AND NEW.operation_kind='favorite-operation') OR
+          (NEW.event_stream='asset-ratings-v1' AND NEW.operation_kind='rating-operation')))
+      BEGIN SELECT RAISE(ABORT,'global event ID registry identity is immutable'); END;
+      CREATE TRIGGER sync_event_global_id_guard BEFORE INSERT ON sync_event_log
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND (r.event_stream IS NOT 'asset-metadata-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER sync_event_global_id_register AFTER INSERT ON sync_event_log
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'asset-metadata-v1',NULL); END;
+      CREATE TRIGGER sync_inbox_global_id_guard BEFORE INSERT ON sync_inbox
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND (r.event_stream IS NOT 'asset-metadata-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER sync_inbox_global_id_register AFTER INSERT ON sync_inbox
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'asset-metadata-v1',NULL); END;
+      CREATE TRIGGER tag_sync_event_global_id_guard BEFORE INSERT ON tag_sync_event_log
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND (r.event_stream IS NOT 'asset-tags-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER tag_sync_event_global_id_register AFTER INSERT ON tag_sync_event_log
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'asset-tags-v1',NULL); END;
+      CREATE TRIGGER tag_sync_inbox_global_id_guard BEFORE INSERT ON tag_sync_inbox
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND (r.event_stream IS NOT 'asset-tags-v1' OR r.operation_kind IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER tag_sync_inbox_global_id_register AFTER INSERT ON tag_sync_inbox
+      BEGIN INSERT OR IGNORE INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'asset-tags-v1',NULL); END;
+      CREATE TRIGGER album_sync_event_global_id_guard BEFORE INSERT ON album_sync_event_log
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'virtual-albums-v1') OR r.operation_kind='album-visibility' OR
+         (r.operation_kind='album-operation' AND NOT EXISTS(SELECT 1 FROM album_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type IN ('album.created','member.added','member.removed'))) OR
+         (r.operation_kind='album-lifecycle' AND NOT EXISTS(SELECT 1 FROM album_lifecycle_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type IN ('album.deleted','album.restored')))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER album_sync_event_global_id_register AFTER INSERT ON album_sync_event_log
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'virtual-albums-v1',NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream='virtual-albums-v1' WHERE sync_global_id_registry.event_stream IS NULL; END;
+      CREATE TRIGGER album_sync_inbox_global_id_guard BEFORE INSERT ON album_sync_inbox
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'virtual-albums-v1') OR r.operation_kind='album-visibility' OR
+         (r.operation_kind='album-operation' AND NOT EXISTS(SELECT 1 FROM album_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type IN ('album.created','member.added','member.removed'))) OR
+         (r.operation_kind='album-lifecycle' AND NOT EXISTS(SELECT 1 FROM album_lifecycle_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type IN ('album.deleted','album.restored')))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER album_sync_inbox_global_id_register AFTER INSERT ON album_sync_inbox
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'virtual-albums-v1',NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream='virtual-albums-v1' WHERE sync_global_id_registry.event_stream IS NULL; END;
+      CREATE TRIGGER album_operations_global_id_guard BEFORE INSERT ON album_operations
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.operation_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'virtual-albums-v1') OR r.operation_kind IS NOT NULL OR
+         (r.event_stream='virtual-albums-v1' AND NOT EXISTS(SELECT 1 FROM album_sync_inbox i WHERE i.event_id=NEW.operation_id AND i.state='applying' AND
+           i.library_id=NEW.library_id AND i.author_peer_id=NEW.author_peer_id AND json_extract(i.envelope_json,'$.payload.albumId')=NEW.album_id AND
+           (NEW.operation_type<>'member.added' OR json_extract(i.envelope_json,'$.eventType')='album.member.added') AND
+           (NEW.operation_type<>'member.removed' OR json_extract(i.envelope_json,'$.eventType')='album.member.removed') AND
+           (NEW.operation_type<>'album.created' OR json_extract(i.envelope_json,'$.eventType')='album.created')))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER album_operations_global_id_register AFTER INSERT ON album_operations
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind)
+        VALUES(NEW.operation_id,CASE WHEN NEW.operation_type IN ('album.created','member.added','member.removed') THEN 'virtual-albums-v1' ELSE NULL END,'album-operation')
+        ON CONFLICT(global_id) DO UPDATE SET operation_kind='album-operation',event_stream=COALESCE(sync_global_id_registry.event_stream,excluded.event_stream)
+        WHERE sync_global_id_registry.operation_kind IS NULL AND (sync_global_id_registry.event_stream IS NULL OR sync_global_id_registry.event_stream='virtual-albums-v1'); END;
+      CREATE TRIGGER album_lifecycle_global_id_guard BEFORE INSERT ON album_lifecycle_operations
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.operation_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'virtual-albums-v1') OR r.operation_kind IS NOT NULL OR
+         (r.event_stream='virtual-albums-v1' AND NOT EXISTS(SELECT 1 FROM album_sync_inbox i WHERE i.event_id=NEW.operation_id AND i.state='applying' AND
+           i.library_id=NEW.library_id AND i.author_peer_id=NEW.author_peer_id AND json_extract(i.envelope_json,'$.payload.albumId')=NEW.album_id AND json_extract(i.envelope_json,'$.eventType')=NEW.operation_type))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER album_lifecycle_global_id_register AFTER INSERT ON album_lifecycle_operations
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind)
+        VALUES(NEW.operation_id,CASE WHEN NEW.operation_type IN ('album.deleted','album.restored') THEN 'virtual-albums-v1' ELSE NULL END,'album-lifecycle')
+        ON CONFLICT(global_id) DO UPDATE SET operation_kind='album-lifecycle',event_stream=COALESCE(sync_global_id_registry.event_stream,excluded.event_stream)
+        WHERE sync_global_id_registry.operation_kind IS NULL AND (sync_global_id_registry.event_stream IS NULL OR sync_global_id_registry.event_stream='virtual-albums-v1'); END;
+      CREATE TRIGGER album_visibility_global_id_guard BEFORE INSERT ON album_visibility_operations
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry WHERE global_id=NEW.operation_id)
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER album_visibility_global_id_register AFTER INSERT ON album_visibility_operations
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.operation_id,NULL,'album-visibility'); END;
+      CREATE TRIGGER favorite_sync_event_global_id_guard BEFORE INSERT ON favorite_sync_event_log
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'asset-favorites-v1') OR (r.operation_kind IS NOT NULL AND r.operation_kind<>'favorite-operation') OR
+         (r.operation_kind='favorite-operation' AND NOT EXISTS(SELECT 1 FROM favorite_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type IN ('asset.favorite.added','asset.favorite.removed')))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER favorite_sync_event_global_id_register AFTER INSERT ON favorite_sync_event_log
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'asset-favorites-v1',NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream='asset-favorites-v1' WHERE sync_global_id_registry.event_stream IS NULL; END;
+      CREATE TRIGGER favorite_sync_inbox_global_id_guard BEFORE INSERT ON favorite_sync_inbox
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'asset-favorites-v1') OR (r.operation_kind IS NOT NULL AND r.operation_kind<>'favorite-operation') OR
+         (r.operation_kind='favorite-operation' AND NOT EXISTS(SELECT 1 FROM favorite_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type IN ('asset.favorite.added','asset.favorite.removed')))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER favorite_sync_inbox_global_id_register AFTER INSERT ON favorite_sync_inbox
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind) VALUES(NEW.event_id,'asset-favorites-v1',NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream='asset-favorites-v1' WHERE sync_global_id_registry.event_stream IS NULL; END;
+      CREATE TRIGGER favorite_operations_global_id_guard BEFORE INSERT ON favorite_operations
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.operation_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'asset-favorites-v1') OR (r.operation_kind IS NOT NULL AND r.operation_kind<>'favorite-operation') OR
+         (r.event_stream='asset-favorites-v1' AND NOT EXISTS(SELECT 1 FROM favorite_sync_event_log e WHERE e.event_id=NEW.operation_id AND e.library_id=NEW.library_id AND e.author_peer_id=NEW.author_peer_id AND e.event_type=NEW.operation_type
+           UNION ALL SELECT 1 FROM favorite_sync_inbox i WHERE i.event_id=NEW.operation_id AND i.state='applying' AND i.library_id=NEW.library_id AND i.author_peer_id=NEW.author_peer_id AND json_extract(i.envelope_json,'$.eventType')=NEW.operation_type))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER favorite_operations_global_id_register AFTER INSERT ON favorite_operations
+      BEGIN INSERT INTO sync_global_id_registry(global_id,event_stream,operation_kind)
+        VALUES(NEW.operation_id,CASE WHEN NEW.operation_type IN ('asset.favorite.added','asset.favorite.removed') THEN 'asset-favorites-v1' ELSE NULL END,'favorite-operation')
+        ON CONFLICT(global_id) DO UPDATE SET operation_kind='favorite-operation',event_stream=COALESCE(sync_global_id_registry.event_stream,excluded.event_stream)
+        WHERE sync_global_id_registry.operation_kind IS NULL AND (sync_global_id_registry.event_stream IS NULL OR sync_global_id_registry.event_stream='asset-favorites-v1'); END;
+      CREATE TRIGGER rating_sync_event_global_id_guard BEFORE INSERT ON rating_sync_event_log
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'asset-ratings-v1') OR (r.operation_kind IS NOT NULL AND r.operation_kind<>'rating-operation') OR
+         (r.operation_kind='rating-operation' AND NOT EXISTS(SELECT 1 FROM rating_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type='asset.rating.set'))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER rating_sync_event_global_id_register AFTER INSERT ON rating_sync_event_log
+      BEGIN INSERT INTO sync_global_id_registry VALUES(NEW.event_id,'asset-ratings-v1',NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream='asset-ratings-v1' WHERE sync_global_id_registry.event_stream IS NULL; END;
+      CREATE TRIGGER rating_sync_inbox_global_id_guard BEFORE INSERT ON rating_sync_inbox
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.event_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'asset-ratings-v1') OR (r.operation_kind IS NOT NULL AND r.operation_kind<>'rating-operation') OR
+         (r.operation_kind='rating-operation' AND NOT EXISTS(SELECT 1 FROM rating_operations o WHERE o.operation_id=NEW.event_id AND o.operation_type='asset.rating.set'))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER rating_sync_inbox_global_id_register AFTER INSERT ON rating_sync_inbox
+      BEGIN INSERT INTO sync_global_id_registry VALUES(NEW.event_id,'asset-ratings-v1',NULL)
+        ON CONFLICT(global_id) DO UPDATE SET event_stream='asset-ratings-v1' WHERE sync_global_id_registry.event_stream IS NULL; END;
+      CREATE TRIGGER rating_operations_global_id_guard BEFORE INSERT ON rating_operations
+      WHEN EXISTS(SELECT 1 FROM sync_global_id_registry r WHERE r.global_id=NEW.operation_id AND
+        ((r.event_stream IS NOT NULL AND r.event_stream<>'asset-ratings-v1') OR (r.operation_kind IS NOT NULL AND r.operation_kind<>'rating-operation') OR
+         (r.event_stream='asset-ratings-v1' AND NOT EXISTS(
+           SELECT 1 FROM rating_sync_event_log e WHERE e.event_id=NEW.operation_id AND e.library_id=NEW.library_id AND e.author_peer_id=NEW.author_peer_id AND e.event_type=NEW.operation_type
+           UNION ALL SELECT 1 FROM rating_sync_inbox i WHERE i.event_id=NEW.operation_id AND i.state='applying' AND i.library_id=NEW.library_id AND i.author_peer_id=NEW.author_peer_id AND json_extract(i.envelope_json,'$.eventType')=NEW.operation_type))))
+      BEGIN SELECT RAISE(ABORT,'global event ID collision'); END;
+      CREATE TRIGGER rating_operations_global_id_register AFTER INSERT ON rating_operations
+      BEGIN INSERT INTO sync_global_id_registry VALUES(NEW.operation_id,CASE WHEN NEW.operation_type='asset.rating.set' THEN 'asset-ratings-v1' ELSE NULL END,'rating-operation')
+        ON CONFLICT(global_id) DO UPDATE SET operation_kind='rating-operation',event_stream=COALESCE(sync_global_id_registry.event_stream,excluded.event_stream)
+        WHERE sync_global_id_registry.operation_kind IS NULL AND (sync_global_id_registry.event_stream IS NULL OR sync_global_id_registry.event_stream='asset-ratings-v1'); END;
+
+      CREATE TRIGGER rating_sync_event_identity_guard BEFORE UPDATE ON rating_sync_event_log
+      WHEN NEW.event_id IS NOT OLD.event_id OR NEW.library_id IS NOT OLD.library_id OR NEW.author_peer_id IS NOT OLD.author_peer_id OR
+        NEW.author_sequence IS NOT OLD.author_sequence OR NEW.protocol_version IS NOT OLD.protocol_version OR NEW.schema_version IS NOT OLD.schema_version OR
+        NEW.event_type IS NOT OLD.event_type OR NEW.causal_parents_json IS NOT OLD.causal_parents_json OR NEW.payload_json IS NOT OLD.payload_json OR
+        NEW.created_at IS NOT OLD.created_at OR OLD.state<>'signing' OR NEW.state<>'ready'
+      BEGIN SELECT RAISE(ABORT,'rating sync event identity is immutable'); END;
+      CREATE TRIGGER rating_sync_event_no_delete BEFORE DELETE ON rating_sync_event_log BEGIN SELECT RAISE(ABORT,'rating sync event deletion is disabled'); END;
+      CREATE TRIGGER rating_sync_inbox_identity_guard BEFORE UPDATE ON rating_sync_inbox
+      WHEN NEW.event_id IS NOT OLD.event_id OR NEW.peer_id IS NOT OLD.peer_id OR NEW.library_id IS NOT OLD.library_id OR
+        NEW.author_peer_id IS NOT OLD.author_peer_id OR NEW.author_sequence IS NOT OLD.author_sequence OR NEW.envelope_json IS NOT OLD.envelope_json
+      BEGIN SELECT RAISE(ABORT,'rating sync inbox identity is immutable'); END;
+      CREATE TRIGGER rating_sync_conflicts_no_update BEFORE UPDATE ON rating_sync_conflicts BEGIN SELECT RAISE(ABORT,'rating sync conflicts are immutable'); END;
+      CREATE TRIGGER rating_sync_conflicts_no_delete BEFORE DELETE ON rating_sync_conflicts BEGIN SELECT RAISE(ABORT,'rating sync conflicts cannot be deleted'); END;
+      CREATE TRIGGER rating_operations_no_update BEFORE UPDATE ON rating_operations BEGIN SELECT RAISE(ABORT,'rating operations are immutable'); END;
+      CREATE TRIGGER rating_operations_no_delete BEFORE DELETE ON rating_operations BEGIN SELECT RAISE(ABORT,'rating operations are retained'); END;
+      CREATE TRIGGER rating_values_no_update BEFORE UPDATE ON rating_values BEGIN SELECT RAISE(ABORT,'rating values are immutable'); END;
+      CREATE TRIGGER rating_values_no_delete BEFORE DELETE ON rating_values BEGIN SELECT RAISE(ABORT,'rating history is retained'); END;
+      CREATE TRIGGER rating_observations_no_update BEFORE UPDATE ON rating_observations BEGIN SELECT RAISE(ABORT,'rating observations are immutable'); END;
+      CREATE TRIGGER rating_observations_no_delete BEFORE DELETE ON rating_observations BEGIN SELECT RAISE(ABORT,'rating observations are retained'); END;
+      CREATE TRIGGER rating_author_limit BEFORE INSERT ON rating_operations
+      WHEN NEW.operation_type='asset.rating.set' AND NOT EXISTS(SELECT 1 FROM rating_sync_author_registry WHERE library_id=NEW.library_id AND author_peer_id=NEW.author_peer_id) AND
+        (SELECT count(*) FROM rating_sync_author_registry WHERE library_id=NEW.library_id)>=64
+      BEGIN SELECT RAISE(ABORT,'rating_author_limit'); END;
+      CREATE TRIGGER rating_author_register AFTER INSERT ON rating_operations WHEN NEW.operation_type='asset.rating.set'
+      BEGIN INSERT OR IGNORE INTO rating_sync_author_registry VALUES(NEW.library_id,NEW.author_peer_id,NEW.created_at); END;
+      CREATE TRIGGER rating_operation_scope_guard BEFORE INSERT ON rating_operations
+      WHEN NEW.operation_type='asset.rating.set' AND NOT EXISTS(
+        SELECT 1 FROM assets a WHERE a.library_id=NEW.library_id AND a.asset_id=NEW.asset_id AND NOT EXISTS(SELECT 1 FROM sync_asset_projection p WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id AND p.tombstone_event_id IS NOT NULL)
+        UNION ALL SELECT 1 FROM sync_asset_projection p WHERE p.library_id=NEW.library_id AND p.asset_id=NEW.asset_id AND p.tombstone_event_id IS NULL AND NOT EXISTS(SELECT 1 FROM assets a WHERE a.library_id=p.library_id AND a.asset_id=p.asset_id)
+        UNION ALL SELECT 1 FROM rating_sync_inbox i WHERE i.event_id=NEW.operation_id AND i.state='applying' AND i.library_id=NEW.library_id AND i.author_peer_id=NEW.author_peer_id AND json_extract(i.envelope_json,'$.payload.assetId')=NEW.asset_id AND json_extract(i.envelope_json,'$.eventType')='asset.rating.set')
+      BEGIN SELECT RAISE(ABORT,'rating_operation_scope_mismatch'); END;
+      CREATE TRIGGER rating_value_guard BEFORE INSERT ON rating_values
+      WHEN NOT EXISTS(SELECT 1 FROM rating_operations o JOIN rating_sync_event_log e ON e.event_id=o.operation_id WHERE o.operation_id=NEW.event_id AND o.operation_type='asset.rating.set' AND o.library_id=NEW.library_id AND o.asset_id=NEW.asset_id AND o.author_peer_id=NEW.author_peer_id AND e.event_type='asset.rating.set')
+      BEGIN SELECT RAISE(ABORT,'rating_value_scope_mismatch'); END;
+      CREATE TRIGGER rating_observation_guard BEFORE INSERT ON rating_observations
+      WHEN NOT EXISTS(SELECT 1 FROM rating_values n JOIN rating_values o ON o.event_id=NEW.observed_event_id WHERE n.event_id=NEW.event_id AND n.library_id=NEW.library_id AND o.library_id=NEW.library_id AND n.asset_id=NEW.asset_id AND o.asset_id=NEW.asset_id)
+      BEGIN SELECT RAISE(ABORT,'rating_observation_scope_mismatch'); END;
+      CREATE TRIGGER asset_rating_projection_scope_guard BEFORE INSERT ON asset_rating_projection
+      WHEN NOT EXISTS(SELECT 1 FROM assets a WHERE a.library_id=NEW.library_id AND a.asset_id=NEW.asset_id AND NOT EXISTS(SELECT 1 FROM sync_asset_projection p WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id AND p.tombstone_event_id IS NOT NULL)
+        UNION ALL SELECT 1 FROM sync_asset_projection p WHERE p.library_id=NEW.library_id AND p.asset_id=NEW.asset_id AND p.tombstone_event_id IS NULL)
+      BEGIN SELECT RAISE(ABORT,'rating projection requires visible asset'); END;
+    `
   }
 ];

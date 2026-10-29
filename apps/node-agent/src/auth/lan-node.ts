@@ -14,6 +14,7 @@ import { isSyncExchangeRequest, SYNC_PROTOCOL, SyncService, type SyncExchangeReq
 import { isTagSyncExchangeRequest, TAG_SYNC_CAPABILITY, TAG_SYNC_PROTOCOL, TagSyncService, type TagSyncExchangeRequest, type TagSyncExchangeResponse, type TagSyncTransport } from '../sync/tag-sync-service.js';
 import { ALBUM_SYNC_CAPABILITY, ALBUM_SYNC_PROTOCOL, AlbumSyncService, isAlbumSyncExchangeRequest, type AlbumSyncExchangeRequest, type AlbumSyncExchangeResponse, type AlbumSyncTransport } from '../sync/album-sync-service.js';
 import { FAVORITE_SYNC_CAPABILITY, FAVORITE_SYNC_PROTOCOL, FavoriteSyncService, isFavoriteSyncExchangeRequest, type FavoriteSyncExchangeRequest, type FavoriteSyncExchangeResponse, type FavoriteSyncTransport } from '../sync/favorite-sync-service.js';
+import { RATING_SYNC_CAPABILITY, RATING_SYNC_PROTOCOL, RatingSyncService, isRatingSyncExchangeRequest, type RatingSyncExchangeRequest, type RatingSyncExchangeResponse, type RatingSyncTransport } from '../sync/rating-sync-service.js';
 
 const PAIR_PROTOCOL = '/photomesh/pairing/1.0.0';
 const INDEX_PROTOCOL = '/photomesh/library-index/1.0.0';
@@ -22,6 +23,7 @@ const MAX_SYNC_FRAME_BYTES = 18 * 1024 * 1024;
 const MAX_TAG_SYNC_FRAME_BYTES = 18 * 1024 * 1024;
 const MAX_ALBUM_SYNC_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_FAVORITE_SYNC_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_RATING_SYNC_FRAME_BYTES = 16 * 1024 * 1024;
 
 export interface DiscoveredPeer { peerId: string; addresses: string[] }
 
@@ -35,9 +37,10 @@ export interface LanNodeOptions {
   tagSyncService?: TagSyncService;
   albumSyncService?: AlbumSyncService;
   favoriteSyncService?: FavoriteSyncService;
+  ratingSyncService?: RatingSyncService;
 }
 
-export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyncTransport, FavoriteSyncTransport {
+export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyncTransport, FavoriteSyncTransport, RatingSyncTransport {
   private readonly discovered = new Map<string, Set<string>>();
   private readonly syncTasks = new Map<string, Promise<{ rounds: number; received: number; sent: number }>>();
   private syncTimer: ReturnType<typeof setInterval> | undefined;
@@ -51,17 +54,20 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyn
     private readonly syncService?: SyncService,
     private readonly tagSyncService?: TagSyncService,
     private readonly albumSyncService?: AlbumSyncService,
-    private readonly favoriteSyncService?: FavoriteSyncService
+    private readonly favoriteSyncService?: FavoriteSyncService,
+    private readonly ratingSyncService?: RatingSyncService
   ) {}
 
   static async start(options: LanNodeOptions): Promise<LanPairingNode> {
-    if ((options.tagSyncService || options.albumSyncService || options.favoriteSyncService) && !options.syncService) throw new Error('extension sync requires event sync capability negotiation');
+    if ((options.tagSyncService || options.albumSyncService || options.favoriteSyncService || options.ratingSyncService) && !options.syncService) throw new Error('extension sync requires event sync capability negotiation');
     const advertisesTagSync = options.syncService?.hello().capabilities.includes(TAG_SYNC_CAPABILITY) ?? false;
     if (advertisesTagSync !== Boolean(options.tagSyncService)) throw new Error('tag sync capability must match its transport handler');
     const advertisesAlbumSync = options.syncService?.hello().capabilities.includes(ALBUM_SYNC_CAPABILITY) ?? false;
     if (advertisesAlbumSync !== Boolean(options.albumSyncService)) throw new Error('album sync capability must match its transport handler');
     const advertisesFavoriteSync = options.syncService?.hello().capabilities.includes(FAVORITE_SYNC_CAPABILITY) ?? false;
     if (advertisesFavoriteSync !== Boolean(options.favoriteSyncService)) throw new Error('favorite sync capability must match its transport handler');
+    const advertisesRatingSync = options.syncService?.hello().capabilities.includes(RATING_SYNC_CAPABILITY) ?? false;
+    if (advertisesRatingSync !== Boolean(options.ratingSyncService)) throw new Error('rating sync capability must match its transport handler');
     const privateAddresses = [...new Set(options.listenAddresses)].map(normalizePrivateLanAddress);
     if (privateAddresses.length === 0) throw new Error('explicit private LAN listen addresses are required');
     const node = await createLibp2p({
@@ -69,7 +75,7 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyn
       addresses: { listen: privateAddresses.map((address) => `${address}/tcp/${options.listenPort ?? 0}`) },
       transports: [tcp()], connectionEncrypters: [noise()], streamMuxers: [yamux()], peerDiscovery: [mdns()]
     });
-    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey, options.syncService, options.tagSyncService, options.albumSyncService, options.favoriteSyncService);
+    const lan = new LanPairingNode(node, options.pairing, options.identity.publicKey, options.syncService, options.tagSyncService, options.albumSyncService, options.favoriteSyncService, options.ratingSyncService);
     node.addEventListener('peer:discovery', (event) => {
       const detail = event.detail as { id: { toString(): string }; multiaddrs?: Array<{ toString(): string }> };
       const peerId = detail.id.toString();
@@ -153,6 +159,16 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyn
         await writeFrame(stream, { ...response }, MAX_FAVORITE_SYNC_FRAME_BYTES);
       } catch {
         await writeFrame(stream, { ok: false, error: 'favorite_sync_rejected' }, MAX_FAVORITE_SYNC_FRAME_BYTES).catch(() => undefined);
+      }
+    });
+    if (options.ratingSyncService) node.handle(RATING_SYNC_PROTOCOL, async (stream, connection) => {
+      try {
+        const message = await readFrame(stream, MAX_RATING_SYNC_FRAME_BYTES);
+        if (!isRatingSyncExchangeRequest(message)) throw new Error('invalid rating sync request');
+        const response = await options.ratingSyncService!.handleExchange(connection.remotePeer.toString(), message);
+        await writeFrame(stream, { ...response }, MAX_RATING_SYNC_FRAME_BYTES);
+      } catch {
+        await writeFrame(stream, { ok: false, error: 'rating_sync_rejected' }, MAX_RATING_SYNC_FRAME_BYTES).catch(() => undefined);
       }
     });
     await node.start();
@@ -249,6 +265,14 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyn
     return response as unknown as FavoriteSyncExchangeResponse;
   }
 
+  async exchangeRatings(peerId: string, request: RatingSyncExchangeRequest): Promise<RatingSyncExchangeResponse> {
+    const stream = await this.node.dialProtocol(peerIdFromString(peerId), RATING_SYNC_PROTOCOL);
+    await writeFrame(stream, { ...request }, MAX_RATING_SYNC_FRAME_BYTES);
+    const response = await readFrame(stream, MAX_RATING_SYNC_FRAME_BYTES);
+    if (response.ok === false || typeof response.hello !== 'object' || response.hello === null) throw new Error('peer rejected rating sync exchange');
+    return response as unknown as RatingSyncExchangeResponse;
+  }
+
   async syncWithPeer(peerId: string): Promise<{ rounds: number; received: number; sent: number }> {
     if (this.stopping) throw new Error('LAN node is stopping');
     if (!this.syncService) throw new Error('event sync is not configured');
@@ -275,6 +299,13 @@ export class LanPairingNode implements SyncTransport, TagSyncTransport, AlbumSyn
           await this.favoriteSyncService.syncWithPeer(peerId, this);
         } else {
           this.favoriteSyncService.markPeerUnsupported(peerId);
+        }
+      }
+      if (this.ratingSyncService) {
+        if (this.syncService!.peerSupportsCapability(peerId, RATING_SYNC_CAPABILITY)) {
+          await this.ratingSyncService.syncWithPeer(peerId, this);
+        } else {
+          this.ratingSyncService.markPeerUnsupported(peerId);
         }
       }
       return result;

@@ -28,7 +28,7 @@ describe('PM-046 asset favorite migration and global event IDs', () => {
       insertMetadataEvent(db, uuid(1));
       const before = db.prepare('SELECT migration_id, checksum FROM schema_migrations ORDER BY migration_id').all();
       const repo = new SqliteRepository(db, { backupBeforeMigration: async () => undefined });
-      await repo.migrate();
+      await repo.migrate(migrations.slice(0, 9));
       const latest = db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id DESC LIMIT 1').get();
       expect(latest).toEqual({ migration_id: '0009_asset_favorites' });
       expect(db.prepare(`SELECT migration_id, checksum FROM schema_migrations WHERE migration_id <> '0009_asset_favorites' ORDER BY migration_id`).all()).toEqual(before);

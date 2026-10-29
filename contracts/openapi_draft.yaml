@@ -387,6 +387,41 @@ paths:
         '409': {description: Idempotency conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '503': {description: Favorite capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/assets/{assetId}/rating:
+     parameters:
+       - in: path
+         name: libraryId
+         required: true
+         schema: {type: string, minLength: 1, maxLength: 128}
+       - in: path
+         name: assetId
+         required: true
+         schema: {type: string, minLength: 1, maxLength: 128}
+     put:
+       operationId: setAssetRating
+       summary: Set the shared library-wide rating for an authorized asset
+       parameters:
+         - $ref: '#/components/parameters/RatingIdempotencyKey'
+       requestBody:
+         required: true
+         content:
+           application/json:
+             schema: {$ref: '#/components/schemas/AssetRatingSetRequest'}
+       responses:
+         '200':
+           description: Shared rating and current MV-register conflict candidates; no author or principal identity is disclosed.
+           headers:
+             Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+             X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+           content:
+             application/json:
+               schema: {$ref: '#/components/schemas/AssetRatingState'}
+         '400': {description: Invalid body or Idempotency-Key, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '403': {description: Library authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '404': {description: 'Asset absent, hidden, or tombstoned', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '409': {description: 'Idempotency conflict, rating-author limit, or active conflict-candidate limit reached', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '503': {description: Rating capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}:
     parameters:
       - in: path
@@ -1154,6 +1189,69 @@ paths:
         '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      operationId: grantRatingWrite
+      summary: Grant a trusted peer default-deny rating-write authority for one library
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: 'Peer is not trusted, lacks a library-read grant, or the 64-author limit is reached; revoked author slots remain reserved', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      operationId: revokeRatingWrite
+      summary: Revoke a peer's future rating writes without retracting accepted events
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/libraries/{libraryId}/rating-sync-grants:
+    get:
+      operationId: listRatingSyncGrants
+      summary: List active rating-write grants for one library
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Active grant records only, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantList'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/rating-sync-status:
+    get:
+      operationId: getRatingSyncStatus
+      summary: Get rating sync queue count and enumerated error status for a peer
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Operational counters and fixed error code only, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncPeerStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/pairing/discovered:
     get:
       summary: 获取 mDNS 发现的未信任节点地址（发现不代表信任）
@@ -1380,6 +1478,12 @@ components:
       required: true
       description: UUID operation ID globally unique across libraries, resources and mutation types; retained durably for replay.
       schema: {type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+    RatingIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID operation ID for idempotent shared rating mutation.
+      schema: {type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
   schemas:
     Album:
       type: object
@@ -1545,6 +1649,59 @@ components:
          peerId: {type: string, minLength: 1, maxLength: 128}
          pendingEvents: {type: integer, minimum: 0}
          lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
+    NullableRatingValue:
+      anyOf:
+        - type: integer
+          minimum: 1
+          maximum: 5
+        - type: 'null'
+    AssetRatingSetRequest:
+      type: object
+      additionalProperties: false
+      required: [rating]
+      properties:
+        rating: {$ref: '#/components/schemas/NullableRatingValue', description: Integer from 1 to 5, or explicit null to clear.}
+    AssetRatingState:
+      type: object
+      additionalProperties: false
+      required: [rating, ratingConflict, ratingCandidates]
+      properties:
+        rating: {$ref: '#/components/schemas/NullableRatingValue'}
+        ratingConflict: {type: boolean}
+        ratingCandidates:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/NullableRatingValue'}
+    RatingSyncGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: {type: boolean, const: true, description: Grant enabled; revoke using DELETE.}
+    RatingSyncGrantStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, libraryId, permission, granted]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        permission: {type: string, const: rating-write}
+        granted: {type: boolean}
+    RatingSyncGrantList:
+      type: object
+      additionalProperties: false
+      required: [grants]
+      properties:
+        grants: {type: array, maxItems: 64, items: {$ref: '#/components/schemas/RatingSyncGrantStatus'}}
+    RatingSyncPeerStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, pendingEvents, lastErrorCode]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        pendingEvents: {type: integer, minimum: 0}
+        lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
     NodeDiagnostics:
       type: object
       additionalProperties: false
@@ -1570,10 +1727,10 @@ components:
         capabilities:
           type: array
           uniqueItems: true
-          maxItems: 8
+          maxItems: 15
           items:
             type: string
-            enum: [rest, mediaVersions, thumbnails, assetTags, virtualAlbums, assetFavorites, favoriteSync, tagSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
+            enum: [rest, mediaVersions, thumbnails, assetTags, virtualAlbums, assetFavorites, favoriteSync, tagSync, assetRatings, ratingSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
     PairingInvite:
       type: object
       required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]
@@ -1647,7 +1804,7 @@ components:
         items: {type: array, items: {$ref: '#/components/schemas/Library'}}
     Asset:
       type: object
-      required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version, tags]
+      required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version, tags, rating, ratingConflict, ratingCandidates]
       properties:
         assetId: {type: string}
         libraryId: {type: string}
@@ -1673,6 +1830,14 @@ components:
         favorite:
           type: boolean
           description: Library-wide shared favorite state (not a personal bookmark); absent on pre-PM-046 Nodes without the assetFavorites diagnostic capability.
+        rating: {$ref: '#/components/schemas/NullableRatingValue', description: Current shared library-wide rating; null when clear or conflicted.}
+        ratingConflict: {type: boolean, description: True when multiple concurrent rating candidates remain unresolved.}
+        ratingCandidates:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: Current causal MV-register candidates, without author or principal identity.
+          items: {$ref: '#/components/schemas/NullableRatingValue'}
     AssetPage:
       type: object
       required: [items]
@@ -1801,7 +1966,7 @@ components:
           type: string
           minLength: 1
           description: Stable machine-readable error code; unknown values are possible. This example list is not closed.
-          examples: [invalid_request, forbidden, not_found, capability_unavailable, writer_limit_reached, thumbnail_invalid, source_offline, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
+          examples: [invalid_request, forbidden, not_found, capability_unavailable, writer_limit_reached, thumbnail_invalid, source_offline, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, conflict, rating_conflict_limit, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
         requestId:
           type: string
           minLength: 1

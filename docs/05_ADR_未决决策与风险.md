@@ -164,3 +164,10 @@
 - **决定：** 采用图库级共享收藏以保留 PRD §3.4 的事件同步要求；独立 `asset-favorites-v1` capability/stream；OR-Set observed-remove；新增默认拒绝 `favorite-write` grant；远端撤权拒绝新事件、已经持久接受的 pending event 按接收时授权继续；PM-047 单独处理评分。
 - **兼容/迁移：** append-only `0009_asset_favorites`，扩展全局 UUID registry 及所有 writer guards；N-1 不阻塞共同 streams；隔离 SQLite 做备份失败、历史 ID 冲突、旧 binary 和恢复测试。
 - **边界：** 批准仅限隔离 PM-046 分支的协议/API/schema实现、测试及本地提交；不运行生产迁移、不 push/merge/release。若将来改选个人收藏，须先补稳定的人类身份/ACL；改选 local-only 须先修订 PRD §3.4。
+
+## ADR-020：PM-047 图库级共享评分与并发冲突
+
+- **状态：** 用户于2026-10-29批准推荐默认。详见 [`ADR-020`](adr/ADR-020-pm047-library-ratings.md)。Node Peer ID 仅标识设备/签名作者，不代表人类用户。
+- **决定：** 图库级共享评分；值为整数1–5或null；独立 `asset-ratings-v1` stream 与默认拒绝 `rating-write` grant；基于因果多值寄存器保存并发候选，冲突可见、仅由显式解决事件消解，不采用墙钟 LWW。
+- **兼容/迁移：** 仅追加 `0010_asset_ratings`；N-1 不阻塞共同 streams；持久化幂等操作、因果 inbox/outbox、连续接受游标、冲突历史和可重建投影；只在隔离 DB 运行备份失败与升级/恢复测试。
+- **边界：** 批准仅限隔离 PM-047 分支的 API/schema/protocol实现、测试及本地提交；不运行生产迁移、不 push/merge/release。真实 per-user rating 等到稳定的人类身份/ACL 已有独立方案后另行决定。

@@ -29,6 +29,8 @@ import { AlbumSyncRepository } from './sync/album-sync-repository.js';
 import { AlbumSyncService } from './sync/album-sync-service.js';
 import { FavoriteSyncRepository } from './sync/favorite-sync-repository.js';
 import { FavoriteSyncService } from './sync/favorite-sync-service.js';
+import { RatingSyncRepository } from './sync/rating-sync-repository.js';
+import { RatingSyncService } from './sync/rating-sync-service.js';
 import { TombstoneRestoreCoordinator } from './sync/restore-coordinator.js';
 import { restoreTombstoneOperation } from './sync/restore-operation.js';
 
@@ -60,6 +62,8 @@ let albumSyncRepository: AlbumSyncRepository | undefined;
 let albumSyncService: AlbumSyncService | undefined;
 let favoriteSyncRepository: FavoriteSyncRepository | undefined;
 let favoriteSyncService: FavoriteSyncService | undefined;
+let ratingSyncRepository: RatingSyncRepository | undefined;
+let ratingSyncService: RatingSyncService | undefined;
 let nodeId = process.env.PHOTOMESH_NODE_ID ?? 'local-node';
 let albumPeerId: string | undefined;
 try {
@@ -74,6 +78,7 @@ try {
   tagSyncRepository = new TagSyncRepository(database);
   albumSyncRepository = new AlbumSyncRepository(database);
   favoriteSyncRepository = new FavoriteSyncRepository(database);
+  ratingSyncRepository = new RatingSyncRepository(database);
   syncService = new SyncService(new SyncRepository(database), identity, pairing, undefined, (event) => {
     const payload = event.payload;
     if (typeof payload === 'object' && payload !== null && !Array.isArray(payload) &&
@@ -82,14 +87,17 @@ try {
       tagSyncRepository!.rebuildAssetTagProjection(event.libraryId, payload.assetId);
       albumSyncRepository!.rebuildMembershipsForAsset(event.libraryId, payload.assetId);
       favoriteSyncRepository!.rebuildFavoriteProjectionForAsset(event.libraryId, payload.assetId);
+      ratingSyncRepository!.rebuildRatingProjectionForAsset(event.libraryId, payload.assetId);
     }
     tagSyncRepository!.reconcilePendingEvents(event.libraryId);
     albumSyncRepository!.reconcilePendingEvents(event.libraryId);
     favoriteSyncRepository!.reconcilePendingEvents(event.libraryId);
-  }, true, Boolean(albumPeerId), Boolean(albumPeerId));
+    ratingSyncRepository!.reconcilePendingEvents(event.libraryId);
+  }, true, Boolean(albumPeerId), Boolean(albumPeerId), Boolean(albumPeerId));
   tagSyncService = new TagSyncService(tagSyncRepository, identity, pairing, () => syncService!.hello());
   albumSyncService = new AlbumSyncService(albumSyncRepository, identity, pairing, () => syncService!.hello());
   favoriteSyncService = new FavoriteSyncService(favoriteSyncRepository, identity, pairing, () => syncService!.hello());
+  ratingSyncService = new RatingSyncService(ratingSyncRepository, identity, pairing, () => syncService!.hello());
   repository.setAlbumOperationEventDrafter((input) => { albumSyncService!.reserveLocalOperation(input); });
   repository.setAlbumLifecycleEventDrafter((input) => { albumSyncService!.reserveLocalLifecycleOperation(input); });
   await syncService.signPendingLocalEvents();
@@ -99,10 +107,12 @@ try {
   await albumSyncService.signPendingLocalEvents();
   favoriteSyncService.reconcilePendingEvents();
   await favoriteSyncService.signPendingLocalEvents();
+  ratingSyncService.reconcilePendingEvents();
+  await ratingSyncService.signPendingLocalEvents();
   const listenAddresses = (process.env.PHOTOMESH_LAN_BIND_ADDRESSES ?? '').split(',').map((value) => value.trim()).filter(Boolean);
   if (listenAddresses.length > 0) {
     lanNode = await LanPairingNode.start({
-      identity, pairing, listenAddresses, syncService, tagSyncService, albumSyncService, favoriteSyncService,
+      identity, pairing, listenAddresses, syncService, tagSyncService, albumSyncService, favoriteSyncService, ratingSyncService,
       listenPort: Number(process.env.PHOTOMESH_P2P_PORT ?? 0)
     });
     process.stdout.write(`PhotoMesh LAN pairing enabled on ${listenAddresses.length} configured interface(s)\n`);
@@ -232,6 +242,27 @@ const pairingControl: PairingServerControl | undefined = pairing && tagSyncRepos
     if (!pairing!.listPeers().some((peer) => peer.peerId === peerId)) return undefined;
     return favoriteSyncRepository!.getPeerSyncStatus(peerId);
   },
+  grantRatingWrite: (peerId, libraryId, grantedAt) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId)) return undefined;
+    if (!pairing!.listPeers().some((peer) => peer.peerId === peerId && peer.trustState === 'trusted')) throw new RepositoryConflictError('peer is not trusted');
+    ratingSyncRepository!.grantRatingWriter(libraryId, peerId, nodeId, grantedAt);
+    return { peerId, libraryId, permission: 'rating-write' as const, granted: true };
+  },
+  revokeRatingWrite: (peerId, libraryId, revokedAt) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId) || !pairing!.listPeers().some((peer) => peer.peerId === peerId)) return undefined;
+    ratingSyncRepository!.revokeRatingWriter(libraryId, peerId, revokedAt);
+    return { peerId, libraryId, permission: 'rating-write' as const, granted: false };
+  },
+  listRatingSyncGrants: (libraryId) => {
+    if (!repository.listGalleryLibraries().some((library) => library.libraryId === libraryId)) return undefined;
+    return { grants: ratingSyncRepository!.listRatingWriters(libraryId).map((peerId) => ({
+      peerId, libraryId, permission: 'rating-write' as const, granted: true
+    })) };
+  },
+  getRatingSyncStatus: (peerId) => {
+    if (!pairing!.listPeers().some((peer) => peer.peerId === peerId)) return undefined;
+    return ratingSyncRepository!.getPeerSyncStatus(peerId);
+  },
   readLibraryIndex: (peerId, libraryId) => pairing!.readLibraryIndex(peerId, libraryId),
   listDiscoveredPeers: () => lanNode?.listDiscoveredPeers() ?? [],
   dialManualIp: async (host, port, peerId) => {
@@ -256,7 +287,8 @@ const server = createNodeAgentServer({
       ...(mediaThumbnailService ? ['thumbnails' as const] : []),
       ...(albumPeerId ? ['virtualAlbums' as const] : []),
       ...(tagSyncService ? ['assetTags' as const] : []),
-      ...(favoriteSyncService ? ['assetFavorites' as const] : [])
+      ...(favoriteSyncService ? ['assetFavorites' as const] : []),
+      ...(ratingSyncService ? ['assetRatings' as const] : [])
     ],
     storageCapabilities: (): DiagnosticCapability[] => ['managedFiles'],
     identityCapabilities: (): DiagnosticCapability[] => [
@@ -264,6 +296,7 @@ const server = createNodeAgentServer({
       ...(syncService ? ['eventSigning' as const] : []),
       ...(tagSyncService ? ['tagSync' as const] : []),
       ...(favoriteSyncService ? ['favoriteSync' as const] : []),
+      ...(ratingSyncService ? ['ratingSync' as const] : []),
       ...(lanNode ? ['lanPairing' as const] : [])
     ]
   },
@@ -319,6 +352,9 @@ const server = createNodeAgentServer({
   } } : {}),
   ...(favoriteSyncService ? { assetFavorites: {
     setAssetFavorite: (input: import('./server.js').AssetFavoriteMutationRequest) => favoriteSyncService!.setAssetFavorite(input)
+  } } : {}),
+  ...(ratingSyncService ? { assetRatings: {
+    setAssetRating: (input: import('./server.js').AssetRatingMutationRequest) => ratingSyncService!.setAssetRating(input)
   } } : {}),
   ...(mediaVersionService ? { mediaVersions: mediaVersionService } : {}),
   ...(mediaThumbnailService ? { thumbnails: {

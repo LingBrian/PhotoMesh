@@ -14,6 +14,7 @@ import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage
 import type { ThumbnailContent } from './media/thumbnail-service.js';
 import { maxThumbnailOutputBytes } from './media/image-transformer.js';
 import { FavoriteSyncConflictError } from './sync/favorite-sync-repository.js';
+import { RatingSyncConflictError } from './sync/rating-sync-repository.js';
 
 export interface UploadAuthorizationRequest {
   token: string | undefined;
@@ -39,6 +40,7 @@ export interface NodeAgentServerOptions {
   albums?: AlbumServerControl;
   assetTags?: AssetTagServerControl;
   assetFavorites?: AssetFavoriteServerControl;
+  assetRatings?: AssetRatingServerControl;
   tagSync?: boolean;
   mediaVersions?: MediaVersionServerControl;
   thumbnails?: ThumbnailServerControl;
@@ -118,6 +120,22 @@ export interface AssetFavoriteServerControl {
   setAssetFavorite(input: AssetFavoriteMutationRequest): AssetFavoriteMutationResult | Promise<AssetFavoriteMutationResult>;
 }
 
+export interface AssetRatingMutationRequest {
+  operationId: string; principalId: string; requestFingerprint: string; libraryId: string; assetId: string;
+  rating: number | null; createdAt: string;
+}
+export interface AssetRatingState { rating: number | null; conflict: boolean; ratingCandidates: Array<number | null> }
+export type AssetRatingMutationResult = (AssetRatingState & { status: 'changed' | 'unchanged' }) |
+  'not_found' | 'author_limit' | 'conflict_limit';
+export interface AssetRatingServerControl {
+  setAssetRating(input: AssetRatingMutationRequest): AssetRatingMutationResult | Promise<AssetRatingMutationResult>;
+}
+
+export type RatingSyncPermission = 'rating-write';
+export interface RatingSyncGrantStatus { peerId: string; libraryId: string; permission: RatingSyncPermission; granted: boolean }
+export interface RatingSyncGrantList { grants: RatingSyncGrantStatus[] }
+export interface RatingSyncPeerStatus { peerId: string; pendingEvents: number; lastErrorCode: 'unauthorized' | 'unavailable' | 'conflict' | null }
+
 export type FavoriteSyncPermission = 'favorite-write';
 export interface FavoriteSyncGrantStatus { peerId: string; libraryId: string; permission: FavoriteSyncPermission; granted: boolean }
 export interface FavoriteSyncGrantList { grants: FavoriteSyncGrantStatus[] }
@@ -150,6 +168,10 @@ export interface PairingServerControl {
   revokeFavoriteWrite?(peerId: string, libraryId: string, revokedAt: string): FavoriteSyncGrantStatus | undefined;
   listFavoriteSyncGrants?(libraryId: string): FavoriteSyncGrantList | undefined;
   getFavoriteSyncStatus?(peerId: string): { pending: number; lastError: string | null } | undefined;
+  grantRatingWrite?(peerId: string, libraryId: string, grantedAt: string): RatingSyncGrantStatus | undefined;
+  revokeRatingWrite?(peerId: string, libraryId: string, revokedAt: string): RatingSyncGrantStatus | undefined;
+  listRatingSyncGrants?(libraryId: string): RatingSyncGrantList | undefined;
+  getRatingSyncStatus?(peerId: string): { pending: number; lastError: string | null } | undefined;
   readLibraryIndex(peerId: string, libraryId: string): unknown[] | undefined;
   listDiscoveredPeers(): Array<{ peerId: string; addresses: string[] }>;
   dialManualIp(host: string, port: number, peerId: string): Promise<{ peerId: string; addresses: string[] }>;
@@ -454,6 +476,42 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       else sendJson(response, 200, { favorite: result.favorite });
     } catch (error) {
       if (error instanceof RepositoryConflictError || error instanceof FavoriteSyncConflictError) {
+        sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      } else throw error;
+    }
+    return;
+  }
+
+  const ratingPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/rating$/);
+  if (request.method === 'PUT' && ratingPath?.[1] && ratingPath[2]) {
+    response.setHeader('cache-control', 'private, no-store');
+    const libraryId = decodePathSegment(ratingPath[1]);
+    const assetId = decodePathSegment(ratingPath[2]);
+    if (!libraryId || !assetId || url.searchParams.size > 0) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const principalId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!principalId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    const control = options.assetRatings;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const operationId = readRatingOperationId(request);
+    if (!operationId || !/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['rating']) || !isValidRating(body.rating)) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    try {
+      const result = await control.setAssetRating({
+        operationId, principalId, libraryId, assetId, rating: body.rating,
+        requestFingerprint: ratingRequestFingerprint(principalId, libraryId, assetId, body.rating),
+        createdAt: new Date().toISOString()
+      });
+      if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+      else if (result === 'author_limit' || result === 'conflict_limit') {
+        sendJson(response, 409, { error: result === 'author_limit' ? 'writer_limit_reached' : 'rating_conflict_limit', requestId });
+      } else sendJson(response, 200, projectAssetRatingResponse(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof RatingSyncConflictError) {
         sendJson(response, 409, { error: 'idempotency_conflict', requestId });
       } else throw error;
     }
@@ -768,6 +826,37 @@ function projectFavoriteSyncStatus(value: FavoriteSyncPeerStatus): FavoriteSyncP
   return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
 }
 
+function projectAssetRatingResponse(value: AssetRatingState): { rating: number | null; ratingConflict: boolean; ratingCandidates: Array<number | null> } {
+  if (!isPlainRecord(value) || !isValidRating(value.rating) || typeof value.conflict !== 'boolean' ||
+      !Array.isArray(value.ratingCandidates) || value.ratingCandidates.length > 64 ||
+      !value.ratingCandidates.every(isValidRating) || new Set(value.ratingCandidates).size !== value.ratingCandidates.length) {
+    throw new Error('rating control returned an invalid rating state');
+  }
+  return { rating: value.rating, ratingConflict: value.conflict, ratingCandidates: [...value.ratingCandidates] };
+}
+
+function projectRatingSyncGrantStatus(value: RatingSyncGrantStatus): RatingSyncGrantStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !isValidAlbumIdentifier(value.libraryId) ||
+      value.permission !== 'rating-write' || typeof value.granted !== 'boolean') throw new Error('rating sync control returned an invalid grant');
+  return { peerId: value.peerId, libraryId: value.libraryId, permission: value.permission, granted: value.granted };
+}
+
+function projectRatingSyncGrantList(value: RatingSyncGrantList): RatingSyncGrantList {
+  if (!isPlainRecord(value) || !Array.isArray(value.grants)) throw new Error('rating sync control returned an invalid grant list');
+  const grants = value.grants.map((grant) => projectRatingSyncGrantStatus(grant));
+  const keys = grants.map((grant) => `${grant.peerId}\\0${grant.libraryId}\\0${grant.permission}`);
+  if (new Set(keys).size !== keys.length) throw new Error('rating sync control returned duplicate grants');
+  return { grants };
+}
+
+function projectRatingSyncStatus(value: RatingSyncPeerStatus): RatingSyncPeerStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !Number.isSafeInteger(value.pendingEvents) || value.pendingEvents < 0 ||
+      !(value.lastErrorCode === null || ['unauthorized', 'unavailable', 'conflict'].includes(value.lastErrorCode))) {
+    throw new Error('rating sync control returned an invalid status');
+  }
+  return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
+}
+
 function parseAlbumPageQuery(searchParams: URLSearchParams, scope: AlbumCursorScope): { cursor: string | undefined; limit: number } | undefined {
   if ([...searchParams.keys()].some((key) => key !== 'cursor' && key !== 'limit')) return undefined;
   const limitValues = searchParams.getAll('limit');
@@ -895,6 +984,20 @@ function favoriteRequestFingerprint(principalId: string, libraryId: string, asse
   return createHash('sha256').update(JSON.stringify({ apiVersion: 1, principalId, method: 'PUT', libraryId, assetId, favorite })).digest('hex');
 }
 
+function readRatingOperationId(request: IncomingMessage): string | undefined {
+  const header = request.headers['idempotency-key'];
+  if (typeof header !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(header)) return undefined;
+  return header.toLowerCase();
+}
+
+function isValidRating(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= 5);
+}
+
+function ratingRequestFingerprint(principalId: string, libraryId: string, assetId: string, rating: number | null): string {
+  return createHash('sha256').update(JSON.stringify({ apiVersion: 1, principalId, method: 'PUT', libraryId, assetId, rating })).digest('hex');
+}
+
 async function handlePairingRequest(
   request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string, pathname: string
 ): Promise<boolean> {
@@ -992,6 +1095,50 @@ async function handlePairingRequest(
       else sendJson(response, 200, projectFavoriteSyncGrantStatus(result));
     } catch (error) {
       if (error instanceof RepositoryConflictError || error instanceof FavoriteSyncConflictError) sendJson(response, 409, { error: 'conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
+  const ratingGrantListPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/rating-sync-grants$/);
+  if (request.method === 'GET' && ratingGrantListPath?.[1]) {
+    if (!control.listRatingSyncGrants) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.listRatingSyncGrants(decodeURIComponent(ratingGrantListPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectRatingSyncGrantList(result));
+    return true;
+  }
+  const ratingStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/rating-sync-status$/);
+  if (request.method === 'GET' && ratingStatusPath?.[1]) {
+    if (!control.getRatingSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const peerId = decodeURIComponent(ratingStatusPath[1]);
+    const result = control.getRatingSyncStatus(peerId);
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectRatingSyncStatus({
+      peerId, pendingEvents: result.pending,
+      lastErrorCode: result.lastError === null ? null : /denied|unauthori[sz]ed|write/i.test(result.lastError)
+        ? 'unauthorized' : /conflict|invalid|sequence/i.test(result.lastError) ? 'conflict' : 'unavailable'
+    }));
+    return true;
+  }
+  const ratingGrantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/rating-write$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && ratingGrantPath?.[1] && ratingGrantPath[2]) {
+    const update = request.method === 'PUT' ? control.grantRatingWrite : control.revokeRatingWrite;
+    if (!update) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (request.method === 'PUT') {
+      if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+      const body = await readJsonBody(request, 8 * 1024);
+      if (!isPlainRecord(body) || !hasExactKeys(body, ['enabled']) || body.enabled !== true) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+    }
+    try {
+      const result = update.call(control, decodeURIComponent(ratingGrantPath[1]), decodeURIComponent(ratingGrantPath[2]), new Date().toISOString());
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, projectRatingSyncGrantStatus(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof RatingSyncConflictError) sendJson(response, 409, { error: 'conflict', requestId });
       else throw error;
     }
     return true;

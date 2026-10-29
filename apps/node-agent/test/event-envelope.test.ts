@@ -98,6 +98,38 @@ describe('signed EventEnvelope', () => {
       createdAt: '2026-10-28T00:00:02.000Z' })).toThrow();
   });
 
+  it('validates rating MV-register events and observed causal context', async () => {
+    const identity = await makeIdentity();
+    const assetIndexId = '123e4567-e89b-42d3-a456-426614174000';
+    const ratingId = '123e4567-e89b-42d3-a456-426614174001';
+    const set = makeUnsignedEvent({
+      libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 1, causalParents: [assetIndexId],
+      eventType: 'asset.rating.set', payload: { assetId: 'asset-1', rating: 4, observedRatingEventIds: [] },
+      createdAt: '2026-10-29T00:00:00.000Z'
+    });
+    const signed = await signEvent(set, identity);
+    expect(await verifyEvent(signed, publicKeyText(identity))).toBe(true);
+    expect(parseEventEnvelope(signed)).toEqual(signed);
+    const invalid = (rating: JsonValue, observed: string[] = [ratingId], parents: string[] = [ratingId]) => makeUnsignedEvent({
+      libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 2, causalParents: parents,
+      eventType: 'asset.rating.set', payload: { assetId: 'asset-1', rating, observedRatingEventIds: observed },
+      createdAt: '2026-10-29T00:00:01.000Z'
+    });
+    expect(() => invalid(0)).toThrow();
+    expect(() => invalid(6)).toThrow();
+    expect(() => invalid(2.5)).toThrow();
+    expect(() => invalid(true)).toThrow();
+    expect(() => invalid(null, [])).toThrow();
+    expect(() => invalid(null, [ratingId], [])).toThrow();
+    expect(() => makeUnsignedEvent({
+      eventId: ratingId, libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 2, causalParents: [ratingId],
+      eventType: 'asset.rating.set', payload: { assetId: 'asset-1', rating: 3, observedRatingEventIds: [ratingId] },
+      createdAt: '2026-10-29T00:00:01.000Z'
+    })).toThrow();
+    const tooMany = Array.from({ length: 65 }, (_, index) => `123e4567-e89b-42d3-a456-${(index + 10).toString(16).padStart(12, '0')}`);
+    expect(() => invalid(3, tooMany, tooMany)).toThrow();
+  });
+
   it('preserves a well-formed unknown event version for safe non-application', async () => {
     const identity = await makeIdentity();
     const known = await signEvent(makeUnsignedEvent({

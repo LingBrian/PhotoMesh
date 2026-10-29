@@ -15,9 +15,11 @@ export type SyncEventType = 'asset.indexed' | 'asset.metadata.updated' | 'asset.
 export type TagSyncEventType = 'asset.tag.added' | 'asset.tag.removed';
 export type AlbumSyncEventType = 'album.created' | 'album.member.added' | 'album.member.removed' | 'album.deleted' | 'album.restored';
 export type FavoriteSyncEventType = 'asset.favorite.added' | 'asset.favorite.removed';
-export type AnyEventType = SyncEventType | TagSyncEventType | AlbumSyncEventType | FavoriteSyncEventType;
+export type RatingSyncEventType = 'asset.rating.set';
+export type AnyEventType = SyncEventType | TagSyncEventType | AlbumSyncEventType | FavoriteSyncEventType | RatingSyncEventType;
 export const MAX_ALBUM_OBSERVED_IDS = 64;
 export const MAX_FAVORITE_OBSERVED_IDS = 64;
+export const MAX_RATING_OBSERVED_IDS = 64;
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface EventEnvelope {
@@ -56,7 +58,7 @@ export function makeUnsignedEvent(input: {
     payload: input.payload, createdAt: input.createdAt
   };
   if (!isSupportedEventType(input.eventType) && !isTagSyncEventType(input.eventType) && !isAlbumSyncEventType(input.eventType) &&
-      !isFavoriteSyncEventType(input.eventType)) throw new Error('unsupported local event type');
+      !isFavoriteSyncEventType(input.eventType) && !isRatingSyncEventType(input.eventType)) throw new Error('unsupported local event type');
   validateUnsignedEvent(event);
   return event;
 }
@@ -120,7 +122,8 @@ function validateUnsignedEvent(event: UnsignedEventEnvelope): void {
       !Number.isSafeInteger(event.schemaVersion) || event.schemaVersion < 1 ||
       !Number.isSafeInteger(event.authorSequence) || event.authorSequence < 1 ||
       !Array.isArray(event.causalParents) || event.causalParents.length > 64 ||
-      event.causalParents.some((parent) => !isUuid(parent)) || new Set(event.causalParents).size !== event.causalParents.length ||
+      event.causalParents.some((parent) => !isUuid(parent)) || event.causalParents.includes(event.eventId) ||
+      new Set(event.causalParents).size !== event.causalParents.length ||
       typeof event.eventType !== 'string' || event.eventType.length === 0 || event.eventType.length > 128 ||
       !Number.isFinite(Date.parse(event.createdAt)) || !isRecord(event.payload)) {
     throw new Error('invalid event envelope');
@@ -129,6 +132,7 @@ function validateUnsignedEvent(event: UnsignedEventEnvelope): void {
   else if (isTagSyncEventType(event.eventType)) validateTagOperationPayload(event.eventType, event.payload);
   else if (isAlbumSyncEventType(event.eventType)) validateAlbumEventPayload(event.eventType, event.payload);
   else if (isFavoriteSyncEventType(event.eventType)) validateFavoriteEventPayload(event.eventType, event.payload, event.causalParents);
+  else if (isRatingSyncEventType(event.eventType)) validateRatingEventPayload(event.payload, event.causalParents);
   if (Buffer.byteLength(JSON.stringify(event), 'utf8') > MAX_EVENT_BYTES) throw new Error('event exceeds maximum size');
 }
 
@@ -199,6 +203,24 @@ function validateFavoriteEventPayload(type: FavoriteSyncEventType, payload: Reco
   }
 }
 
+function validateRatingEventPayload(payload: Record<string, unknown>, causalParents: readonly string[]): void {
+  const rating = payload.rating;
+  const observed = payload.observedRatingEventIds;
+  if (!hasExactKeys(payload, ['assetId', 'rating', 'observedRatingEventIds']) || !isSafeId(payload.assetId, 128) ||
+      !(rating === null || (typeof rating === 'number' && Number.isInteger(rating) && rating >= 1 && rating <= 5)) ||
+      !Array.isArray(observed) || observed.length > MAX_RATING_OBSERVED_IDS || !observed.every(isUuid) ||
+      observed.some((id, index) => index > 0 && String(observed[index - 1]) >= String(id))) {
+    throw new Error('invalid rating payload');
+  }
+  if (observed.length === 0) {
+    if (rating === null || causalParents.length !== 1 || !isUuid(causalParents[0])) {
+      throw new Error('initial rating must reference one asset index parent');
+    }
+  } else if (causalParents.length !== observed.length || causalParents.some((id, index) => id !== observed[index])) {
+    throw new Error('rating must observe sorted unique rating IDs as causal parents');
+  }
+}
+
 function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
@@ -228,6 +250,10 @@ export function isAlbumSyncEventType(value: string): value is AlbumSyncEventType
 
 export function isFavoriteSyncEventType(value: string): value is FavoriteSyncEventType {
   return value === 'asset.favorite.added' || value === 'asset.favorite.removed';
+}
+
+export function isRatingSyncEventType(value: string): value is RatingSyncEventType {
+  return value === 'asset.rating.set';
 }
 
 function isSafeId(value: unknown, maxLength: number): value is string {

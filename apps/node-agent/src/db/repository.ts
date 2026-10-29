@@ -110,6 +110,9 @@ export interface GalleryAssetRecord extends LibraryIndexAsset {
   version: string;
   tags: string[];
   favorite: boolean;
+  rating: number | null;
+  ratingConflict: boolean;
+  ratingCandidates: Array<number | null>;
 }
 
 export type AssetTagMutationResult = 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'limit_reached';
@@ -1021,9 +1024,12 @@ export class SqliteRepository implements UploadRepository {
     const localRows = this.db.prepare(`SELECT a.asset_id, a.library_id, a.origin_node_id, a.kind, a.capture_ts AS captured_at,
         f.sha256, f.byte_size, COALESCE(l.original_filename, a.asset_id) AS filename, l.original_path AS source_path,
         COALESCE(l.source_kind, 'import') AS source_kind, COALESCE(l.availability, 'missing') AS availability,
-        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite
+        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite,
+        r.rating AS rating, COALESCE(r.conflict, 0) AS rating_conflict,
+        COALESCE(r.candidates_json, '[]') AS rating_candidates_json
       FROM assets a LEFT JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
       LEFT JOIN asset_favorites fav ON fav.library_id = a.library_id AND fav.asset_id = a.asset_id
+      LEFT JOIN asset_rating_projection r ON r.library_id = a.library_id AND r.asset_id = a.asset_id
       LEFT JOIN file_locations l ON l.location_id = (SELECT candidate.location_id FROM file_locations candidate
         WHERE candidate.file_id = f.file_id AND candidate.node_id = a.origin_node_id
         ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END LIMIT 1)
@@ -1043,8 +1049,11 @@ export class SqliteRepository implements UploadRepository {
         COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id) AS filename,
         json_extract(p.metadata_json, '$.sourcePath') AS source_path,
         COALESCE(json_extract(p.metadata_json, '$.sourceKind'), 'import') AS source_kind, 'missing' AS availability,
-        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite
+        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite,
+        r.rating AS rating, COALESCE(r.conflict, 0) AS rating_conflict,
+        COALESCE(r.candidates_json, '[]') AS rating_candidates_json
       FROM sync_asset_projection p LEFT JOIN asset_favorites fav ON fav.library_id = p.library_id AND fav.asset_id = p.asset_id
+      LEFT JOIN asset_rating_projection r ON r.library_id = p.library_id AND r.asset_id = p.asset_id
       WHERE p.library_id = ? AND p.tombstone_event_id IS NULL
         AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
         AND (? = '' OR instr(lower(COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id)), lower(?)) > 0 OR
@@ -1386,18 +1395,35 @@ interface GalleryAssetSqlRow {
   source_kind: unknown;
   availability: GalleryAssetRecord['availability'];
   favorite: number | boolean | null;
+  rating: number | null;
+  rating_conflict: number | boolean | null;
+  rating_candidates_json: string | null;
 }
 
 function toGalleryAsset(row: GalleryAssetSqlRow): GalleryAssetRecord {
   const capturedAt = typeof row.captured_at === 'string' ? row.captured_at : null;
+  const parsedCandidates = parseRatingCandidates(row.rating_candidates_json);
+  const ratingConflict = Boolean(row.rating_conflict);
   return {
     assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id, kind: row.kind,
     sha256: row.sha256 ?? '', availability: row.availability,
     filename: typeof row.filename === 'string' ? row.filename : row.asset_id,
     capturedAt, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
     sourceKind: row.source_kind === 'upload' ? 'upload' : 'import',
-    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id, tags: [], favorite: Boolean(row.favorite)
+    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id, tags: [], favorite: Boolean(row.favorite),
+    rating: ratingConflict ? null : row.rating,
+    ratingConflict,
+    ratingCandidates: parsedCandidates
   };
+}
+
+function parseRatingCandidates(value: string | null): Array<number | null> {
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed) || !parsed.every((item) => item === null || (Number.isInteger(item) && Number(item) >= 1 && Number(item) <= 5))) return [];
+    return [...new Set(parsed as Array<number | null>)].sort((left, right) => left === right ? 0 : left === null ? -1 : right === null ? 1 : left - right);
+  } catch { return []; }
 }
 
 function compareGalleryAsset(left: GalleryAssetRecord, right: GalleryAssetRecord): number {

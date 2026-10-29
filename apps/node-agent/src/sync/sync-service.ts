@@ -62,7 +62,8 @@ export class SyncService {
     private readonly onEventApplied?: (event: EventEnvelope) => void,
     private readonly tagSyncAvailable = false,
     private readonly albumSyncAvailable = false,
-    private readonly favoriteSyncAvailable = false
+    private readonly favoriteSyncAvailable = false,
+    private readonly ratingSyncAvailable = false
   ) {}
 
   hello(): SyncHello {
@@ -70,7 +71,8 @@ export class SyncService {
       nodeId: this.identity.peerId, protocolMin: SYNC_PROTOCOL_MIN, protocolMax: SYNC_PROTOCOL_MAX,
       schemaVersions: [EVENT_SCHEMA_VERSION],
       capabilities: [...SUPPORTED_CAPABILITIES, ...(this.tagSyncAvailable ? ['asset-tags-v1'] : []),
-        ...(this.albumSyncAvailable ? ['virtual-albums-v1'] : []), ...(this.favoriteSyncAvailable ? ['asset-favorites-v1'] : [])]
+        ...(this.albumSyncAvailable ? ['virtual-albums-v1'] : []), ...(this.favoriteSyncAvailable ? ['asset-favorites-v1'] : []),
+        ...(this.ratingSyncAvailable ? ['asset-ratings-v1'] : [])]
     };
   }
 
