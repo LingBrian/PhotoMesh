@@ -194,3 +194,11 @@
 - **隐私/兼容：** 搜索词仅随当前授权请求作为 `/v1/assets` 的 `q` 参数发送；不写地址栏、浏览器存储、console 或应用日志。未声明能力的旧 Node 禁用搜索并显示兼容提示，时间线其他功能保持可用；无 schema 或迁移影响。
 - **验证：** 根级 lint/typecheck/test/contracts/build 通过；Playwright 全套 23 项通过（含 PM-050 搜索状态和 100k server-pagination 回归）。测试核对 location/localStorage/sessionStorage/console 中不含搜索词；截图见 [PM-050 搜索界面](screenshots/pm050-search-ux.png)。
 - **边界：** 仅限隔离 worktree 与本地 Conventional Commit；不 push、merge、release、部署或执行生产迁移。
+
+## ADR-024：PM-051 Web 批量选择与可逆元数据操作
+
+- **状态：** PM-051 已在隔离 worktree 实现并验证；详见 [ADR-024](adr/ADR-024-pm051-bulk-metadata-operations.md)。不改变 Node API、OpenAPI、数据库或迁移。
+- **决定：** 当前图库已加载资产逐项勾选，每批最多 100 项；数量、图库和排除未加载/其他匹配项的范围在提交前显示。仅提供添加/移除单一标签、设置共享收藏/取消收藏；收藏按图库共享并在获授权节点同步。无批量删除/永久删除。
+- **安全/恢复：** 使用现有单项授权 API，串行提交并逐项记录成功/失败；只重试失败项，收藏重用每资产 UUID `Idempotency-Key`，标签依赖既有幂等 PUT/DELETE。能力缺失时禁用相应操作；选择和批次仅在内存，搜索/图库/会话变化会清除选择。会话重置时保留仅含计数的中断摘要，区分已确认、失败、结果未知与未启动项；不把旧批次自动重放到新会话。
+- **验证：** 根级依赖安装、lint、typecheck、test、contracts:check、build 通过；Playwright 全套 27/27（含 100k 分页和会话切换时在途操作状态摘要）通过；界面截图见 [PM-051 批量操作](screenshots/pm051-bulk-operations.png)。
+- **边界：** 仅隔离 worktree 与本地 Conventional Commit；不 push、merge、release、部署或执行生产迁移。

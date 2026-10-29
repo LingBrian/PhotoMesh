@@ -5,6 +5,7 @@ import { GalleryPreviewError, loadAssetPreview, type GalleryPreviewErrorCode } f
 import { maxGalleryThumbnailBytes, readGalleryThumbnail } from './gallery-thumbnail.js';
 import { createMediaVersion, GalleryVersionError, getMediaVersion, isTerminalVersionStatus, loadMediaVersions, loadVersionContent, normalizeCrop, type VersionCollection } from './gallery-versions.js';
 import { assetTagPath, maxLegacyTagsPerAsset, mergeAssetTags, normalizeAssetTag } from './asset-tags.js';
+import { maxBulkSelection, updateAssetSelection } from './gallery-bulk.js';
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
 import './gallery.css';
 
@@ -12,12 +13,17 @@ type Library = { libraryId: string; title: string };
 type Asset = {
   assetId: string; libraryId: string; originNodeId: string; kind: string; sha256: string;
   availability: 'online' | 'cached' | 'offline' | 'missing'; filename: string; capturedAt: string | null;
-  sourcePath: string | null; sourceKind: string; byteSize: number; version: string; tags?: string[];
+  sourcePath: string | null; sourceKind: string; byteSize: number; version: string; tags?: string[]; favorite?: boolean;
 };
 type Page = { items: Asset[]; nextCursor: string | null };
 type Tombstone = { assetId: string; libraryId: string; eventId: string };
 type PendingPeerApproval = { peerId: string; publicKey: string; proposedLabel: string; requestedAt: string };
 type Album = { id: string; name: string; tag: string };
+type BulkActionDraft = { kind: 'tag'; add: boolean } | { kind: 'favorite'; favorite: boolean };
+type BulkAction = { kind: 'tag'; add: boolean; tag: string } | { kind: 'favorite'; favorite: boolean };
+type BulkOperationEntry = { assetId: string; filename: string; status: 'queued' | 'pending' | 'success' | 'failed'; operationId?: string; error?: string };
+type BulkOperation = { libraryId: string; action: BulkAction; entries: BulkOperationEntry[] };
+type BulkInterruptedSummary = { id: number; kind: 'tag' | 'favorite'; total: number; succeeded: number; failed: number; uncertain: number; notStarted: number };
 class NodeApiError extends Error {
   constructor(readonly status: number) { super(String(status)); }
 }
@@ -79,6 +85,15 @@ const legacyTagImportFailedKeys = new Set<string>();
 const albums = ref<Album[]>([]);
 const activeAlbum = ref('');
 const selectedAsset = ref<Asset | null>(null);
+const selectedAssetIds = ref<Set<string>>(new Set());
+const selectionError = ref('');
+const bulkActionDraft = ref<BulkActionDraft | null>(null);
+const bulkDialogOpen = ref(false);
+const bulkTagInput = ref('');
+const bulkError = ref('');
+const bulkOperation = ref<BulkOperation | null>(null);
+const bulkBusy = ref(false);
+const bulkInterrupted = ref<BulkInterruptedSummary[]>([]);
 const tagDialogError = ref('');
 const tagWriteBusy = ref(false);
 const previewAsset = ref<Asset | null>(null);
@@ -88,6 +103,7 @@ const previewErrorCode = ref<GalleryPreviewErrorCode | null>(null);
 const mediaVersionsEnabled = ref(false);
 const thumbnailsEnabled = ref(false);
 const assetTagsEnabled = ref(false);
+const assetFavoritesEnabled = ref(false);
 const tagSyncEnabled = ref(false);
 const versions = ref<VersionCollection | null>(null);
 const versionsBusy = ref(false);
@@ -117,6 +133,7 @@ let cacheGeneration = 0;
 let metadataGeneration = 0;
 let suppressLibraryReload = false;
 let sessionRevision = 0;
+let bulkInterruptedSequence = 0;
 let connectionGeneration = 0;
 let healthGeneration = 0;
 let healthAbort: AbortController | undefined;
@@ -152,6 +169,48 @@ const searchFeedback = computed(() => {
     default: return '';
   }
 });
+const selectedLibraryTitle = computed(() => libraries.value.find((library) => library.libraryId === libraryId.value)?.title ?? t('gallery.timeline'));
+const bulkActionsAvailable = computed(() => assetTagsEnabled.value || assetFavoritesEnabled.value);
+const selectedAssets = computed(() => Array.from(selectedAssetIds.value)
+  .map((assetId) => assets.value.find((asset) => asset.assetId === assetId))
+  .filter((asset): asset is Asset => Boolean(asset && asset.libraryId === libraryId.value)));
+const selectedTagOptions = computed(() => mergeAssetTags(...selectedAssets.value.map((asset) => tags.value[asset.assetId] ?? [])));
+const activeBulkAction = computed(() => bulkOperation.value?.action ?? bulkActionDraft.value);
+const bulkActionCount = computed(() => bulkOperation.value?.entries.length ?? selectedAssetIds.value.size);
+const bulkSucceededCount = computed(() => bulkOperation.value?.entries.filter((entry) => entry.status === 'success').length ?? 0);
+const bulkFailedCount = computed(() => bulkOperation.value?.entries.filter((entry) => entry.status === 'failed').length ?? 0);
+const bulkCompletedCount = computed(() => bulkSucceededCount.value + bulkFailedCount.value);
+const bulkDialogTitle = computed(() => {
+  const action = activeBulkAction.value;
+  if (!action) return t('gallery.bulkActions');
+  if (action.kind === 'tag') return t(action.add ? 'gallery.bulkDialogAddTagTitle' : 'gallery.bulkDialogRemoveTagTitle', { count: bulkActionCount.value });
+  return t(action.favorite ? 'gallery.bulkDialogFavoriteTitle' : 'gallery.bulkDialogUnfavoriteTitle', { count: bulkActionCount.value });
+});
+const bulkConfirmLabel = computed(() => {
+  const action = bulkActionDraft.value;
+  if (!action) return '';
+  if (action.kind === 'tag') return t(action.add ? 'gallery.bulkConfirmTagAdd' : 'gallery.bulkConfirmTagRemove', { count: selectedAssetIds.value.size });
+  return t(action.favorite ? 'gallery.bulkConfirmFavorite' : 'gallery.bulkConfirmUnfavorite', { count: selectedAssetIds.value.size });
+});
+const bulkCanConfirm = computed(() => {
+  const action = bulkActionDraft.value;
+  if (!action || bulkOperation.value || bulkBusy.value || !hasSession.value || !connected.value || selectedAssets.value.length !== selectedAssetIds.value.size || !selectedAssets.value.length || selectedAssets.value.length > maxBulkSelection) return false;
+  if (action.kind === 'favorite') return assetFavoritesEnabled.value;
+  if (!assetTagsEnabled.value) return false;
+  const tag = normalizeAssetTag(bulkTagInput.value);
+  if (!tag || !action.add && !selectedTagOptions.value.includes(tag)) return false;
+  return action.add || !selectedAssets.value.some((asset) => !importedLegacyTagAssets.value[asset.assetId] && (legacyTags.value[asset.assetId] ?? []).includes(tag));
+});
+const bulkStatusText = computed(() => {
+  const total = bulkOperation.value?.entries.length ?? 0;
+  return bulkBusy.value
+    ? t('gallery.bulkProgress', { completed: bulkCompletedCount.value, total })
+    : t('gallery.bulkCompletedSummary', { succeeded: bulkSucceededCount.value, failed: bulkFailedCount.value });
+});
+function bulkInterruptionText(summary: BulkInterruptedSummary): string {
+  const key = summary.kind === 'tag' ? 'gallery.bulkInterruptedTag' : 'gallery.bulkInterruptedFavorite';
+  return t(key, { total: summary.total, succeeded: summary.succeeded, failed: summary.failed, uncertain: summary.uncertain, notStarted: summary.notStarted });
+}
 const visibleStart = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeight) - 3));
 const visibleEnd = computed(() => Math.min(filteredAssets.value.length, visibleStart.value + 24));
 const visibleAssets = computed(() => filteredAssets.value.slice(visibleStart.value, visibleEnd.value));
@@ -197,7 +256,29 @@ function isLoopbackEndpoint(value: string): boolean {
     return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
   } catch { return false; }
 }
+function captureBulkInterruption(): void {
+  const operation = bulkOperation.value;
+  if (!operation) return;
+  const succeeded = operation.entries.filter((entry) => entry.status === 'success').length;
+  const failed = operation.entries.filter((entry) => entry.status === 'failed').length;
+  const uncertain = operation.entries.filter((entry) => entry.status === 'pending').length;
+  const notStarted = operation.entries.filter((entry) => entry.status === 'queued').length;
+  if (failed + uncertain + notStarted === 0) return;
+  bulkInterrupted.value = [...bulkInterrupted.value, {
+    id: ++bulkInterruptedSequence,
+    kind: operation.action.kind,
+    total: operation.entries.length,
+    succeeded,
+    failed,
+    uncertain,
+    notStarted,
+  }].slice(-5);
+}
+function dismissBulkInterruption(id: number): void {
+  bulkInterrupted.value = bulkInterrupted.value.filter((summary) => summary.id !== id);
+}
 function clearAuthorizedSession(clearCredentials = false): void {
+  captureBulkInterruption();
   sessionRevision += 1;
   sessionRequests.invalidate();
   connectionGeneration += 1;
@@ -209,7 +290,7 @@ function clearAuthorizedSession(clearCredentials = false): void {
   searchRevision += 1;
   busy.value = false; tombstonesBusy.value = false; peersBusy.value = false;
   if (healthTimer) { clearInterval(healthTimer); healthTimer = undefined; }
-  hasSession.value = false; connected.value = false; lastHealthCheck.value = null; gallerySearchEnabled.value = false;
+  hasSession.value = false; connected.value = false; lastHealthCheck.value = null; gallerySearchEnabled.value = false; assetFavoritesEnabled.value = false;
   search.value = ''; searchStatus.value = 'idle';
   libraries.value = []; libraryId.value = ''; assets.value = []; cursor.value = null;
   tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
@@ -217,6 +298,8 @@ function clearAuthorizedSession(clearCredentials = false): void {
   tags.value = {}; serverTags.value = {}; legacyTags.value = {}; importedLegacyTagAssets.value = {};
   legacyTagImportState.value = 'idle'; legacyTagImportFailures.value = 0; localMetadataUnavailable.value = false; legacyTagImportInFlight.clear(); legacyTagImportFailedKeys.clear();
   albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
+  selectedAssetIds.value = new Set(); selectionError.value = ''; bulkActionDraft.value = null; bulkDialogOpen.value = false;
+  bulkTagInput.value = ''; bulkError.value = ''; bulkOperation.value = null; bulkBusy.value = false;
   tagInput.value = ''; tagDialogError.value = ''; tagWriteBusy.value = false; pendingIdempotencyKeys.clear();
   mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
   closePreview(); clearThumbnailUrls();
@@ -292,6 +375,7 @@ async function connect(preserveSession = false): Promise<void> {
     mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
     thumbnailsEnabled.value = capabilities.includes('thumbnails');
     assetTagsEnabled.value = capabilities.includes('assetTags');
+    assetFavoritesEnabled.value = capabilities.includes('assetFavorites');
     tagSyncEnabled.value = capabilities.includes('tagSync');
     const result = await request<{ items: Library[] }>('/v1/libraries', { signal: controller.signal });
     if (generation !== connectionGeneration) return;
@@ -337,7 +421,7 @@ async function checkHealth(): Promise<void> {
     if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
     if (isAuthorizationFailure(response.status) && hasSession.value) { invalidateAuthorizationSession(); return; }
     connected.value = response.ok;
-    if (!response.ok) gallerySearchEnabled.value = false;
+    if (!response.ok) { gallerySearchEnabled.value = false; assetFavoritesEnabled.value = false; }
     if (response.ok) {
       const healthResult = await response.json() as { capabilities?: unknown };
       if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
@@ -346,6 +430,7 @@ async function checkHealth(): Promise<void> {
       mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
       thumbnailsEnabled.value = capabilities.includes('thumbnails');
       assetTagsEnabled.value = capabilities.includes('assetTags');
+      assetFavoritesEnabled.value = capabilities.includes('assetFavorites');
       tagSyncEnabled.value = capabilities.includes('tagSync');
     }
     if (response.ok && !wasConnected && hasSession.value) {
@@ -355,7 +440,7 @@ async function checkHealth(): Promise<void> {
     }
   } catch (cause) {
     if (generation === healthGeneration && !isRequestAborted(cause)) {
-      connected.value = false; gallerySearchEnabled.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
+      connected.value = false; gallerySearchEnabled.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; assetFavoritesEnabled.value = false; tagSyncEnabled.value = false;
     }
   } finally { if (healthAbort === controller) healthAbort = undefined; }
 }
@@ -407,6 +492,7 @@ async function executeSearch(revision: number): Promise<void> {
 }
 function scheduleSearch(): void {
   if (searchTimer) { clearTimeout(searchTimer); searchTimer = undefined; }
+  selectedAssetIds.value = new Set(); selectionError.value = '';
   const revision = ++searchRevision;
   pageGeneration += 1;
   busy.value = false; assets.value = []; cursor.value = null; scrollTop.value = 0; error.value = '';
@@ -433,6 +519,7 @@ function clearSearch(): void {
   searchInput.value?.focus();
 }
 watch(search, scheduleSearch, { flush: 'sync' });
+watch(activeAlbum, () => { selectedAssetIds.value = new Set(); selectionError.value = ''; });
 watch(libraryId, (value, previous) => {
   if (!suppressLibraryReload && hasSession.value && previous && value && value !== previous) {
     requestedLibraryAfterReconnect = value;
@@ -1141,6 +1228,157 @@ async function saveTagAndAlbum(): Promise<void> {
     if (revision === sessionRevision) tagWriteBusy.value = false;
   }
 }
+function onAssetSelectionChange(assetId: string, event: Event): void {
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement) || bulkBusy.value || bulkDialogOpen.value || bulkFailedCount.value > 0) return;
+  const update = updateAssetSelection(selectedAssetIds.value, assetId, input.checked);
+  selectedAssetIds.value = update.selected;
+  selectionError.value = update.limitReached ? t('gallery.bulkSelectionLimitReached', { limit: maxBulkSelection }) : '';
+}
+function clearAssetSelection(): void {
+  if (bulkBusy.value || bulkDialogOpen.value || bulkFailedCount.value > 0) return;
+  selectedAssetIds.value = new Set();
+  selectionError.value = '';
+}
+function openBulkTagAction(add: boolean): void {
+  if (!hasSession.value || !connected.value || !assetTagsEnabled.value || bulkBusy.value || bulkOperation.value) return;
+  bulkActionDraft.value = { kind: 'tag', add };
+  bulkTagInput.value = add ? '' : selectedTagOptions.value[0] ?? '';
+  bulkError.value = '';
+  bulkDialogOpen.value = true;
+}
+function openBulkFavoriteAction(favorite: boolean): void {
+  if (!hasSession.value || !connected.value || !assetFavoritesEnabled.value || bulkBusy.value || bulkOperation.value) return;
+  bulkActionDraft.value = { kind: 'favorite', favorite };
+  bulkError.value = '';
+  bulkDialogOpen.value = true;
+}
+function closeBulkDialog(): void {
+  if (bulkBusy.value) return;
+  bulkDialogOpen.value = false;
+  bulkError.value = '';
+  if (bulkFailedCount.value === 0) {
+    bulkOperation.value = null;
+    bulkActionDraft.value = null;
+    bulkTagInput.value = '';
+  }
+}
+function reviewBulkOperation(): void {
+  if (!bulkOperation.value) return;
+  bulkActionDraft.value = null;
+  bulkDialogOpen.value = true;
+  bulkTagInput.value = bulkOperation.value.action.kind === 'tag' ? bulkOperation.value.action.tag : '';
+}
+async function confirmBulkOperation(): Promise<void> {
+  const draft = bulkActionDraft.value;
+  if (!draft || bulkOperation.value || bulkBusy.value) return;
+  const selected = selectedAssets.value;
+  if (!hasSession.value || !connected.value || !libraryId.value || selected.length !== selectedAssetIds.value.size || !selected.length || selected.length > maxBulkSelection) {
+    bulkError.value = t('gallery.bulkScopeUnavailable');
+    return;
+  }
+  let action: BulkAction;
+  if (draft.kind === 'favorite') {
+    if (!assetFavoritesEnabled.value) { bulkError.value = t('gallery.bulkCapabilityUnavailable'); return; }
+    action = { kind: 'favorite', favorite: draft.favorite };
+  } else {
+    if (!assetTagsEnabled.value) { bulkError.value = t('gallery.bulkCapabilityUnavailable'); return; }
+    const tag = normalizeAssetTag(bulkTagInput.value);
+    if (!tag) { bulkError.value = t('gallery.bulkTagInvalid'); return; }
+    if (!draft.add && !selectedTagOptions.value.includes(tag)) { bulkError.value = t('gallery.bulkTagUnavailable'); return; }
+    if (!draft.add && selected.some((asset) => !importedLegacyTagAssets.value[asset.assetId] && (legacyTags.value[asset.assetId] ?? []).includes(tag))) {
+      bulkError.value = t('gallery.bulkTagImportPending');
+      return;
+    }
+    action = { kind: 'tag', add: draft.add, tag };
+  }
+  try {
+    const entries = selected.map((asset) => ({
+      assetId: asset.assetId,
+      filename: asset.filename,
+      status: 'queued' as const,
+      ...(action.kind === 'favorite' ? { operationId: crypto.randomUUID() } : {}),
+    }));
+    bulkOperation.value = { libraryId: libraryId.value, action, entries };
+    bulkActionDraft.value = null;
+    bulkError.value = '';
+    await runBulkOperation(false);
+  } catch {
+    bulkError.value = t('gallery.bulkOperationUnavailable');
+  }
+}
+async function runBulkOperation(retryOnly: boolean): Promise<void> {
+  const operation = bulkOperation.value;
+  if (!operation || bulkBusy.value || !hasSession.value || !connected.value || libraryId.value !== operation.libraryId) {
+    if (operation) bulkError.value = t('gallery.bulkScopeUnavailable');
+    return;
+  }
+  const revision = sessionRevision;
+  const entries = operation.entries.filter((entry) => !retryOnly || entry.status === 'failed');
+  bulkBusy.value = true;
+  bulkError.value = '';
+  try {
+    for (const entry of entries) {
+      if (revision !== sessionRevision || !hasSession.value) break;
+      if (!connected.value || libraryId.value !== operation.libraryId) {
+        const failure = connected.value ? t('gallery.bulkScopeUnavailable') : t('gallery.connectionFailed');
+        for (const pending of operation.entries) {
+          if (pending.status === 'pending' || pending.status === 'queued') { pending.status = 'failed'; pending.error = failure; }
+        }
+        break;
+      }
+      entry.status = 'pending';
+      delete entry.error;
+      const action = operation.action;
+      try {
+        if (action.kind === 'favorite') {
+          const favorite = action.favorite;
+          const operationId = entry.operationId;
+          if (!operationId) throw new Error(t('gallery.bulkOperationUnavailable'));
+          const result = await request<{ favorite: boolean }>(
+            `/v1/libraries/${encodeURIComponent(operation.libraryId)}/assets/${encodeURIComponent(entry.assetId)}/favorite`,
+            {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json', 'idempotency-key': operationId },
+              body: JSON.stringify({ favorite }),
+            },
+          );
+          if (revision !== sessionRevision || !hasSession.value) return;
+          assets.value = assets.value.map((asset) => asset.assetId === entry.assetId ? { ...asset, favorite: result.favorite } : asset);
+        } else {
+          const { tag, add } = action;
+          await request<void>(assetTagPath(operation.libraryId, entry.assetId, tag), { method: add ? 'PUT' : 'DELETE' });
+          if (revision !== sessionRevision || !hasSession.value) return;
+          const current = serverTags.value[entry.assetId] ?? assets.value.find((asset) => asset.assetId === entry.assetId)?.tags ?? [];
+          const next = add ? mergeAssetTags(current, [tag]) : current.filter((value) => value !== tag);
+          serverTags.value = { ...serverTags.value, [entry.assetId]: next };
+          refreshTagView([entry.assetId]);
+        }
+        entry.status = 'success';
+      } catch (cause) {
+        if (revision !== sessionRevision || !hasSession.value) return;
+        entry.status = 'failed';
+        entry.error = action.kind === 'tag' ? tagMutationErrorText(cause) : errorText(cause);
+      }
+    }
+  } finally {
+    if (revision === sessionRevision) bulkBusy.value = false;
+  }
+  if (revision === sessionRevision && hasSession.value && bulkFailedCount.value === 0) {
+    selectedAssetIds.value = new Set();
+    selectionError.value = '';
+  }
+}
+function retryFailedBulkItems(): void {
+  if (!bulkOperation.value || bulkFailedCount.value === 0 || bulkBusy.value) return;
+  bulkDialogOpen.value = true;
+  void runBulkOperation(true);
+}
+function bulkEntryStatus(entry: BulkOperationEntry): string {
+  if (entry.status === 'success') return t('gallery.bulkItemUpdated');
+  if (entry.status === 'failed') return t('gallery.bulkItemFailed');
+  return t('gallery.bulkItemPending');
+}
 function tagMutationErrorText(cause: unknown): string {
   if (cause instanceof NodeApiError) {
     if (cause.status === 400) return t('gallery.tagRejected');
@@ -1199,7 +1437,11 @@ function versionStatusText(status: string): string {
   }
 }
 function formatSize(bytes: number): string { return new Intl.NumberFormat(locale.value, { style: 'unit', unit: 'byte', unitDisplay: 'narrow', notation: bytes > 1_000_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(bytes); }
-function changeSection(value: typeof section.value): void { section.value = value; if (value === 'recycle') void loadRecycleBin(); }
+function changeSection(value: typeof section.value): void {
+  if (value !== 'timeline') { selectedAssetIds.value = new Set(); selectionError.value = ''; }
+  section.value = value;
+  if (value === 'recycle') void loadRecycleBin();
+}
 onMounted(() => {
   void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value;
   document.addEventListener('keydown', onPreviewKeydown);
@@ -1315,7 +1557,7 @@ async function idbClear(store: string): Promise<void> {
           :aria-label="t('gallery.search')"
           aria-keyshortcuts="/ Control+K Meta+K"
           :aria-describedby="searchFeedback ? 'search-feedback' : undefined"
-          :disabled="!connected || !hasSession || !gallerySearchEnabled"
+          :disabled="!connected || !hasSession || !gallerySearchEnabled || bulkBusy || bulkDialogOpen"
           @keydown.enter.prevent="submitSearch"
           @keydown.esc.prevent.stop="clearSearch"
         ><button
@@ -1323,6 +1565,7 @@ async function idbClear(store: string): Promise<void> {
           type="button"
           class="search-clear-button"
           :aria-label="t('gallery.clearSearch')"
+          :disabled="bulkBusy || bulkDialogOpen"
           @click.stop="clearSearch"
         >
           ×
@@ -1404,6 +1647,21 @@ async function idbClear(store: string): Promise<void> {
 
       <main class="content">
         <div
+          v-for="summary in bulkInterrupted"
+          :key="summary.id"
+          class="notice error-notice bulk-interrupted-notice"
+          role="alert"
+        >
+          <span>{{ bulkInterruptionText(summary) }}</span><button
+            type="button"
+            class="secondary-button"
+            :aria-label="t('gallery.dismissBulkInterrupted')"
+            @click="dismissBulkInterruption(summary.id)"
+          >
+            ×
+          </button>
+        </div>
+        <div
           v-if="!hasSession"
           class="connect-card"
         >
@@ -1468,6 +1726,7 @@ async function idbClear(store: string): Promise<void> {
                 id="library-choice"
                 v-model="libraryId"
                 class="field-select"
+                :disabled="bulkBusy || bulkDialogOpen"
               >
                 <option
                   v-for="library in libraries"
@@ -1563,6 +1822,91 @@ async function idbClear(store: string): Promise<void> {
             </button>
           </div>
           <div
+            v-if="bulkOperation && bulkFailedCount > 0 && !bulkDialogOpen"
+            class="notice error-notice bulk-retry-notice"
+            role="alert"
+          >
+            <span>{{ bulkStatusText }}</span><button
+              type="button"
+              class="secondary-button"
+              @click="reviewBulkOperation"
+            >
+              {{ t('gallery.bulkReviewResults') }}
+            </button><button
+              type="button"
+              class="secondary-button"
+              :disabled="bulkBusy || !connected"
+              @click="retryFailedBulkItems"
+            >
+              {{ t('gallery.bulkRetryFailed') }}
+            </button>
+          </div>
+          <div
+            v-if="selectedAssetIds.size && bulkActionsAvailable"
+            class="bulk-toolbar"
+            role="group"
+            :aria-label="t('gallery.bulkActions')"
+          >
+            <div class="bulk-selection-summary">
+              <span
+                role="status"
+                aria-live="polite"
+              >{{ t('gallery.bulkSelectedCount', { count: selectedAssetIds.size, library: selectedLibraryTitle }) }}</span>
+              <small>{{ t('gallery.bulkSelectionLimit', { limit: maxBulkSelection }) }}</small>
+            </div>
+            <button
+              v-if="assetTagsEnabled"
+              type="button"
+              class="secondary-button"
+              :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation"
+              @click="openBulkTagAction(true)"
+            >
+              {{ t('gallery.bulkAddTag') }}
+            </button>
+            <button
+              v-if="assetTagsEnabled"
+              type="button"
+              class="secondary-button"
+              :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation || !selectedTagOptions.length"
+              @click="openBulkTagAction(false)"
+            >
+              {{ t('gallery.bulkRemoveTag') }}
+            </button>
+            <button
+              v-if="assetFavoritesEnabled"
+              type="button"
+              class="secondary-button"
+              :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation"
+              @click="openBulkFavoriteAction(true)"
+            >
+              {{ t('gallery.bulkFavoriteOn') }}
+            </button>
+            <button
+              v-if="assetFavoritesEnabled"
+              type="button"
+              class="secondary-button"
+              :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation"
+              @click="openBulkFavoriteAction(false)"
+            >
+              {{ t('gallery.bulkFavoriteOff') }}
+            </button>
+            <button
+              type="button"
+              class="secondary-button"
+              :disabled="bulkBusy || bulkDialogOpen || !!bulkOperation"
+              @click="clearAssetSelection"
+            >
+              {{ t('gallery.bulkClearSelection') }}
+            </button>
+          </div>
+          <p
+            v-if="selectionError"
+            class="notice error-notice"
+            role="alert"
+          >
+            {{ selectionError }}
+          </p>
+          <div
             ref="scrollElement"
             class="timeline-scroll"
             role="region"
@@ -1617,7 +1961,10 @@ async function idbClear(store: string): Promise<void> {
                   <h2 :title="asset.filename">{{ asset.filename }}</h2><span
                     class="availability"
                     :class="asset.availability"
-                  >{{ t(`gallery.availability.${asset.availability}`) }}</span>
+                  >{{ t(`gallery.availability.${asset.availability}`) }}</span><span
+                    v-if="assetFavoritesEnabled && asset.favorite"
+                    class="favorite-badge"
+                  ><span aria-hidden="true">★</span><span>{{ t('gallery.sharedFavorite') }}</span></span>
                 </div>
                 <p class="asset-date">
                   <time
@@ -1639,6 +1986,18 @@ async function idbClear(store: string): Promise<void> {
                 </div>
               </div>
               <div class="asset-actions">
+                <label
+                  v-if="bulkActionsAvailable"
+                  class="asset-selection"
+                >
+                  <input
+                    type="checkbox"
+                    :aria-label="t('gallery.bulkSelectAsset', { filename: asset.filename })"
+                    :checked="selectedAssetIds.has(asset.assetId)"
+                    :disabled="!hasSession || !connected || bulkBusy || bulkDialogOpen || bulkFailedCount > 0"
+                    @change="onAssetSelectionChange(asset.assetId, $event)"
+                  >
+                </label>
                 <button
                   class="icon-button"
                   :aria-label="t('gallery.addTag')"
@@ -1849,7 +2208,7 @@ async function idbClear(store: string): Promise<void> {
             <button
               type="button"
               class="secondary-button"
-              :disabled="busy"
+              :disabled="busy || bulkBusy"
               @click="disconnectSession"
             >
               {{ t('gallery.disconnectSession') }}
@@ -2348,6 +2707,109 @@ async function idbClear(store: string): Promise<void> {
             @click="saveTagAndAlbum"
           >
             {{ tagWriteBusy ? t('gallery.savingTag') : t('gallery.saveTag') }}
+          </button>
+        </div>
+      </section>
+    </div>
+    <div
+      v-if="bulkDialogOpen"
+      class="modal-backdrop"
+      @click.self="closeBulkDialog"
+      @keydown.esc.prevent="closeBulkDialog"
+    >
+      <section
+        class="tag-dialog bulk-dialog"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="bulkDialogTitle"
+      >
+        <button
+          class="dialog-close"
+          type="button"
+          :aria-label="t('gallery.close')"
+          :disabled="bulkBusy"
+          @click="closeBulkDialog"
+        >
+          ×
+        </button>
+        <p class="eyebrow">{{ t('gallery.bulkActions') }}</p>
+        <h2>{{ bulkDialogTitle }}</h2>
+        <p class="muted">{{ t('gallery.bulkScopeNotice', { count: bulkActionCount, library: selectedLibraryTitle }) }}</p>
+        <p
+          v-if="activeBulkAction?.kind === 'favorite'"
+          class="bulk-shared-notice"
+        >
+          {{ t('gallery.bulkFavoriteShared') }}
+        </p>
+        <label v-if="activeBulkAction?.kind === 'tag' && activeBulkAction.add">{{ t('gallery.tagName') }}<input
+          v-model="bulkTagInput"
+          autofocus
+          :placeholder="t('gallery.tagPlaceholder')"
+          :disabled="bulkBusy || !!bulkOperation"
+          @input="bulkError = ''"
+          @keydown.enter.prevent="confirmBulkOperation"
+        ></label>
+        <label v-else-if="activeBulkAction?.kind === 'tag'">{{ t('gallery.bulkTagToRemove') }}<select
+          v-model="bulkTagInput"
+          autofocus
+          :disabled="bulkBusy || !!bulkOperation"
+        ><option
+          v-for="tag in selectedTagOptions"
+          :key="tag"
+          :value="tag"
+        >{{ tag }}</option></select></label>
+        <p
+          v-if="bulkError"
+          class="notice error-notice"
+          role="alert"
+        >
+          {{ bulkError }}
+        </p>
+        <template v-if="bulkOperation">
+          <p
+            class="notice"
+            :class="bulkFailedCount ? 'error-notice' : 'offline-notice'"
+            role="status"
+            aria-live="polite"
+          >
+            {{ bulkStatusText }}
+          </p>
+          <ul class="bulk-result-list">
+            <li
+              v-for="entry in bulkOperation.entries"
+              :key="entry.assetId"
+              :class="`bulk-result-${entry.status}`"
+            >
+              <span>{{ entry.filename }}</span><span>{{ bulkEntryStatus(entry) }}</span><small v-if="entry.error">{{ entry.error }}</small>
+            </li>
+          </ul>
+          <button
+            v-if="bulkFailedCount"
+            type="button"
+            class="secondary-button"
+            :disabled="bulkBusy || !connected"
+            @click="retryFailedBulkItems"
+          >
+            {{ t('gallery.bulkRetryFailed') }}
+          </button>
+        </template>
+        <div class="dialog-actions">
+          <button
+            type="button"
+            class="secondary-button"
+            :disabled="bulkBusy"
+            @click="closeBulkDialog"
+          >
+            {{ bulkOperation ? t('gallery.close') : t('gallery.cancel') }}
+          </button>
+          <button
+            v-if="!bulkOperation"
+            type="button"
+            class="primary-button small-primary"
+            :disabled="!bulkCanConfirm"
+            @click="confirmBulkOperation"
+          >
+            {{ bulkConfirmLabel }}
           </button>
         </div>
       </section>
