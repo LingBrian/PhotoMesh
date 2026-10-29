@@ -44,6 +44,9 @@ const libraryId = ref('');
 const assets = ref<Asset[]>([]);
 const cursor = ref<string | null>(null);
 const search = ref('');
+const searchInput = ref<HTMLInputElement>();
+const gallerySearchEnabled = ref(false);
+const searchStatus = ref<'idle' | 'debouncing' | 'loading' | 'results' | 'empty' | 'invalid' | 'unsupported' | 'error'>('idle');
 const section = ref<'timeline' | 'recycle' | 'settings'>('timeline');
 const tombstones = ref<Tombstone[]>([]);
 const tombstonesBusy = ref(false);
@@ -128,16 +131,26 @@ const groupDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, 
 const dayKeyFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { year: 'numeric', month: '2-digit', day: '2-digit' }));
 const timeFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { timeStyle: 'short' }));
 
+const searchTerm = computed(() => search.value.trim());
 const filteredAssets = computed(() => {
-  const needle = search.value.trim().toLocaleLowerCase();
   return assets.value.filter((asset) => {
-    if (needle && !`${asset.filename} ${asset.sourcePath ?? ''} ${asset.originNodeId}`.toLocaleLowerCase().includes(needle)) return false;
     if (activeAlbum.value) {
       const album = albums.value.find((item) => item.id === activeAlbum.value);
       if (!album || !(tags.value[asset.assetId] ?? []).includes(album.tag)) return false;
     }
     return true;
   });
+});
+const searchFeedback = computed(() => {
+  if (!hasSession.value || !connected.value) return '';
+  if (searchStatus.value === 'unsupported' || !gallerySearchEnabled.value) return t('gallery.searchUnsupported');
+  switch (searchStatus.value) {
+    case 'debouncing': return t('gallery.searchWaiting');
+    case 'loading': return t('gallery.searchLoading');
+    case 'invalid': return t('gallery.searchMinLength');
+    case 'results': return t('gallery.searchResultsLoaded');
+    default: return '';
+  }
 });
 const visibleStart = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeight) - 3));
 const visibleEnd = computed(() => Math.min(filteredAssets.value.length, visibleStart.value + 24));
@@ -193,9 +206,11 @@ function clearAuthorizedSession(clearCredentials = false): void {
   healthAbort?.abort(); healthAbort = undefined;
   pageGeneration += 1; metadataGeneration += 1;
   if (searchTimer) { clearTimeout(searchTimer); searchTimer = undefined; }
+  searchRevision += 1;
   busy.value = false; tombstonesBusy.value = false; peersBusy.value = false;
   if (healthTimer) { clearInterval(healthTimer); healthTimer = undefined; }
-  hasSession.value = false; connected.value = false; lastHealthCheck.value = null;
+  hasSession.value = false; connected.value = false; lastHealthCheck.value = null; gallerySearchEnabled.value = false;
+  search.value = ''; searchStatus.value = 'idle';
   libraries.value = []; libraryId.value = ''; assets.value = []; cursor.value = null;
   tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
   peers.value = []; pendingPeers.value = []; peersError.value = ''; tagWriteNotice.value = ''; grantLibraryByPeer.value = {}; tagWritersByLibrary.value = {}; tagSyncStatusByPeer.value = {}; invitation.value = null; scannedInvite.value = '';
@@ -273,6 +288,7 @@ async function connect(preserveSession = false): Promise<void> {
     const healthResult = await health.json() as { capabilities?: unknown };
     if (generation !== connectionGeneration) return;
     const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
+    gallerySearchEnabled.value = capabilities.includes('gallerySearch');
     mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
     thumbnailsEnabled.value = capabilities.includes('thumbnails');
     assetTagsEnabled.value = capabilities.includes('assetTags');
@@ -321,10 +337,12 @@ async function checkHealth(): Promise<void> {
     if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
     if (isAuthorizationFailure(response.status) && hasSession.value) { invalidateAuthorizationSession(); return; }
     connected.value = response.ok;
+    if (!response.ok) gallerySearchEnabled.value = false;
     if (response.ok) {
       const healthResult = await response.json() as { capabilities?: unknown };
       if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
       const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
+      gallerySearchEnabled.value = capabilities.includes('gallerySearch');
       mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
       thumbnailsEnabled.value = capabilities.includes('thumbnails');
       assetTagsEnabled.value = capabilities.includes('assetTags');
@@ -337,11 +355,13 @@ async function checkHealth(): Promise<void> {
     }
   } catch (cause) {
     if (generation === healthGeneration && !isRequestAborted(cause)) {
-      connected.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
+      connected.value = false; gallerySearchEnabled.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
     }
   } finally { if (healthAbort === controller) healthAbort = undefined; }
 }
 async function loadPage(reset = false, preserveOnFailure = false): Promise<boolean> {
+  const requestedSearch = searchTerm.value;
+  if (requestedSearch && (!gallerySearchEnabled.value || Array.from(requestedSearch).length < 3)) return false;
   if (!connected.value || !hasSession.value || !libraryId.value || busy.value && !reset) return false;
   const previousAssets = assets.value;
   const previousCursor = cursor.value;
@@ -352,7 +372,7 @@ async function loadPage(reset = false, preserveOnFailure = false): Promise<boole
   try {
     const query = new URLSearchParams({ libraryId: libraryId.value, limit: String(pageSize) });
     if (cursor.value) query.set('cursor', cursor.value);
-    if (search.value.trim()) query.set('q', search.value.trim());
+    if (requestedSearch) query.set('q', requestedSearch);
     const page = await request<Page>(`/v1/assets?${query.toString()}`);
     if (generation !== pageGeneration) return false;
     const pageTags = Object.fromEntries(page.items.map((asset) => [asset.assetId, Array.isArray(asset.tags) ? asset.tags : []]));
@@ -372,7 +392,47 @@ async function loadPage(reset = false, preserveOnFailure = false): Promise<boole
   } finally { if (generation === pageGeneration) busy.value = false; }
 }
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
-watch(search, () => { if (searchTimer) clearTimeout(searchTimer); searchTimer = setTimeout(() => void loadPage(true), 250); });
+let searchRevision = 0;
+async function executeSearch(revision: number): Promise<void> {
+  const query = searchTerm.value;
+  if (revision !== searchRevision) return;
+  if (!connected.value || !hasSession.value || !libraryId.value) { searchStatus.value = 'idle'; return; }
+  if (query && !gallerySearchEnabled.value) { searchStatus.value = 'unsupported'; return; }
+  if (query && Array.from(query).length < 3) { searchStatus.value = 'invalid'; return; }
+  searchStatus.value = 'loading';
+  const loaded = await loadPage(true);
+  if (revision !== searchRevision) return;
+  if (!loaded) { searchStatus.value = query && error.value ? 'error' : 'idle'; return; }
+  searchStatus.value = query ? assets.value.length ? 'results' : 'empty' : 'idle';
+}
+function scheduleSearch(): void {
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = undefined; }
+  const revision = ++searchRevision;
+  pageGeneration += 1;
+  busy.value = false; assets.value = []; cursor.value = null; scrollTop.value = 0; error.value = '';
+  const query = searchTerm.value;
+  if (query && !gallerySearchEnabled.value) {
+    searchStatus.value = hasSession.value && connected.value ? 'unsupported' : 'idle';
+    return;
+  }
+  if (query && Array.from(query).length < 3) { searchStatus.value = 'invalid'; return; }
+  if (!query) {
+    searchStatus.value = connected.value && hasSession.value ? 'loading' : 'idle';
+    void executeSearch(revision);
+    return;
+  }
+  searchStatus.value = 'debouncing';
+  searchTimer = setTimeout(() => { searchTimer = undefined; void executeSearch(revision); }, 250);
+}
+function submitSearch(): void {
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = undefined; }
+  void executeSearch(++searchRevision);
+}
+function clearSearch(): void {
+  search.value = '';
+  searchInput.value?.focus();
+}
+watch(search, scheduleSearch, { flush: 'sync' });
 watch(libraryId, (value, previous) => {
   if (!suppressLibraryReload && hasSession.value && previous && value && value !== previous) {
     requestedLibraryAfterReconnect = value;
@@ -741,6 +801,16 @@ function onPreviewKeydown(event: KeyboardEvent): void {
   if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [role="textbox"]'))) return;
   if (event.key === 'ArrowLeft') { event.preventDefault(); navigatePreview(-1); }
   else if (event.key === 'ArrowRight') { event.preventDefault(); navigatePreview(1); }
+}
+function onSearchShortcut(event: KeyboardEvent): void {
+  if (event.altKey || event.shiftKey || section.value !== 'timeline' || !connected.value || !gallerySearchEnabled.value || previewAsset.value) return;
+  const target = event.target;
+  if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [role="textbox"]'))) return;
+  const focusSearch = (event.key === '/' && !event.ctrlKey && !event.metaKey) ||
+    (event.key.toLowerCase() === 'k' && (event.ctrlKey || event.metaKey));
+  if (!focusSearch) return;
+  event.preventDefault();
+  searchInput.value?.focus();
 }
 function previewErrorMessage(code: GalleryPreviewErrorCode): string {
   switch (code) {
@@ -1130,9 +1200,14 @@ function versionStatusText(status: string): string {
 }
 function formatSize(bytes: number): string { return new Intl.NumberFormat(locale.value, { style: 'unit', unit: 'byte', unitDisplay: 'narrow', notation: bytes > 1_000_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(bytes); }
 function changeSection(value: typeof section.value): void { section.value = value; if (value === 'recycle') void loadRecycleBin(); }
-onMounted(() => { void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value; document.addEventListener('keydown', onPreviewKeydown); });
+onMounted(() => {
+  void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value;
+  document.addEventListener('keydown', onPreviewKeydown);
+  document.addEventListener('keydown', onSearchShortcut);
+});
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', onPreviewKeydown);
+  document.removeEventListener('keydown', onSearchShortcut);
   requestedLibraryAfterReconnect = undefined;
   clearAuthorizedSession(true);
   imageObserver?.disconnect();
@@ -1222,12 +1297,37 @@ async function idbClear(store: string): Promise<void> {
         href="#timeline"
         @click.prevent="changeSection('timeline')"
       ><span class="brand-mark">P</span> PhotoMesh</a>
-      <label class="searchbox"><span class="sr-only">{{ t('gallery.search') }}</span><span aria-hidden="true">⌕</span><input
-        v-model="search"
-        type="search"
-        :placeholder="t('gallery.searchPlaceholder')"
-        :aria-label="t('gallery.search')"
-      ></label>
+      <div
+        class="searchbox"
+        role="search"
+      >
+        <label
+          class="sr-only"
+          for="gallery-search-input"
+        >{{ t('gallery.search') }}</label><span aria-hidden="true">⌕</span><input
+          id="gallery-search-input"
+          ref="searchInput"
+          v-model="search"
+          type="search"
+          maxlength="256"
+          autocomplete="off"
+          :placeholder="t('gallery.searchPlaceholder')"
+          :aria-label="t('gallery.search')"
+          aria-keyshortcuts="/ Control+K Meta+K"
+          :aria-describedby="searchFeedback ? 'search-feedback' : undefined"
+          :disabled="!connected || !hasSession || !gallerySearchEnabled"
+          @keydown.enter.prevent="submitSearch"
+          @keydown.esc.prevent.stop="clearSearch"
+        ><button
+          v-if="search"
+          type="button"
+          class="search-clear-button"
+          :aria-label="t('gallery.clearSearch')"
+          @click.stop="clearSearch"
+        >
+          ×
+        </button>
+      </div>
       <div class="top-actions">
         <span
           class="connection-pill"
@@ -1387,6 +1487,15 @@ async function idbClear(store: string): Promise<void> {
             </div>
           </div>
           <div
+            v-if="searchFeedback"
+            id="search-feedback"
+            class="notice search-feedback"
+            role="status"
+            aria-live="polite"
+          >
+            {{ searchFeedback }}
+          </div>
+          <div
             v-if="!connected"
             class="notice offline-notice"
             role="status"
@@ -1406,7 +1515,14 @@ async function idbClear(store: string): Promise<void> {
             class="notice error-notice"
             role="alert"
           >
-            {{ error }}
+            <span>{{ error }}</span><button
+              v-if="searchStatus === 'error' && searchTerm"
+              type="button"
+              class="secondary-button"
+              @click="submitSearch"
+            >
+              {{ t('gallery.retrySearch') }}
+            </button>
           </div>
           <div
             v-if="localMetadataUnavailable"
@@ -1455,10 +1571,12 @@ async function idbClear(store: string): Promise<void> {
             @scroll="onScroll"
           >
             <div
-              v-if="!filteredAssets.length && !busy"
+              v-if="!filteredAssets.length && !busy && !['debouncing', 'loading', 'invalid', 'unsupported', 'error'].includes(searchStatus)"
               class="empty-state"
+              role="status"
+              aria-live="polite"
             >
-              <span>◇</span><h2>{{ activeAlbum ? t('gallery.noTaggedItemsLoaded') : search ? t('gallery.noSearchResults') : t('gallery.emptyLibrary') }}</h2><p>{{ activeAlbum && cursor ? t('gallery.localAlbumPageHint') : t('gallery.emptyHint') }}</p>
+              <span>◇</span><h2>{{ activeAlbum ? t('gallery.noTaggedItemsLoaded') : searchTerm ? t('gallery.noSearchResults') : t('gallery.emptyLibrary') }}</h2><p>{{ activeAlbum && cursor ? t('gallery.localAlbumPageHint') : searchTerm ? t('gallery.noSearchResultsHint') : t('gallery.emptyHint') }}</p>
             </div>
             <div
               :style="{ height: `${topSpacer}px` }"

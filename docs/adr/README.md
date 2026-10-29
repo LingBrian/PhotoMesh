@@ -7,3 +7,4 @@
 - [ADR-020：PM-047 图库级共享评分与并发冲突](ADR-020-pm047-library-ratings.md) — 用户于2026-10-29批准图库级共享评分、1–5/null、因果多值寄存器与显式冲突解决；隔离分支已提交 `e830517` 并通过根级验证，未执行生产迁移。
 - [ADR-021：PM-048 授权图库文件名/路径/日期检索](ADR-021-pm048-authorized-search.md) — 用户于2026-10-29批准的搜索 API/索引方案已在隔离分支实现与验证，含文件型 100k HTTP/WAL 证据；未执行生产迁移。
 - [ADR-022：PM-049 日期/类型/来源/可用性组合筛选](ADR-022-pm049-filter-combinations.md) — 组合筛选、v2 条件绑定 cursor 与 append-only 0012 索引迁移已实现；100k 文件型 HTTP/WAL 与契约测试通过；未执行生产迁移。
+- [ADR-023：PM-050 Web 搜索状态与键盘体验](ADR-023-pm050-search-experience.md) — 双语、能力门控、键盘操作、空态/重试与查询词隐私保护已实现；根级验证和 23 项 Playwright（含 100k）通过；未 push/merge/release。

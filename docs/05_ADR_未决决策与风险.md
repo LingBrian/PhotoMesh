@@ -186,3 +186,11 @@
 - **兼容/迁移：** 只追加 `0012_gallery_filter_indexes` 三个维度/图库/拍摄时间索引，不改写 `0001`–`0011`；隔离数据库验证备份失败原子性、旧二进制拒绝和索引查询计划。
 - **验证：** 单测/HTTP/OpenAPI 契约、根级 lint/typecheck/test/contracts/build 与 100k 文件型 HTTP/WAL 日期+三维组合筛选均通过；详见 [ADR-022](adr/ADR-022-pm049-filter-combinations.md) 及 [100k 基准报告](../artifacts/performance/gallery-100k-pm049.json)。
 - **边界：** 仅限隔离分支与本地提交；不运行生产迁移、不 push/merge/release。
+
+## ADR-023：PM-050 Web 搜索状态与键盘体验
+
+- **状态：** PM-050 已在隔离分支按批准的开发范围完成；详见 [`ADR-023`](adr/ADR-023-pm050-search-experience.md)。无 API、OpenAPI 或数据库变更。
+- **决定：** Web 仅在 Node 健康能力声明 `gallerySearch` 时启用搜索；修剪后的非空词不足 3 个 Unicode code points 时在本地指导且不发请求，输入长度上限 256 UTF-16 code units。250ms 防抖；Enter 立即提交、Escape 清空、`/` 和 Ctrl/Cmd+K 聚焦；结果仅使用服务端分页，避免本地二次过滤造成 asset ID 等命中丢失。双语状态/空态和失败重试不回显查询词。
+- **隐私/兼容：** 搜索词仅随当前授权请求作为 `/v1/assets` 的 `q` 参数发送；不写地址栏、浏览器存储、console 或应用日志。未声明能力的旧 Node 禁用搜索并显示兼容提示，时间线其他功能保持可用；无 schema 或迁移影响。
+- **验证：** 根级 lint/typecheck/test/contracts/build 通过；Playwright 全套 23 项通过（含 PM-050 搜索状态和 100k server-pagination 回归）。测试核对 location/localStorage/sessionStorage/console 中不含搜索词；截图见 [PM-050 搜索界面](screenshots/pm050-search-ux.png)。
+- **边界：** 仅限隔离 worktree 与本地 Conventional Commit；不 push、merge、release、部署或执行生产迁移。

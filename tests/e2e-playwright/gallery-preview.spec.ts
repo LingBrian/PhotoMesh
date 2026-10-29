@@ -42,7 +42,7 @@ test('Windows gallery loads image bytes only after an explicit preview action an
     };
   });
 
-  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: ['mediaVersions', 'thumbnails', 'assetTags'] } }));
+  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: ['mediaVersions', 'thumbnails', 'assetTags', 'gallerySearch'] } }));
   await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [
     { libraryId: 'fixture-library', title: 'Fixture library' },
     { libraryId: 'other-library', title: 'Other library' },
