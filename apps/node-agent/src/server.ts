@@ -202,7 +202,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       ...(options.mediaVersions ? ['mediaVersions'] : []),
       ...(options.thumbnails ? ['thumbnails'] : []),
       ...(options.assetTags ? ['assetTags'] : []),
-      ...(options.gallery ? ['gallerySearch'] : []),
+      ...(options.gallery ? ['gallerySearch', 'galleryFilters'] : []),
       ...(options.albums ? ['virtualAlbums'] : []),
       ...(options.tagSync ? ['tagSync'] : [])
     ];
@@ -389,7 +389,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
 
   if (request.method === 'GET' && url.pathname === '/v1/assets') {
-    const allowedParameters = new Set(['libraryId', 'cursor', 'limit', 'q', 'dateFrom', 'dateTo']);
+    const allowedParameters = new Set(['libraryId', 'cursor', 'limit', 'q', 'dateFrom', 'dateTo', 'kind', 'sourceKind', 'availability']);
     const parameterNames = [...url.searchParams.keys()];
     if (parameterNames.some((name) => !allowedParameters.has(name)) ||
       parameterNames.some((name) => url.searchParams.getAll(name).length !== 1)) {
@@ -402,7 +402,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const filters: GallerySearchFilters = {
       ...(url.searchParams.has('q') ? { q: url.searchParams.get('q') ?? '' } : {}),
       ...(url.searchParams.has('dateFrom') ? { dateFrom: url.searchParams.get('dateFrom') ?? '' } : {}),
-      ...(url.searchParams.has('dateTo') ? { dateTo: url.searchParams.get('dateTo') ?? '' } : {})
+      ...(url.searchParams.has('dateTo') ? { dateTo: url.searchParams.get('dateTo') ?? '' } : {}),
+      ...(url.searchParams.has('kind') ? { kind: (url.searchParams.get('kind') ?? '') as NonNullable<GallerySearchFilters['kind']> } : {}),
+      ...(url.searchParams.has('sourceKind') ? { sourceKind: (url.searchParams.get('sourceKind') ?? '') as NonNullable<GallerySearchFilters['sourceKind']> } : {}),
+      ...(url.searchParams.has('availability') ? { availability: (url.searchParams.get('availability') ?? '') as NonNullable<GallerySearchFilters['availability']> } : {})
     };
     if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 200 ||
       (options.gallery ? cursor !== null && !/^[A-Za-z0-9_-]{1,2048}$/.test(cursor) : !Number.isSafeInteger(rawOffset) || rawOffset < 0) ||
@@ -423,7 +426,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       }
       return;
     }
-    if (filters.q !== undefined || filters.dateFrom !== undefined || filters.dateTo !== undefined) {
+    if (filters.q !== undefined || filters.dateFrom !== undefined || filters.dateTo !== undefined ||
+      filters.kind !== undefined || filters.sourceKind !== undefined || filters.availability !== undefined) {
       sendJson(response, 400, { error: 'invalid_request', requestId }); return;
     }
     const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;

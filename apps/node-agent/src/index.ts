@@ -283,7 +283,7 @@ const server = createNodeAgentServer({
     checkStorage: async () => { await access(dataDirectory, fsConstants.R_OK | fsConstants.W_OK); },
     apiCapabilities: (): DiagnosticCapability[] => [
       'rest',
-      'gallerySearch',
+      'gallerySearch', 'galleryFilters',
       ...(mediaVersionService ? ['mediaVersions' as const] : []),
       ...(mediaThumbnailService ? ['thumbnails' as const] : []),
       ...(albumPeerId ? ['virtualAlbums' as const] : []),

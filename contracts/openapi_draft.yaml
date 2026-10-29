@@ -338,6 +338,18 @@ paths:
           name: dateTo
           description: Exclusive UTC calendar-date boundary.
           schema: {type: string, format: date}
+        - in: query
+          name: kind
+          description: Exact asset kind filter; combine with all other filters using AND.
+          schema: {type: string, enum: [photo, video, live_photo]}
+        - in: query
+          name: sourceKind
+          description: Exact source kind filter; local and synchronized assets use their normalized Gallery value.
+          schema: {type: string, enum: [upload, import]}
+        - in: query
+          name: availability
+          description: Exact availability filter; synchronized assets without local location evidence are missing.
+          schema: {type: string, enum: [online, cached, offline, missing]}
       responses:
         '200':
           description: Assets page
@@ -350,7 +362,7 @@ paths:
             Cache-Control:
               schema: {type: string, const: 'private, no-store'}
         '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
-        '400': {description: 'Invalid, duplicate, or unknown query parameter; short q; invalid UTC date; or cursor/filter mismatch.', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: 'Invalid, duplicate, or unknown query parameter; short q; invalid UTC date/enum; or cursor/filter mismatch.', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default:
           description: Unexpected HTTP error using the common error envelope.
           headers:
@@ -1738,10 +1750,10 @@ components:
         capabilities:
           type: array
           uniqueItems: true
-          maxItems: 16
+          maxItems: 17
           items:
             type: string
-            enum: [rest, mediaVersions, thumbnails, assetTags, gallerySearch, virtualAlbums, assetFavorites, favoriteSync, tagSync, assetRatings, ratingSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
+            enum: [rest, mediaVersions, thumbnails, assetTags, gallerySearch, galleryFilters, virtualAlbums, assetFavorites, favoriteSync, tagSync, assetRatings, ratingSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
     PairingInvite:
       type: object
       required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]

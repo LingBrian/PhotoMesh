@@ -58,7 +58,7 @@ describe('PM-048 gallery search index and cursor', () => {
       insertProjection(db, { assetId: 'shared-asset', filename: 'Projection Must Stay Hidden.jpg', path: '/remote/Projection Must Stay Hidden.jpg' });
       const before = db.prepare('SELECT migration_id, checksum FROM schema_migrations ORDER BY migration_id').all();
 
-      await repository.migrate(migrations);
+      await repository.migrate(migrations.slice(0, 11));
 
       expect(db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id DESC LIMIT 1').get())
         .toEqual({ migration_id: '0011_gallery_search_index' });
@@ -160,6 +160,7 @@ describe('PM-048 gallery search index and cursor', () => {
       expect(third.items.map((asset) => asset.assetId)).toEqual(['asset-null', 'asset-invalid']);
       expect(third.nextCursor).toBeNull();
       const cursorPayload = JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')) as Record<string, unknown>;
+      expect(cursorPayload.version).toBe(1);
       const extraCursorField = Buffer.from(JSON.stringify({ ...cursorPayload, unexpected: true }), 'utf8').toString('base64url');
       expect(() => repository.listGalleryAssets('library-a', extraCursorField, 2, { q: 'photo' })).toThrow(/cursor/i);
       expect(() => repository.listGalleryAssets('library-a', 'e30=', 2, { q: 'photo' })).toThrow(/cursor/i);
@@ -168,6 +169,91 @@ describe('PM-048 gallery search index and cursor', () => {
       expect(() => repository.listGalleryAssets('library-a', first.nextCursor!, 2, { q: 'photo', dateFrom: '2026-05-01' })).toThrow(/cursor/i);
     } finally {
       db.close();
+    }
+  });
+
+  it('combines PM-049 kind, source, availability, q, and date filters with scoped v2 cursors', async () => {
+    const db = new Database(':memory:');
+    try {
+      const repository = new SqliteRepository(db, { backupBeforeMigration: async () => undefined });
+      await repository.migrate(migrations);
+      insertLocalAsset(db, { assetId: 'asset-photo-import-online', capturedAt: '2026-10-29T00:00:00.000Z', filename: 'Trip Alpha.jpg', path: '/trip/Trip Alpha.jpg' });
+      insertLocalAsset(db, { assetId: 'asset-video-upload-cached', capturedAt: '2026-10-28T00:00:00.000Z', filename: 'Trip Bravo.jpg', path: '/trip/Trip Bravo.jpg' });
+      db.prepare("UPDATE assets SET kind='video' WHERE asset_id='asset-video-upload-cached'").run();
+      db.prepare("UPDATE file_locations SET source_kind='upload',availability='cached' WHERE location_id='loc-asset-video-upload-cached'").run();
+      insertLocalAsset(db, { assetId: 'asset-video-import-offline', capturedAt: '2026-10-27T00:00:00.000Z', filename: 'Trip Charlie.jpg', path: '/trip/Trip Charlie.jpg' });
+      db.prepare("UPDATE assets SET kind='video' WHERE asset_id='asset-video-import-offline'").run();
+      db.prepare("UPDATE file_locations SET availability='offline' WHERE location_id='loc-asset-video-import-offline'").run();
+      insertLocalAsset(db, { assetId: 'asset-live-upload-online', capturedAt: '2026-10-26T00:00:00.000Z', filename: 'Trip Delta.jpg', path: '/trip/Trip Delta.jpg' });
+      db.prepare("UPDATE assets SET kind='live_photo' WHERE asset_id='asset-live-upload-online'").run();
+      db.prepare("UPDATE file_locations SET source_kind='upload' WHERE location_id='loc-asset-live-upload-online'").run();
+      insertProjection(db, { assetId: 'asset-remote-video-upload', capturedAt: '2026-10-25T00:00:00.000Z', filename: 'Trip Echo.jpg', path: '/trip/Trip Echo.jpg' });
+      db.prepare("UPDATE sync_asset_projection SET kind='video',metadata_json=json_set(metadata_json,'$.sourceKind','upload') WHERE asset_id='asset-remote-video-upload'").run();
+      insertLocalAsset(db, { assetId: 'asset-other-library', libraryId: 'library-b', capturedAt: '2026-10-28T00:00:00.000Z', filename: 'Trip Secret.jpg', path: '/trip/Trip Secret.jpg' });
+      db.prepare("UPDATE assets SET kind='video' WHERE asset_id='asset-other-library'").run();
+
+      const ids = (filters: Parameters<typeof repository.listGalleryAssets>[3]) =>
+        repository.listGalleryAssets('library-a', undefined, 20, filters).items.map((asset) => asset.assetId);
+      expect(ids({ kind: 'video' })).toEqual(['asset-video-upload-cached', 'asset-video-import-offline', 'asset-remote-video-upload']);
+      expect(ids({ sourceKind: 'upload' })).toEqual(['asset-video-upload-cached', 'asset-live-upload-online', 'asset-remote-video-upload']);
+      expect(ids({ availability: 'missing' })).toEqual(['asset-remote-video-upload']);
+      expect(ids({ kind: 'video', sourceKind: 'upload', availability: 'cached' })).toEqual(['asset-video-upload-cached']);
+      expect(ids({ kind: 'video', sourceKind: 'upload', availability: 'missing' })).toEqual(['asset-remote-video-upload']);
+      expect(ids({ q: 'Trip', dateFrom: '2026-10-25', dateTo: '2026-10-29', kind: 'video', sourceKind: 'upload' }))
+        .toEqual(['asset-video-upload-cached', 'asset-remote-video-upload']);
+
+      const first = repository.listGalleryAssets('library-a', undefined, 1, { kind: 'video', sourceKind: 'upload' });
+      const firstPayload = JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')) as { version: number };
+      expect(firstPayload.version).toBe(2);
+      expect(first.items.map((asset) => asset.assetId)).toEqual(['asset-video-upload-cached']);
+      const second = repository.listGalleryAssets('library-a', first.nextCursor!, 1, { kind: 'video', sourceKind: 'upload' });
+      expect(second.items.map((asset) => asset.assetId)).toEqual(['asset-remote-video-upload']);
+      expect(() => repository.listGalleryAssets('library-a', first.nextCursor!, 1, { kind: 'video', sourceKind: 'import' })).toThrow(/cursor/i);
+      expect(() => repository.listGalleryAssets('library-a', first.nextCursor!, 1, { kind: 'video', sourceKind: 'upload', availability: 'missing' })).toThrow(/cursor/i);
+      expect(() => repository.listGalleryAssets('library-b', first.nextCursor!, 1, { kind: 'video', sourceKind: 'upload' })).toThrow(/cursor/i);
+      expect(() => repository.listGalleryAssets('library-a', undefined, 10, { kind: 'audio' as never })).toThrow(/kind/i);
+      expect(() => repository.listGalleryAssets('library-a', undefined, 10, { sourceKind: 'camera' as never })).toThrow(/source/i);
+      expect(() => repository.listGalleryAssets('library-a', undefined, 10, { availability: 'present' as never })).toThrow(/availability/i);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('appends 0012 filter indexes transactionally and preserves the 0011 checksum', async () => {
+    const db = new Database(':memory:');
+    let backupCalls = 0;
+    try {
+      const repository = new SqliteRepository(db, { backupBeforeMigration: async () => { backupCalls += 1; } });
+      await repository.migrate(migrations.slice(0, 11));
+      const previous = db.prepare("SELECT checksum FROM schema_migrations WHERE migration_id='0011_gallery_search_index'").get();
+      await repository.migrate(migrations);
+      expect(backupCalls).toBe(1);
+      expect(db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id DESC LIMIT 1').get())
+        .toEqual({ migration_id: '0012_gallery_filter_indexes' });
+      expect(db.prepare("SELECT checksum FROM schema_migrations WHERE migration_id='0011_gallery_search_index'").get())
+        .toEqual(previous);
+      expect(db.prepare(`SELECT migration_id,checksum FROM schema_migrations WHERE migration_id='0012_gallery_filter_indexes'`).get())
+        .toEqual({ migration_id: '0012_gallery_filter_indexes', checksum: expect.any(String) });
+      for (const index of [
+        'gallery_search_content_kind_capture_idx', 'gallery_search_content_source_kind_capture_idx',
+        'gallery_search_content_availability_capture_idx'
+      ]) {
+        expect(db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(index)).toBeDefined();
+      }
+    } finally {
+      db.close();
+    }
+
+    const backupDb = new Database(':memory:');
+    try {
+      const base = new SqliteRepository(backupDb);
+      await base.migrate(migrations.slice(0, 11));
+      const refusing = new SqliteRepository(backupDb, { backupBeforeMigration: async () => { throw new Error('backup unavailable'); } });
+      await expect(refusing.migrate(migrations)).rejects.toThrow(/backup unavailable/);
+      expect(backupDb.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 11 });
+      expect(backupDb.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='gallery_search_content_kind_capture_idx'").get()).toBeUndefined();
+    } finally {
+      backupDb.close();
     }
   });
 
@@ -185,6 +271,24 @@ describe('PM-048 gallery search index and cursor', () => {
         WHERE library_id=? AND captured_at>=? AND captured_at<? ORDER BY captured_at DESC,asset_id DESC LIMIT 10`)
         .all('library-a', '2026-05-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z') as Array<{ detail: string }>;
       expect(datePlan.some((row) => row.detail.includes('gallery_search_content_capture_idx'))).toBe(true);
+      const filterIndexes = [
+        ['kind', 'gallery_search_content_kind_capture_idx'],
+        ['source_kind', 'gallery_search_content_source_kind_capture_idx'],
+        ['availability', 'gallery_search_content_availability_capture_idx']
+      ] as const;
+      for (const [column, indexName] of filterIndexes) {
+        const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT asset_id FROM gallery_search_content
+          WHERE library_id=? AND ${column}=? ORDER BY captured_at DESC,asset_id COLLATE BINARY DESC LIMIT 10`)
+          .all('library-a', column === 'kind' ? 'photo' : column === 'source_kind' ? 'import' : 'online') as Array<{ detail: string }>;
+        expect(plan.some((row) => row.detail.includes(indexName))).toBe(true);
+      }
+      const combinedPlan = db.prepare(`EXPLAIN QUERY PLAN SELECT asset_id FROM gallery_search_content
+        WHERE library_id=? AND kind=? AND source_kind=? AND availability=? AND captured_at>=? AND captured_at<?
+        ORDER BY captured_at DESC,asset_id COLLATE BINARY DESC LIMIT 10`)
+        .all('library-a', 'photo', 'import', 'online', '2026-05-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z') as Array<{ detail: string }>;
+      expect(combinedPlan.some((row) => row.detail.includes('gallery_search_content_kind_capture_idx') ||
+        row.detail.includes('gallery_search_content_source_kind_capture_idx') || row.detail.includes('gallery_search_content_availability_capture_idx') ||
+        row.detail.includes('gallery_search_content_capture_idx'))).toBe(true);
       db.prepare("INSERT INTO gallery_search_fts(gallery_search_fts,rank) VALUES('integrity-check',1)").run();
     } finally {
       db.close();
@@ -209,9 +313,11 @@ describe('PM-048 gallery search index and cursor', () => {
     try {
       const current = new SqliteRepository(db);
       await current.migrate(migrations);
+      const pm048Binary = new SqliteRepository(db);
+      await expect(pm048Binary.migrate(migrations.slice(0, 11))).rejects.toThrow(/unknown migration 0012_gallery_filter_indexes/i);
       const oldBinary = new SqliteRepository(db);
       await expect(oldBinary.migrate(migrations.slice(0, 10))).rejects.toThrow(/unknown migration 0011_gallery_search_index/i);
-      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 11 });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 12 });
     } finally {
       db.close();
     }

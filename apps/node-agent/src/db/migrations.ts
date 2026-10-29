@@ -1758,5 +1758,16 @@ export const migrations: readonly Migration[] = [
       INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
         SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at FROM gallery_search_source;
     `
+  },
+  {
+    id: '0012_gallery_filter_indexes',
+    sql: `
+      CREATE INDEX gallery_search_content_kind_capture_idx
+        ON gallery_search_content(library_id,kind,captured_at DESC,asset_id COLLATE BINARY DESC);
+      CREATE INDEX gallery_search_content_source_kind_capture_idx
+        ON gallery_search_content(library_id,source_kind,captured_at DESC,asset_id COLLATE BINARY DESC);
+      CREATE INDEX gallery_search_content_availability_capture_idx
+        ON gallery_search_content(library_id,availability,captured_at DESC,asset_id COLLATE BINARY DESC);
+    `
   }
 ];

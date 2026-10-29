@@ -11,6 +11,7 @@ const limit = 100;
 const pageCounts: number[] = [];
 const performanceSamplesMs: number[] = [];
 const datePerformanceSamplesMs: number[] = [];
+const filterCombinationSamplesMs: number[] = [];
 let database!: Database.Database;
 let repository!: SqliteRepository;
 let api!: ReturnType<typeof createNodeAgentServer>;
@@ -45,7 +46,7 @@ test.beforeAll(async () => {
     (file_id,asset_id,sha256,byte_size,media_role,storage_ref,created_at) VALUES (?,?,?,?,?,?,?)`);
   const insertLocation = database.prepare(`INSERT INTO file_locations
     (location_id,file_id,node_id,original_filename,original_path,source_kind,source_node_id,path_ref,storage_class,availability,created_at)
-    VALUES (?,?,?, ?,?,'import',NULL,?,'external',?,?)`);
+    VALUES (?,?,?,?,?,?,NULL,?,'external',?,?)`);
   const seed = database.transaction(() => {
     for (let index = 0; index < total; index++) {
       const assetId = `asset-${String(index).padStart(6, '0')}`;
@@ -60,11 +61,13 @@ test.beforeAll(async () => {
       const sourcePath = `E:/PhotoMesh/fixture-library/album-${Math.floor(index / 1000)}/${filename}`;
       insertFile.run(fileId, assetId, index.toString(16).padStart(64, '0'), 128 + index % 8192,
         'original', `external:e2e:${index}`, createdAt);
-      insertLocation.run(`loc-${index}`, fileId, origin, filename, sourcePath, `path-ref:${index}`,
-        availability[index % availability.length], createdAt);
+      const locationOrdinal = Math.floor(index / 20);
+      const sourceKind = locationOrdinal % 4 === 0 ? 'upload' : 'import';
+      insertLocation.run(`loc-${index}`, fileId, origin, filename, sourcePath, sourceKind, `path-ref:${index}`,
+        availability[locationOrdinal % availability.length], createdAt);
       if (index % 1000 === 0) {
         insertLocation.run(`loc-alt-${index}`, fileId, origin, `alternate-${filename}`,
-          `E:/PhotoMesh/fixture-library/alternate/${filename}`, `path-alt:${index}`, 'online', createdAt);
+          `E:/PhotoMesh/fixture-library/alternate/${filename}`, 'upload', `path-alt:${index}`, 'online', createdAt);
       }
     }
   });
@@ -145,22 +148,37 @@ test('virtual timeline pages through 100k records and search stays server pagina
     expect(pageResult.nextCursor).toBeTruthy();
     datePerformanceSamplesMs.push(performance.now() - started);
   }
+  const combinationQuery = 'q=trip&dateFrom=2024-02-01&dateTo=2024-03-11&kind=video&sourceKind=upload&availability=online';
+  for (let i = 0; i < 100; i++) {
+    const started = performance.now();
+    const response = await page.request.get(`${endpoint}/v1/assets?libraryId=fixture-library&limit=50&${combinationQuery}`, {
+      headers: { authorization: 'Bearer e2e-token' }
+    });
+    expect(response.ok()).toBeTruthy();
+    const pageResult = await response.json() as { items: unknown[]; nextCursor: string | null };
+    expect(pageResult.items).toHaveLength(50);
+    expect(pageResult.nextCursor).toBeTruthy();
+    filterCombinationSamplesMs.push(performance.now() - started);
+  }
   const shortQueryResponse = await page.request.get(`${endpoint}/v1/assets?libraryId=fixture-library&limit=50&q=ab`, {
     headers: { authorization: 'Bearer e2e-token' }
   });
   expect(shortQueryResponse.status()).toBe(400);
   const sortedSamples = [...performanceSamplesMs].sort((a, b) => a - b);
   const sortedDateSamples = [...datePerformanceSamplesMs].sort((a, b) => a - b);
+  const sortedFilterSamples = [...filterCombinationSamplesMs].sort((a, b) => a - b);
   const percentile = (samples: number[], p: number): number => samples[Math.ceil(p * samples.length) - 1] ?? 0;
   const sqliteVersion = (database.prepare('SELECT sqlite_version() AS version').get() as { version: string }).version;
   const sqlitePageCount = database.pragma('page_count', { simple: true }) as number;
   const databaseFileBytes = await fileSizeOrZero(databasePath);
   const walFileBytes = await fileSizeOrZero(`${databasePath}-wal`);
   const report = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     dataset: {
-      assets: total, queries: performanceSamplesMs.length, dateFilteredQueries: datePerformanceSamplesMs.length, pageSize: 50,
+      assets: total, queries: performanceSamplesMs.length, dateFilteredQueries: datePerformanceSamplesMs.length,
+      filterCombinationQueries: filterCombinationSamplesMs.length, pageSize: 50,
       terms: queryTerms, libraryCount: 1, originNodeCount: 4, assetKinds: ['photo', 'video', 'live_photo'],
+      sourceKinds: ['upload', 'import'], availability: ['online', 'cached', 'offline', 'missing'],
       nullableCaptureEvery: 37, fileLocationsEvery: 20, secondaryLocationEvery: 1000
     },
     storage: {
@@ -176,8 +194,12 @@ test('virtual timeline pages through 100k records and search stays server pagina
         p50Ms: percentile(sortedDateSamples, 0.50), p95Ms: percentile(sortedDateSamples, 0.95),
         p99Ms: percentile(sortedDateSamples, 0.99), maxMs: sortedDateSamples.at(-1) ?? 0, samples: datePerformanceSamplesMs.length
       },
+      combinedFilterSearch: {
+        query: combinationQuery, p50Ms: percentile(sortedFilterSamples, 0.50), p95Ms: percentile(sortedFilterSamples, 0.95),
+        p99Ms: percentile(sortedFilterSamples, 0.99), maxMs: sortedFilterSamples.at(-1) ?? 0, samples: filterCombinationSamplesMs.length
+      },
       p50Ms: percentile(sortedSamples, 0.50), p95Ms: percentile(sortedSamples, 0.95), p99Ms: percentile(sortedSamples, 0.99), maxMs: sortedSamples.at(-1) ?? 0,
-      rawLatencyMs: { warmSearch: performanceSamplesMs, dateFilteredSearch: datePerformanceSamplesMs, sqlitePageCacheReset: [coldCacheMs] }
+      rawLatencyMs: { warmSearch: performanceSamplesMs, dateFilteredSearch: datePerformanceSamplesMs, filterCombinationSearch: filterCombinationSamplesMs, sqlitePageCacheReset: [coldCacheMs] }
     },
     validation: { twoCodePointQueryStatus: shortQueryResponse.status(), expectedStatus: 400 },
     environment: {
@@ -186,13 +208,15 @@ test('virtual timeline pages through 100k records and search stays server pagina
       totalRamMiB: Math.round(os.totalmem() / 1024 / 1024), peakRssMiB: Math.round(process.memoryUsage().rss / 1024 / 1024)
     },
     thresholdMs: 1_000,
-    passed: percentile(sortedSamples, 0.95) < 1_000 && percentile(sortedDateSamples, 0.95) < 1_000 && shortQueryResponse.status() === 400
+    passed: percentile(sortedSamples, 0.95) < 1_000 && percentile(sortedDateSamples, 0.95) < 1_000 &&
+      percentile(sortedFilterSamples, 0.95) < 1_000 && shortQueryResponse.status() === 400
   };
-  const output = process.env.PHOTOMESH_PERF_REPORT ?? 'artifacts/performance/gallery-100k.json';
+  const output = process.env.PHOTOMESH_PERF_REPORT ?? 'artifacts/performance/gallery-100k-pm049.json';
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
   expect(report.queryApi.p95Ms, `100k query API P95 ${report.queryApi.p95Ms.toFixed(2)}ms must be < 1000ms`).toBeLessThan(1_000);
   expect(report.queryApi.dateFilteredSearch.p95Ms, `100k date-filtered search P95 ${report.queryApi.dateFilteredSearch.p95Ms.toFixed(2)}ms must be < 1000ms`).toBeLessThan(1_000);
+  expect(report.queryApi.combinedFilterSearch.p95Ms, `100k combined-filter search P95 ${report.queryApi.combinedFilterSearch.p95Ms.toFixed(2)}ms must be < 1000ms`).toBeLessThan(1_000);
   expect(report.validation.twoCodePointQueryStatus).toBe(400);
 
   await search.fill('target');

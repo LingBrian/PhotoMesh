@@ -17,7 +17,7 @@ describe('getDiagnostics', () => {
     const result = await getDiagnostics({
       checkDatabase,
       checkStorage,
-      apiCapabilities: () => ['rest', 'mediaVersions'],
+      apiCapabilities: () => ['rest', 'mediaVersions', 'galleryFilters'],
       storageCapabilities: () => ['managedFiles'],
       identityCapabilities: () => ['nodeIdentity', 'eventSigning']
     });
@@ -26,7 +26,7 @@ describe('getDiagnostics', () => {
       status: 'ok',
       readiness: 'ready',
       components: {
-        api: { status: 'ok', capabilities: ['rest', 'mediaVersions'] },
+        api: { status: 'ok', capabilities: ['rest', 'mediaVersions', 'galleryFilters'] },
         database: { status: 'ok', capabilities: ['sqlite'] },
         storage: { status: 'ok', capabilities: ['managedFiles'] },
         identity: { status: 'ok', capabilities: ['nodeIdentity', 'eventSigning'] }

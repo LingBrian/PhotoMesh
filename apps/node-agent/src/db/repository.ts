@@ -119,6 +119,9 @@ export interface GallerySearchFilters {
   q?: string;
   dateFrom?: string;
   dateTo?: string;
+  kind?: AssetKind;
+  sourceKind?: SourceKind;
+  availability?: GalleryAssetRecord['availability'];
 }
 
 export type AssetTagMutationResult = 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'limit_reached';
@@ -1039,6 +1042,9 @@ export class SqliteRepository implements UploadRepository {
       where.push('c.captured_at < ?');
       parameters.push(`${filters.dateTo}T00:00:00.000Z`);
     }
+    if (filters.kind) { where.push('c.kind = ?'); parameters.push(filters.kind); }
+    if (filters.sourceKind) { where.push('c.source_kind = ?'); parameters.push(filters.sourceKind); }
+    if (filters.availability) { where.push('c.availability = ?'); parameters.push(filters.availability); }
     if (position) {
       if (position.capturedAt === null) {
         where.push('c.captured_at IS NULL AND c.asset_id COLLATE BINARY < ?');
@@ -1424,6 +1430,9 @@ interface NormalizedGallerySearchFilters {
   q: string;
   dateFrom: string | null;
   dateTo: string | null;
+  kind: AssetKind | null;
+  sourceKind: SourceKind | null;
+  availability: GalleryAssetRecord['availability'] | null;
 }
 
 interface GalleryCursorPosition {
@@ -1442,7 +1451,16 @@ export function normalizeGallerySearchFilters(filters: GallerySearchFilters): No
   const dateFrom = normalizeGalleryDate(filters.dateFrom);
   const dateTo = normalizeGalleryDate(filters.dateTo);
   if (dateFrom && dateTo && dateFrom >= dateTo) throw new Error('invalid gallery date range');
-  return { q, dateFrom, dateTo };
+  const kind = normalizeGalleryEnum(filters.kind, ['photo', 'video', 'live_photo'], 'kind');
+  const sourceKind = normalizeGalleryEnum(filters.sourceKind, ['upload', 'import'], 'source kind');
+  const availability = normalizeGalleryEnum(filters.availability, ['online', 'cached', 'offline', 'missing'], 'availability');
+  return { q, dateFrom, dateTo, kind, sourceKind, availability };
+}
+
+function normalizeGalleryEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !allowed.includes(value as T)) throw new Error(`invalid gallery ${label}`);
+  return value as T;
 }
 
 function normalizeGalleryDate(value: string | undefined): string | null {
@@ -1457,15 +1475,23 @@ function toFts5Phrase(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
-function gallerySearchFilterHash(filters: NormalizedGallerySearchFilters): string {
-  return createHash('sha256').update(JSON.stringify({ q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo })).digest('hex');
+function galleryCursorVersion(filters: NormalizedGallerySearchFilters): 1 | 2 {
+  return filters.kind || filters.sourceKind || filters.availability ? 2 : 1;
+}
+
+function gallerySearchFilterHash(filters: NormalizedGallerySearchFilters, version: 1 | 2): string {
+  const canonical = version === 1
+    ? { q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo }
+    : { q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo, kind: filters.kind, sourceKind: filters.sourceKind, availability: filters.availability };
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
 function encodeGalleryCursor(
   capturedAt: string | null, assetId: string, libraryId: string, filters: NormalizedGallerySearchFilters
 ): string {
+  const version = galleryCursorVersion(filters);
   return Buffer.from(JSON.stringify({
-    version: 1, libraryId, filterHash: gallerySearchFilterHash(filters), sort: GALLERY_CURSOR_SORT, capturedAt, assetId
+    version, libraryId, filterHash: gallerySearchFilterHash(filters, version), sort: GALLERY_CURSOR_SORT, capturedAt, assetId
   }), 'utf8').toString('base64url');
 }
 
@@ -1475,8 +1501,10 @@ function decodeGalleryCursor(
   try {
     if (value.length > 2048 || Buffer.from(value, 'base64url').toString('base64url') !== value) throw new Error('invalid cursor');
     const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>;
-    if (Object.keys(decoded).sort().join(',') !== GALLERY_CURSOR_KEYS.join(',') || decoded.version !== 1 ||
-      decoded.libraryId !== libraryId || decoded.filterHash !== gallerySearchFilterHash(filters) || decoded.sort !== GALLERY_CURSOR_SORT ||
+    const version = decoded.version;
+    if (Object.keys(decoded).sort().join(',') !== GALLERY_CURSOR_KEYS.join(',') || (version !== 1 && version !== 2) ||
+      version !== galleryCursorVersion(filters) || decoded.libraryId !== libraryId ||
+      decoded.filterHash !== gallerySearchFilterHash(filters, version) || decoded.sort !== GALLERY_CURSOR_SORT ||
       !(decoded.capturedAt === null || isCanonicalUtcTimestamp(decoded.capturedAt)) || typeof decoded.assetId !== 'string' ||
       decoded.assetId.length < 1 || decoded.assetId.length > 256) throw new Error('invalid cursor');
     return { capturedAt: decoded.capturedAt as string | null, assetId: decoded.assetId };

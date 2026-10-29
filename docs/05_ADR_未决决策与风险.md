@@ -178,3 +178,11 @@
 - **决定：** `GET /v1/assets` 使用大小写不敏感字面子串检索文件名/路径，保留资产 ID/来源节点 ID 搜索；非空 q 至少3个 Unicode code points（更短返回400）；可选 UTC `dateFrom`/`dateTo` 半开区间；本机及同步投影均参与文本检索。未授权请求在查库前拒绝；不新增路径/用户归属字段。
 - **兼容/迁移：** append-only `0011_gallery_search_index` 维护 FTS5 trigram 派生索引与图库/拍摄日期分页索引；query/cursor 参数有界、唯一且允许字段明确，keyset 游标绑定图库和规范化搜索条件。旧二进制拒绝未知迁移；仅隔离 DB 测试备份、索引回填/恢复。
 - **边界：** PM-048 不做类型、来源、可用性等组合筛选（PM-049）；排序只保证静态数据集稳定分页，不承诺并发写入快照；不运行生产迁移、不 push/merge/release。
+
+## ADR-022：PM-049 日期/类型/来源/可用性组合筛选
+
+- **状态：** 用户于2026-10-29批准范围；详见 [`ADR-022`](adr/ADR-022-pm049-filter-combinations.md)。隔离分支实现与测试通过，未执行生产迁移。
+- **决定：** `GET /v1/assets` 增加 kind/sourceKind/availability 精确枚举筛选，与 q/UTC 半开日期按 AND 组合；筛选绑定分页 cursor，旧无新维度 cursor 保持 v1；新增 `galleryFilters` 能力标志。
+- **兼容/迁移：** 只追加 `0012_gallery_filter_indexes` 三个维度/图库/拍摄时间索引，不改写 `0001`–`0011`；隔离数据库验证备份失败原子性、旧二进制拒绝和索引查询计划。
+- **验证：** 单测/HTTP/OpenAPI 契约、根级 lint/typecheck/test/contracts/build 与 100k 文件型 HTTP/WAL 日期+三维组合筛选均通过；详见 [ADR-022](adr/ADR-022-pm049-filter-combinations.md) 及 [100k 基准报告](../artifacts/performance/gallery-100k-pm049.json)。
+- **边界：** 仅限隔离分支与本地提交；不运行生产迁移、不 push/merge/release。

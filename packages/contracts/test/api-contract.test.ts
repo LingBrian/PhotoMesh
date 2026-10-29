@@ -55,7 +55,7 @@ interface ContractOperation {
   security?: unknown[];
   parameters?: Array<{
     name?: string; in?: string; required?: boolean; $ref?: string;
-    description?: string; schema?: { type?: string; maxLength?: number; minLength?: number; pattern?: string; format?: string; 'x-maxUtf16CodeUnits'?: number };
+    description?: string; schema?: { type?: string; maxLength?: number; minLength?: number; pattern?: string; format?: string; enum?: string[]; 'x-maxUtf16CodeUnits'?: number };
   }>;
   requestBody?: { required?: boolean; content?: Record<string, { schema?: unknown }> };
 }
@@ -86,6 +86,7 @@ const routes: RouteCase[] = [
   { template: '/v1/libraries', method: 'get', path: '/v1/libraries', status: 403, error: 'forbidden' },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 403, error: 'forbidden' },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&q=photo&dateFrom=2026-01-01&dateTo=2026-02-01', status: 200, authorization: 'Bearer contract-admin', expectedTags: [], headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&kind=video&sourceKind=upload&availability=online', status: 200, authorization: 'Bearer contract-admin', expectedTags: [], headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&q=ab', status: 400, error: 'invalid_request' },
   { template: '/v1/assets/{assetId}/original', method: 'get', path: '/v1/assets/asset/original', status: 404, error: 'not_found' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/thumbnail', method: 'get', path: '/v1/libraries/lib/assets/asset/thumbnail', status: 404, error: 'not_found' },
@@ -289,7 +290,7 @@ describe('implemented Node HTTP API contract', () => {
     expect(contract.paths['/v1/health']!.get!.security).toEqual([]);
   });
 
-  it('documents PM-048 bounded indexed search, UTC date filters, and private responses', async () => {
+  it('documents PM-048/049 bounded search filters, cursor scope, and private responses', async () => {
     const contract = await loadContract();
     const operation = contract.paths['/v1/assets']?.get;
     const parameters = new Map((operation?.parameters ?? []).filter((parameter) => parameter.in === 'query').map((parameter) => [parameter.name, parameter]));
@@ -298,6 +299,10 @@ describe('implemented Node HTTP API contract', () => {
     expect(parameters.get('q')?.description).toContain('at least 3 Unicode code points');
     expect(parameters.get('dateFrom')?.schema?.format).toBe('date');
     expect(parameters.get('dateTo')?.schema?.format).toBe('date');
+    expect(parameters.get('kind')?.schema?.enum).toEqual(['photo', 'video', 'live_photo']);
+    expect(parameters.get('sourceKind')?.schema?.enum).toEqual(['upload', 'import']);
+    expect(parameters.get('availability')?.schema?.enum).toEqual(['online', 'cached', 'offline', 'missing']);
+    expect(JSON.stringify(contract.components.schemas.DiagnosticComponent)).toContain('galleryFilters');
     expect(operation?.responses['400']).toBeDefined();
     expect((operation?.responses['200']?.headers?.['Cache-Control'] as { schema?: { const?: string } } | undefined)?.schema?.const)
       .toBe('private, no-store');
@@ -427,7 +432,7 @@ describe('implemented Node HTTP API contract', () => {
     expect(contract.paths['/v1/pairing/peers/{peerId}/rating-sync-status']?.get).toBeDefined();
 
     const diagnosticCapabilities = (schemas.DiagnosticComponent?.properties?.capabilities?.items as { enum?: string[] } | undefined)?.enum;
-    expect(diagnosticCapabilities).toEqual(expect.arrayContaining(['assetRatings', 'ratingSync', 'assetFavorites', 'favoriteSync']));
+    expect(diagnosticCapabilities).toEqual(expect.arrayContaining(['assetRatings', 'ratingSync', 'assetFavorites', 'favoriteSync', 'gallerySearch', 'galleryFilters']));
   });
 
   it('declares an open error envelope and a request-id header for every response', async () => {
