@@ -53,7 +53,10 @@ interface ContractResponse {
 interface ContractOperation {
   responses: Record<string, ContractResponse>;
   security?: unknown[];
-  parameters?: Array<{ name?: string; in?: string; required?: boolean; $ref?: string }>;
+  parameters?: Array<{
+    name?: string; in?: string; required?: boolean; $ref?: string;
+    description?: string; schema?: { type?: string; maxLength?: number; minLength?: number; pattern?: string; format?: string; 'x-maxUtf16CodeUnits'?: number };
+  }>;
   requestBody?: { required?: boolean; content?: Record<string, { schema?: unknown }> };
 }
 
@@ -82,6 +85,8 @@ const routes: RouteCase[] = [
   { template: '/v1/diagnostics', method: 'get', path: '/v1/diagnostics', status: 200, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'no-store' } },
   { template: '/v1/libraries', method: 'get', path: '/v1/libraries', status: 403, error: 'forbidden' },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 403, error: 'forbidden' },
+  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&q=photo&dateFrom=2026-01-01&dateTo=2026-02-01', status: 200, authorization: 'Bearer contract-admin', expectedTags: [], headers: { 'Cache-Control': 'private, no-store' } },
+  { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&q=ab', status: 400, error: 'invalid_request' },
   { template: '/v1/assets/{assetId}/original', method: 'get', path: '/v1/assets/asset/original', status: 404, error: 'not_found' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/thumbnail', method: 'get', path: '/v1/libraries/lib/assets/asset/thumbnail', status: 404, error: 'not_found' },
   { template: '/v1/libraries/{libraryId}/assets/{assetId}/versions', method: 'get', path: '/v1/libraries/lib/assets/asset/versions', status: 403, error: 'forbidden' },
@@ -282,6 +287,20 @@ describe('implemented Node HTTP API contract', () => {
     expect(documented).toEqual(exercised);
     expect(contract.security).toEqual([{ nodeAdminBearer: [] }]);
     expect(contract.paths['/v1/health']!.get!.security).toEqual([]);
+  });
+
+  it('documents PM-048 bounded indexed search, UTC date filters, and private responses', async () => {
+    const contract = await loadContract();
+    const operation = contract.paths['/v1/assets']?.get;
+    const parameters = new Map((operation?.parameters ?? []).filter((parameter) => parameter.in === 'query').map((parameter) => [parameter.name, parameter]));
+    expect(parameters.get('cursor')?.schema).toMatchObject({ maxLength: 2048, pattern: '^[A-Za-z0-9_-]+$' });
+    expect(parameters.get('q')?.schema).toMatchObject({ maxLength: 256, 'x-maxUtf16CodeUnits': 256 });
+    expect(parameters.get('q')?.description).toContain('at least 3 Unicode code points');
+    expect(parameters.get('dateFrom')?.schema?.format).toBe('date');
+    expect(parameters.get('dateTo')?.schema?.format).toBe('date');
+    expect(operation?.responses['400']).toBeDefined();
+    expect((operation?.responses['200']?.headers?.['Cache-Control'] as { schema?: { const?: string } } | undefined)?.schema?.const)
+      .toBe('private, no-store');
   });
 
   it('defines bounded, strict album DTOs and private album responses', async () => {

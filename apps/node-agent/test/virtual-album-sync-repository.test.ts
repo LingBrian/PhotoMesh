@@ -51,12 +51,12 @@ function addAsset(db: Database.Database): void {
 }
 
 describe('PM-045 migration and global identifier registry', () => {
-  it('preserves the isolated virtual album stream and event-ID registry after migrations through 0010', async () => {
+  it('preserves the isolated virtual album stream and event-ID registry after migrations through 0011', async () => {
     const db = new Database(':memory:');
     try {
       const repository = await migrateToLatest(db);
       const version = db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id DESC LIMIT 1').get() as { migration_id: string };
-      expect(version.migration_id).toBe('0010_asset_ratings');
+      expect(version.migration_id).toBe('0011_gallery_search_index');
       for (const table of [
         'sync_global_id_registry', 'library_album_write_grants', 'library_album_delete_grants',
         'album_sync_event_log', 'album_sync_inbox', 'album_sync_outbox', 'album_sync_author_heads',
@@ -134,7 +134,7 @@ describe('PM-045 migration and global identifier registry', () => {
       await migrateToLatest(db);
       const oldBinary = new SqliteRepository(db);
       await expect(oldBinary.migrate(migrations.slice(0, 7))).rejects.toThrow(/unknown migration 0008_virtual_album_sync/);
-      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 10 });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 11 });
       expect(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'album_sync_event_log'").get()).toBeDefined();
     } finally {
       db.close();

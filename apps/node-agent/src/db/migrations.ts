@@ -1617,5 +1617,146 @@ export const migrations: readonly Migration[] = [
         UNION ALL SELECT 1 FROM sync_asset_projection p WHERE p.library_id=NEW.library_id AND p.asset_id=NEW.asset_id AND p.tombstone_event_id IS NULL)
       BEGIN SELECT RAISE(ABORT,'rating projection requires visible asset'); END;
     `
+  },
+  {
+    id: '0011_gallery_search_index',
+    sql: `
+      CREATE TABLE gallery_search_content (
+        rowid INTEGER PRIMARY KEY,
+        library_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        origin_node_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('photo','video','live_photo')),
+        sha256 TEXT NOT NULL,
+        byte_size INTEGER NOT NULL CHECK(byte_size>=0),
+        filename TEXT NOT NULL,
+        source_path TEXT,
+        source_kind TEXT NOT NULL CHECK(source_kind IN ('upload','import')),
+        availability TEXT NOT NULL CHECK(availability IN ('online','cached','offline','missing')),
+        captured_at TEXT,
+        UNIQUE(library_id,asset_id)
+      );
+      CREATE INDEX gallery_search_content_capture_idx ON gallery_search_content(library_id,captured_at DESC,asset_id COLLATE BINARY DESC);
+      CREATE VIRTUAL TABLE gallery_search_fts USING fts5(filename,source_path,asset_id,origin_node_id,
+        content='gallery_search_content',content_rowid='rowid',tokenize='trigram');
+
+      CREATE VIEW gallery_search_source AS
+        SELECT a.library_id,a.asset_id,a.origin_node_id,a.kind,COALESCE(f.sha256,'') AS sha256,COALESCE(f.byte_size,0) AS byte_size,
+          COALESCE(l.original_filename,a.asset_id) AS filename,l.original_path AS source_path,
+          CASE WHEN l.source_kind='upload' THEN 'upload' ELSE 'import' END AS source_kind,
+          COALESCE(l.availability,'missing') AS availability,strftime('%Y-%m-%dT%H:%M:%fZ',a.capture_ts) AS captured_at
+        FROM assets a
+        LEFT JOIN asset_files f ON f.asset_id=a.asset_id AND f.media_role='original'
+        LEFT JOIN file_locations l ON l.location_id=(SELECT candidate.location_id FROM file_locations candidate
+          WHERE candidate.file_id=f.file_id AND candidate.node_id=a.origin_node_id
+          ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END,
+            candidate.location_id COLLATE BINARY LIMIT 1)
+        WHERE NOT EXISTS(SELECT 1 FROM sync_asset_projection p WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id AND p.tombstone_event_id IS NOT NULL)
+        UNION ALL
+        SELECT p.library_id,p.asset_id,p.origin_node_id,p.kind,p.sha256,p.byte_length,
+          CASE WHEN json_type(p.metadata_json,'$.filename')='text' THEN json_extract(p.metadata_json,'$.filename') ELSE p.asset_id END,
+          CASE WHEN json_type(p.metadata_json,'$.sourcePath')='text' THEN json_extract(p.metadata_json,'$.sourcePath') ELSE NULL END,
+          CASE WHEN json_extract(p.metadata_json,'$.sourceKind')='upload' THEN 'upload' ELSE 'import' END,
+          'missing',CASE WHEN json_type(p.metadata_json,'$.capturedAt')='text'
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ',json_extract(p.metadata_json,'$.capturedAt')) ELSE NULL END
+        FROM sync_asset_projection p
+        WHERE p.tombstone_event_id IS NULL AND NOT EXISTS(SELECT 1 FROM assets a WHERE a.library_id=p.library_id AND a.asset_id=p.asset_id);
+
+      CREATE TRIGGER gallery_search_fts_ai AFTER INSERT ON gallery_search_content BEGIN
+        INSERT INTO gallery_search_fts(rowid,filename,source_path,asset_id,origin_node_id)
+          VALUES(NEW.rowid,NEW.filename,COALESCE(NEW.source_path,''),NEW.asset_id,NEW.origin_node_id);
+      END;
+      CREATE TRIGGER gallery_search_fts_ad AFTER DELETE ON gallery_search_content BEGIN
+        INSERT INTO gallery_search_fts(gallery_search_fts,rowid,filename,source_path,asset_id,origin_node_id)
+          VALUES('delete',OLD.rowid,OLD.filename,COALESCE(OLD.source_path,''),OLD.asset_id,OLD.origin_node_id);
+      END;
+      CREATE TRIGGER gallery_search_fts_au AFTER UPDATE ON gallery_search_content BEGIN
+        INSERT INTO gallery_search_fts(gallery_search_fts,rowid,filename,source_path,asset_id,origin_node_id)
+          VALUES('delete',OLD.rowid,OLD.filename,COALESCE(OLD.source_path,''),OLD.asset_id,OLD.origin_node_id);
+        INSERT INTO gallery_search_fts(rowid,filename,source_path,asset_id,origin_node_id)
+          VALUES(NEW.rowid,NEW.filename,COALESCE(NEW.source_path,''),NEW.asset_id,NEW.origin_node_id);
+      END;
+
+      CREATE TRIGGER gallery_search_assets_ai AFTER INSERT ON assets BEGIN
+        DELETE FROM gallery_search_content WHERE library_id=NEW.library_id AND asset_id=NEW.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE library_id=NEW.library_id AND asset_id=NEW.asset_id;
+      END;
+      CREATE TRIGGER gallery_search_assets_au AFTER UPDATE ON assets BEGIN
+        DELETE FROM gallery_search_content WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id;
+        DELETE FROM gallery_search_content WHERE library_id=NEW.library_id AND asset_id=NEW.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE (library_id=OLD.library_id AND asset_id=OLD.asset_id) OR (library_id=NEW.library_id AND asset_id=NEW.asset_id);
+      END;
+      CREATE TRIGGER gallery_search_assets_ad AFTER DELETE ON assets BEGIN
+        DELETE FROM gallery_search_content WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id;
+      END;
+
+      CREATE TRIGGER gallery_search_asset_files_ai AFTER INSERT ON asset_files BEGIN
+        DELETE FROM gallery_search_content WHERE asset_id=NEW.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE asset_id=NEW.asset_id;
+      END;
+      CREATE TRIGGER gallery_search_asset_files_au AFTER UPDATE ON asset_files BEGIN
+        DELETE FROM gallery_search_content WHERE asset_id IN (OLD.asset_id,NEW.asset_id);
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE asset_id IN (OLD.asset_id,NEW.asset_id);
+      END;
+      CREATE TRIGGER gallery_search_asset_files_ad AFTER DELETE ON asset_files BEGIN
+        DELETE FROM gallery_search_content WHERE asset_id=OLD.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE asset_id=OLD.asset_id;
+      END;
+
+      CREATE TRIGGER gallery_search_file_locations_ai AFTER INSERT ON file_locations BEGIN
+        DELETE FROM gallery_search_content WHERE asset_id IN (SELECT asset_id FROM asset_files WHERE file_id=NEW.file_id);
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE asset_id IN (SELECT asset_id FROM asset_files WHERE file_id=NEW.file_id);
+      END;
+      CREATE TRIGGER gallery_search_file_locations_au AFTER UPDATE ON file_locations BEGIN
+        DELETE FROM gallery_search_content WHERE asset_id IN (SELECT asset_id FROM asset_files WHERE file_id IN (OLD.file_id,NEW.file_id));
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE asset_id IN (SELECT asset_id FROM asset_files WHERE file_id IN (OLD.file_id,NEW.file_id));
+      END;
+      CREATE TRIGGER gallery_search_file_locations_ad AFTER DELETE ON file_locations BEGIN
+        DELETE FROM gallery_search_content WHERE asset_id IN (SELECT asset_id FROM asset_files WHERE file_id=OLD.file_id);
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE asset_id IN (SELECT asset_id FROM asset_files WHERE file_id=OLD.file_id);
+      END;
+
+      CREATE TRIGGER gallery_search_projection_ai AFTER INSERT ON sync_asset_projection BEGIN
+        DELETE FROM gallery_search_content WHERE library_id=NEW.library_id AND asset_id=NEW.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE library_id=NEW.library_id AND asset_id=NEW.asset_id;
+      END;
+      CREATE TRIGGER gallery_search_projection_au AFTER UPDATE ON sync_asset_projection BEGIN
+        DELETE FROM gallery_search_content WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id;
+        DELETE FROM gallery_search_content WHERE library_id=NEW.library_id AND asset_id=NEW.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE (library_id=OLD.library_id AND asset_id=OLD.asset_id) OR (library_id=NEW.library_id AND asset_id=NEW.asset_id);
+      END;
+      CREATE TRIGGER gallery_search_projection_ad AFTER DELETE ON sync_asset_projection BEGIN
+        DELETE FROM gallery_search_content WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id;
+        INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+          SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at
+          FROM gallery_search_source WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id;
+      END;
+
+      INSERT INTO gallery_search_content(library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at)
+        SELECT library_id,asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,captured_at FROM gallery_search_source;
+    `
   }
 ];

@@ -171,3 +171,10 @@
 - **决定：** 图库级共享评分；值为整数1–5或null；独立 `asset-ratings-v1` stream 与默认拒绝 `rating-write` grant；基于因果多值寄存器保存并发候选，冲突可见、仅由显式解决事件消解，不采用墙钟 LWW。
 - **兼容/迁移：** 仅追加 `0010_asset_ratings`；N-1 不阻塞共同 streams；持久化幂等操作、因果 inbox/outbox、连续接受游标、冲突历史和可重建投影；只在隔离 DB 运行备份失败与升级/恢复测试。
 - **边界：** 批准仅限隔离 PM-047 分支的 API/schema/protocol实现、测试及本地提交；不运行生产迁移、不 push/merge/release。真实 per-user rating 等到稳定的人类身份/ACL 已有独立方案后另行决定。
+
+## ADR-021：PM-048 授权图库文件名/路径/日期检索
+
+- **状态：** 用户于2026-10-29批准推荐范围。详见 [`ADR-021`](adr/ADR-021-pm048-authorized-search.md)；PM-048 已在隔离分支实现并验证，生产迁移未授权。
+- **决定：** `GET /v1/assets` 使用大小写不敏感字面子串检索文件名/路径，保留资产 ID/来源节点 ID 搜索；非空 q 至少3个 Unicode code points（更短返回400）；可选 UTC `dateFrom`/`dateTo` 半开区间；本机及同步投影均参与文本检索。未授权请求在查库前拒绝；不新增路径/用户归属字段。
+- **兼容/迁移：** append-only `0011_gallery_search_index` 维护 FTS5 trigram 派生索引与图库/拍摄日期分页索引；query/cursor 参数有界、唯一且允许字段明确，keyset 游标绑定图库和规范化搜索条件。旧二进制拒绝未知迁移；仅隔离 DB 测试备份、索引回填/恢复。
+- **边界：** PM-048 不做类型、来源、可用性等组合筛选（PM-049）；排序只保证静态数据集稳定分页，不承诺并发写入快照；不运行生产迁移、不 push/merge/release。

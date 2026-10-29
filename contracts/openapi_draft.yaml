@@ -314,21 +314,30 @@ paths:
         default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/assets:
     get:
-      summary: 授权范围内的游标分页时间线
+      summary: 授权范围内的游标分页图库搜索
       parameters:
         - in: query
           name: libraryId
           required: true
-          schema: {type: string}
+          schema: {type: string, minLength: 1, maxLength: 128}
         - in: query
           name: cursor
-          schema: {type: string}
+          schema: {type: string, maxLength: 2048, pattern: '^[A-Za-z0-9_-]+$'}
         - in: query
           name: limit
           schema: {type: integer, minimum: 1, maximum: 200, default: 50}
         - in: query
           name: q
-          schema: {type: string, maxLength: 256}
+          description: Literal substring; if non-empty, requires at least 3 Unicode code points and at most 256 UTF-16 code units. SQLite FTS5 trigram case-folding; no accent folding.
+          schema: {type: string, maxLength: 256, x-maxUtf16CodeUnits: 256}
+        - in: query
+          name: dateFrom
+          description: Inclusive UTC calendar-date boundary.
+          schema: {type: string, format: date}
+        - in: query
+          name: dateTo
+          description: Exclusive UTC calendar-date boundary.
+          schema: {type: string, format: date}
       responses:
         '200':
           description: Assets page
@@ -338,8 +347,10 @@ paths:
           headers:
             X-Request-ID:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              schema: {type: string, const: 'private, no-store'}
         '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
-        '400': {description: Invalid cursor or query, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: 'Invalid, duplicate, or unknown query parameter; short q; invalid UTC date; or cursor/filter mismatch.', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default:
           description: Unexpected HTTP error using the common error envelope.
           headers:
@@ -1727,10 +1738,10 @@ components:
         capabilities:
           type: array
           uniqueItems: true
-          maxItems: 15
+          maxItems: 16
           items:
             type: string
-            enum: [rest, mediaVersions, thumbnails, assetTags, virtualAlbums, assetFavorites, favoriteSync, tagSync, assetRatings, ratingSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
+            enum: [rest, mediaVersions, thumbnails, assetTags, gallerySearch, virtualAlbums, assetFavorites, favoriteSync, tagSync, assetRatings, ratingSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
     PairingInvite:
       type: object
       required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]

@@ -6,7 +6,7 @@ import { getDiagnostics, getHealth, type HealthDiagnosticsSource } from './healt
 import { UploadError, UploadService, type CreateUploadRequest } from './uploads/service.js';
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
-import { RepositoryConflictError, type AlbumMemberMutationResult, type AlbumMemberPage, type AlbumPage, type AlbumRecord, type AssetTagMutationResult, type TrustedPeerRecord } from './db/repository.js';
+import { RepositoryConflictError, normalizeGallerySearchFilters, type AlbumMemberMutationResult, type AlbumMemberPage, type AlbumPage, type AlbumRecord, type AssetTagMutationResult, type GallerySearchFilters, type TrustedPeerRecord } from './db/repository.js';
 import { maxAssetTagUtf8Bytes } from './asset-tag-limits.js';
 import { decodeAlbumCursor, InvalidAlbumCursorError, normalizeAlbumTitle, type AlbumCursorScope } from './albums/album-utils.js';
 import type { Readable } from 'node:stream';
@@ -86,7 +86,7 @@ const unavailableDiagnostics: HealthDiagnosticsSource = {
 
 export interface GalleryServerControl {
   listLibraries(): Array<{ libraryId: string; title: string }>;
-  listAssets(libraryId: string, cursor: string | undefined, limit: number, query?: string): { items: unknown[]; nextCursor: string | null };
+  listAssets(libraryId: string, cursor: string | undefined, limit: number, filters?: GallerySearchFilters): { items: unknown[]; nextCursor: string | null };
   getOriginal(assetId: string): Promise<{ libraryId: string; filename: string; sha256: string; byteSize: number; availability: string; storageRef: string; originalPath: string | null } | undefined>;
   openOriginal(media: { storageRef: string; originalPath: string | null }): Promise<Readable | undefined> | Readable | undefined;
   listTombstones(libraryId?: string): unknown[];
@@ -202,6 +202,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       ...(options.mediaVersions ? ['mediaVersions'] : []),
       ...(options.thumbnails ? ['thumbnails'] : []),
       ...(options.assetTags ? ['assetTags'] : []),
+      ...(options.gallery ? ['gallerySearch'] : []),
       ...(options.albums ? ['virtualAlbums'] : []),
       ...(options.tagSync ? ['tagSync'] : [])
     ];
@@ -388,32 +389,50 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
 
   if (request.method === 'GET' && url.pathname === '/v1/assets') {
+    const allowedParameters = new Set(['libraryId', 'cursor', 'limit', 'q', 'dateFrom', 'dateTo']);
+    const parameterNames = [...url.searchParams.keys()];
+    if (parameterNames.some((name) => !allowedParameters.has(name)) ||
+      parameterNames.some((name) => url.searchParams.getAll(name).length !== 1)) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
     const libraryId = url.searchParams.get('libraryId');
-    const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;
     const rawLimit = Number(url.searchParams.get('limit') ?? 50);
     const cursor = url.searchParams.get('cursor');
     const rawOffset = cursor === null ? 0 : Number(cursor);
+    const filters: GallerySearchFilters = {
+      ...(url.searchParams.has('q') ? { q: url.searchParams.get('q') ?? '' } : {}),
+      ...(url.searchParams.has('dateFrom') ? { dateFrom: url.searchParams.get('dateFrom') ?? '' } : {}),
+      ...(url.searchParams.has('dateTo') ? { dateTo: url.searchParams.get('dateTo') ?? '' } : {})
+    };
     if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 200 ||
-      (options.gallery ? cursor !== null && !/^[A-Za-z0-9_-]{1,2048}$/.test(cursor) : !Number.isSafeInteger(rawOffset) || rawOffset < 0)) {
+      (options.gallery ? cursor !== null && !/^[A-Za-z0-9_-]{1,2048}$/.test(cursor) : !Number.isSafeInteger(rawOffset) || rawOffset < 0) ||
+      (libraryId !== null && (libraryId.length < 1 || libraryId.length > 128))) {
       sendJson(response, 400, { error: 'invalid_request', requestId }); return;
     }
     if (options.gallery) {
+      try { normalizeGallerySearchFilters(filters); }
+      catch { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+      const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;
       if (!peerId || !libraryId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+      response.setHeader('cache-control', 'private, no-store');
       try {
-        const query = url.searchParams.get('q') ?? '';
-        if (query.length > 256) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
-        const page = options.gallery.listAssets(libraryId, cursor ?? undefined, rawLimit, query);
+        const page = options.gallery.listAssets(libraryId, cursor ?? undefined, rawLimit, filters);
         sendJson(response, 200, page);
       } catch {
         sendJson(response, 400, { error: 'invalid_request', requestId });
       }
       return;
     }
+    if (filters.q !== undefined || filters.dateFrom !== undefined || filters.dateTo !== undefined) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;
     const items = peerId && libraryId ? options.pairingControl?.readLibraryIndex(peerId, libraryId) : undefined;
     if (!items) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
     const page = items.slice(rawOffset, rawOffset + rawLimit).map((item) =>
       isPlainRecord(item) ? { ...item, tags: [] } : item
     );
+    response.setHeader('cache-control', 'private, no-store');
     sendJson(response, 200, { items: page, nextCursor: rawOffset + rawLimit < items.length ? String(rawOffset + rawLimit) : null });
     return;
   }

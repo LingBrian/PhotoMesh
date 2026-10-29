@@ -27,7 +27,7 @@ describe('PM-047 rating register persistence', () => {
       await migrateTo0009(db);
       insertIndexEvent(db, uuid(1), 'asset-1');
       const previous = db.prepare('SELECT migration_id,checksum FROM schema_migrations ORDER BY migration_id').all();
-      await new SqliteRepository(db, { backupBeforeMigration: async () => undefined }).migrate(migrations);
+      await new SqliteRepository(db, { backupBeforeMigration: async () => undefined }).migrate(migrations.slice(0, 10));
       expect(db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id DESC LIMIT 1').get())
         .toEqual({ migration_id: '0010_asset_ratings' });
       expect(db.prepare(`SELECT migration_id,checksum FROM schema_migrations WHERE migration_id <> '0010_asset_ratings' ORDER BY migration_id`).all()).toEqual(previous);

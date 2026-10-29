@@ -283,6 +283,7 @@ const server = createNodeAgentServer({
     checkStorage: async () => { await access(dataDirectory, fsConstants.R_OK | fsConstants.W_OK); },
     apiCapabilities: (): DiagnosticCapability[] => [
       'rest',
+      'gallerySearch',
       ...(mediaVersionService ? ['mediaVersions' as const] : []),
       ...(mediaThumbnailService ? ['thumbnails' as const] : []),
       ...(albumPeerId ? ['virtualAlbums' as const] : []),
@@ -306,7 +307,7 @@ const server = createNodeAgentServer({
   authorizeLibraryRead: (token) => authorizePairingAdmin(token) ? 'local-admin' : undefined,
   gallery: {
     listLibraries: () => repository.listGalleryLibraries(),
-    listAssets: (libraryId, cursor, limit, query) => repository.listGalleryAssets(libraryId, cursor, limit, query),
+    listAssets: (libraryId, cursor, limit, filters) => repository.listGalleryAssets(libraryId, cursor, limit, filters),
     getOriginal: async (assetId) => repository.getGalleryMedia(assetId),
     openOriginal: openOriginalMedia,
     listTombstones: (libraryId) => repository.listActiveTombstones(libraryId),

@@ -91,8 +91,8 @@ describe('SQLite repository and migrations', () => {
     const second = repository.listGalleryAssets('library', first.nextCursor!, 2);
     expect(second.items.map((asset) => asset.assetId)).toEqual(['asset-c', 'asset-a']);
     expect(second.nextCursor).toBeNull();
-    expect(repository.listGalleryAssets('library', undefined, 1, 'Weekend').items.map((asset) => asset.filename)).toEqual(['Weekend.jpg']);
-    expect(repository.listGalleryAssets('library', undefined, 5, '%').items).toEqual([]);
+    expect(repository.listGalleryAssets('library', undefined, 1, { q: 'Weekend' }).items.map((asset) => asset.filename)).toEqual(['Weekend.jpg']);
+    expect(repository.listGalleryAssets('library', undefined, 5, { q: '%%%' }).items).toEqual([]);
     for (const id of ['null-a', 'null-b', 'null-c']) {
       db.prepare('INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at) VALUES (?, ?, ?, ?, NULL, ?)')
         .run(id, 'library', 'node-a', 'photo', '2026-05-04T00:00:00.000Z');

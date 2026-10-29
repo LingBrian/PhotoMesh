@@ -115,6 +115,12 @@ export interface GalleryAssetRecord extends LibraryIndexAsset {
   ratingCandidates: Array<number | null>;
 }
 
+export interface GallerySearchFilters {
+  q?: string;
+  dateFrom?: string;
+  dateTo?: string;
+}
+
 export type AssetTagMutationResult = 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'limit_reached';
 
 export interface AlbumRecord {
@@ -1013,64 +1019,52 @@ export class SqliteRepository implements UploadRepository {
     return result;
   }
 
-  listGalleryAssets(libraryId: string, cursor: string | undefined, limit: number, query = ''): { items: GalleryAssetRecord[]; nextCursor: string | null } {
-    const position = cursor ? decodeGalleryCursor(cursor) : undefined;
-    const localCursorSql = !position ? '' : position.capturedAt === null
-      ? 'AND a.capture_ts IS NULL AND a.asset_id < ?'
-      : 'AND (a.capture_ts < ? OR a.capture_ts IS NULL OR (a.capture_ts = ? AND a.asset_id < ?))';
-    const localCursorArgs = !position ? [] : position.capturedAt === null
-      ? [position.assetId]
-      : [position.capturedAt, position.capturedAt, position.assetId];
-    const localRows = this.db.prepare(`SELECT a.asset_id, a.library_id, a.origin_node_id, a.kind, a.capture_ts AS captured_at,
-        f.sha256, f.byte_size, COALESCE(l.original_filename, a.asset_id) AS filename, l.original_path AS source_path,
-        COALESCE(l.source_kind, 'import') AS source_kind, COALESCE(l.availability, 'missing') AS availability,
+  listGalleryAssets(
+    libraryId: string, cursor: string | undefined, limit: number, search: GallerySearchFilters = {}
+  ): { items: GalleryAssetRecord[]; nextCursor: string | null } {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('invalid gallery limit');
+    const filters = normalizeGallerySearchFilters(search);
+    const position = cursor ? decodeGalleryCursor(cursor, libraryId, filters) : undefined;
+    const where: string[] = ['c.library_id = ?'];
+    const parameters: Array<string | number> = [libraryId];
+    if (filters.q) {
+      where.push(`c.rowid IN (SELECT rowid FROM gallery_search_fts WHERE gallery_search_fts MATCH ?)`);
+      parameters.push(toFts5Phrase(filters.q));
+    }
+    if (filters.dateFrom) {
+      where.push('c.captured_at >= ?');
+      parameters.push(`${filters.dateFrom}T00:00:00.000Z`);
+    }
+    if (filters.dateTo) {
+      where.push('c.captured_at < ?');
+      parameters.push(`${filters.dateTo}T00:00:00.000Z`);
+    }
+    if (position) {
+      if (position.capturedAt === null) {
+        where.push('c.captured_at IS NULL AND c.asset_id COLLATE BINARY < ?');
+        parameters.push(position.assetId);
+      } else {
+        where.push('(c.captured_at < ? OR c.captured_at IS NULL OR (c.captured_at = ? AND c.asset_id COLLATE BINARY < ?))');
+        parameters.push(position.capturedAt, position.capturedAt, position.assetId);
+      }
+    }
+    const rows = this.db.prepare(`SELECT c.asset_id,c.library_id,c.origin_node_id,c.kind,c.captured_at AS captured_at,
+        c.sha256,c.byte_size,c.filename,NULLIF(c.source_path,'') AS source_path,c.source_kind,c.availability,
         CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite,
-        r.rating AS rating, COALESCE(r.conflict, 0) AS rating_conflict,
-        COALESCE(r.candidates_json, '[]') AS rating_candidates_json
-      FROM assets a LEFT JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
-      LEFT JOIN asset_favorites fav ON fav.library_id = a.library_id AND fav.asset_id = a.asset_id
-      LEFT JOIN asset_rating_projection r ON r.library_id = a.library_id AND r.asset_id = a.asset_id
-      LEFT JOIN file_locations l ON l.location_id = (SELECT candidate.location_id FROM file_locations candidate
-        WHERE candidate.file_id = f.file_id AND candidate.node_id = a.origin_node_id
-        ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END LIMIT 1)
-      WHERE a.library_id = ? AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p
-        WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
-        AND (? = '' OR instr(lower(COALESCE(l.original_filename, a.asset_id)), lower(?)) > 0 OR
-          instr(lower(a.asset_id), lower(?)) > 0 OR instr(lower(a.origin_node_id), lower(?)) > 0 OR
-          instr(lower(COALESCE(l.original_path, '')), lower(?)) > 0)
-        ${localCursorSql}
-      ORDER BY a.capture_ts DESC, a.asset_id DESC LIMIT ?`).all(
-        libraryId, query, query, query, query, query, ...localCursorArgs, limit + 1
-      ) as GalleryAssetSqlRow[];
-    const projectionCursorSql = position?.capturedAt === null ? 'AND p.asset_id < ?' : '';
-    const projectionCursorArgs = position?.capturedAt === null ? [position.assetId] : [];
-    const projectionRows = this.db.prepare(`SELECT p.asset_id, p.library_id, p.origin_node_id, p.kind, NULL AS captured_at,
-        p.sha256, p.byte_length AS byte_size,
-        COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id) AS filename,
-        json_extract(p.metadata_json, '$.sourcePath') AS source_path,
-        COALESCE(json_extract(p.metadata_json, '$.sourceKind'), 'import') AS source_kind, 'missing' AS availability,
-        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite,
-        r.rating AS rating, COALESCE(r.conflict, 0) AS rating_conflict,
-        COALESCE(r.candidates_json, '[]') AS rating_candidates_json
-      FROM sync_asset_projection p LEFT JOIN asset_favorites fav ON fav.library_id = p.library_id AND fav.asset_id = p.asset_id
-      LEFT JOIN asset_rating_projection r ON r.library_id = p.library_id AND r.asset_id = p.asset_id
-      WHERE p.library_id = ? AND p.tombstone_event_id IS NULL
-        AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
-        AND (? = '' OR instr(lower(COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id)), lower(?)) > 0 OR
-          instr(lower(p.asset_id), lower(?)) > 0 OR instr(lower(p.origin_node_id), lower(?)) > 0 OR
-          instr(lower(COALESCE(json_extract(p.metadata_json, '$.sourcePath'), '')), lower(?)) > 0)
-        ${projectionCursorSql}
-      ORDER BY p.asset_id DESC LIMIT ?`).all(
-        libraryId, query, query, query, query, query, ...projectionCursorArgs, limit + 1
-      ) as GalleryAssetSqlRow[];
-    const records = [...localRows, ...projectionRows].map(toGalleryAsset).sort(compareGalleryAsset);
-    const hasMore = records.length > limit;
-    const page = records.slice(0, limit);
+        r.rating AS rating,COALESCE(r.conflict,0) AS rating_conflict,
+        COALESCE(r.candidates_json,'[]') AS rating_candidates_json
+      FROM gallery_search_content c
+      LEFT JOIN asset_favorites fav ON fav.library_id=c.library_id AND fav.asset_id=c.asset_id
+      LEFT JOIN asset_rating_projection r ON r.library_id=c.library_id AND r.asset_id=c.asset_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY c.captured_at DESC,c.asset_id COLLATE BINARY DESC LIMIT ?`).all(...parameters, limit + 1) as GalleryAssetSqlRow[];
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit).map(toGalleryAsset);
     const last = page.at(-1);
     const tagsByAsset = this.listAssetTags(libraryId, page.map((asset) => asset.assetId));
     return {
       items: page.map((asset) => ({ ...asset, tags: tagsByAsset.get(asset.assetId) ?? [] })),
-      nextCursor: hasMore && last ? encodeGalleryCursor(last.capturedAt, last.assetId) : null
+      nextCursor: hasMore && last ? encodeGalleryCursor(last.capturedAt, last.assetId, libraryId, filters) : null
     };
   }
 
@@ -1426,28 +1420,74 @@ function parseRatingCandidates(value: string | null): Array<number | null> {
   } catch { return []; }
 }
 
-function compareGalleryAsset(left: GalleryAssetRecord, right: GalleryAssetRecord): number {
-  if (left.capturedAt !== right.capturedAt) {
-    if (left.capturedAt === null) return 1;
-    if (right.capturedAt === null) return -1;
-    return right.capturedAt.localeCompare(left.capturedAt);
+interface NormalizedGallerySearchFilters {
+  q: string;
+  dateFrom: string | null;
+  dateTo: string | null;
+}
+
+interface GalleryCursorPosition {
+  capturedAt: string | null;
+  assetId: string;
+}
+
+const GALLERY_CURSOR_SORT = 'capture-desc-asset-binary-desc-v1';
+const GALLERY_CURSOR_KEYS = ['assetId', 'capturedAt', 'filterHash', 'libraryId', 'sort', 'version'];
+
+export function normalizeGallerySearchFilters(filters: GallerySearchFilters): NormalizedGallerySearchFilters {
+  const q = filters.q ?? '';
+  if (typeof q !== 'string' || q.length > 256 || (q !== '' && Array.from(q).length < 3)) {
+    throw new Error('invalid gallery search query');
   }
-  return left.assetId === right.assetId ? 0 : left.assetId < right.assetId ? 1 : -1;
+  const dateFrom = normalizeGalleryDate(filters.dateFrom);
+  const dateTo = normalizeGalleryDate(filters.dateTo);
+  if (dateFrom && dateTo && dateFrom >= dateTo) throw new Error('invalid gallery date range');
+  return { q, dateFrom, dateTo };
 }
 
-function encodeGalleryCursor(capturedAt: string | null, assetId: string): string {
-  return Buffer.from(JSON.stringify({ capturedAt, assetId }), 'utf8').toString('base64url');
+function normalizeGalleryDate(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('invalid gallery date');
+  const timestamp = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(timestamp.getTime()) || timestamp.toISOString().slice(0, 10) !== value) throw new Error('invalid gallery date');
+  return value;
 }
 
-function decodeGalleryCursor(value: string): { capturedAt: string | null; assetId: string } {
+function toFts5Phrase(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function gallerySearchFilterHash(filters: NormalizedGallerySearchFilters): string {
+  return createHash('sha256').update(JSON.stringify({ q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo })).digest('hex');
+}
+
+function encodeGalleryCursor(
+  capturedAt: string | null, assetId: string, libraryId: string, filters: NormalizedGallerySearchFilters
+): string {
+  return Buffer.from(JSON.stringify({
+    version: 1, libraryId, filterHash: gallerySearchFilterHash(filters), sort: GALLERY_CURSOR_SORT, capturedAt, assetId
+  }), 'utf8').toString('base64url');
+}
+
+function decodeGalleryCursor(
+  value: string, libraryId: string, filters: NormalizedGallerySearchFilters
+): GalleryCursorPosition {
   try {
-    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as { capturedAt?: unknown; assetId?: unknown };
-    if (!(decoded.capturedAt === null || typeof decoded.capturedAt === 'string') || typeof decoded.assetId !== 'string' ||
-      Buffer.from(value, 'base64url').toString('base64url') !== value) throw new Error('invalid cursor');
-    return { capturedAt: decoded.capturedAt, assetId: decoded.assetId };
+    if (value.length > 2048 || Buffer.from(value, 'base64url').toString('base64url') !== value) throw new Error('invalid cursor');
+    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (Object.keys(decoded).sort().join(',') !== GALLERY_CURSOR_KEYS.join(',') || decoded.version !== 1 ||
+      decoded.libraryId !== libraryId || decoded.filterHash !== gallerySearchFilterHash(filters) || decoded.sort !== GALLERY_CURSOR_SORT ||
+      !(decoded.capturedAt === null || isCanonicalUtcTimestamp(decoded.capturedAt)) || typeof decoded.assetId !== 'string' ||
+      decoded.assetId.length < 1 || decoded.assetId.length > 256) throw new Error('invalid cursor');
+    return { capturedAt: decoded.capturedAt as string | null, assetId: decoded.assetId };
   } catch {
     throw new Error('invalid gallery cursor');
   }
+}
+
+function isCanonicalUtcTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  try { return new Date(value).toISOString() === value; } catch { return false; }
 }
 
 function toSessionRecord(row: SessionRow): UploadSessionRecord {

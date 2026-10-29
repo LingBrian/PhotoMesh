@@ -548,6 +548,67 @@ describe('pairing and library authorization endpoints', () => {
     expect(readIndex).toHaveBeenCalledWith('trusted-peer', 'private-library');
   });
 
+  it('passes validated search filters to the gallery after library-read authorization', async () => {
+    const listAssets = vi.fn(() => ({ items: [], nextCursor: null }));
+    const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {
+      listLibraries: () => [], listAssets, getOriginal: async () => undefined, openOriginal: () => undefined,
+      listTombstones: () => [], restoreTombstone: async () => 'not_found'
+    };
+    const options: NodeAgentServerOptions = {
+      gallery,
+      authorizeLibraryRead: (token, libraryId) => token === 'search-token' && libraryId === 'library-a' ? 'admin' : undefined
+    };
+    const denied = await request('/v1/assets?libraryId=library-a&q=%E7%8C%AB%E5%92%AA%E7%8B%97', options);
+    expect(denied.status).toBe(403);
+    const crossLibrary = await request('/v1/assets?libraryId=library-b&q=%E7%8C%AB%E5%92%AA%E7%8B%97', options, {
+      headers: { authorization: 'Bearer search-token' }
+    });
+    expect(crossLibrary.status).toBe(403);
+    expect(listAssets).not.toHaveBeenCalled();
+
+    const response = await request('/v1/assets?libraryId=library-a&q=%E7%8C%AB%E5%92%AA%E7%8B%97&dateFrom=2026-05-01&dateTo=2026-06-01&limit=20', options, {
+      headers: { authorization: 'Bearer search-token' }
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(listAssets).toHaveBeenCalledWith('library-a', undefined, 20, {
+      q: '猫咪狗', dateFrom: '2026-05-01', dateTo: '2026-06-01'
+    });
+  });
+
+  it('rejects short q, duplicate or unknown gallery query parameters before searching', async () => {
+    const listAssets = vi.fn(() => ({ items: [], nextCursor: null }));
+    const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {
+      listLibraries: () => [], listAssets, getOriginal: async () => undefined, openOriginal: () => undefined,
+      listTombstones: () => [], restoreTombstone: async () => 'not_found'
+    };
+    const options: NodeAgentServerOptions = { gallery, authorizeLibraryRead: () => 'admin' };
+    for (const path of [
+      '/v1/assets?libraryId=library-a&q=ab',
+      '/v1/assets?libraryId=library-a&q=one&q=two',
+      '/v1/assets?libraryId=library-a&unknown=x',
+      '/v1/assets?libraryId=library-a&dateFrom=2026-02-30',
+      '/v1/assets?libraryId=library-a&dateFrom=2026-06-01&dateTo=2026-05-01',
+      `/v1/assets?libraryId=library-a&q=${encodeURIComponent('x'.repeat(257))}`
+    ]) {
+      const response = await request(path, options, { headers: { authorization: 'Bearer any' } });
+      expect(response.status, path).toBe(400);
+    }
+    expect(listAssets).not.toHaveBeenCalled();
+  });
+
+  it('advertises gallery-search capability only when the gallery API is configured', async () => {
+    const unavailable = await request('/v1/health');
+    expect((await unavailable.json() as { capabilities: string[] }).capabilities).not.toContain('gallerySearch');
+    const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {
+      listLibraries: () => [], listAssets: () => ({ items: [], nextCursor: null }),
+      getOriginal: async () => undefined, openOriginal: () => undefined, listTombstones: () => [],
+      restoreTombstone: async () => 'not_found'
+    };
+    const available = await request('/v1/health', { gallery });
+    expect((await available.json() as { capabilities: string[] }).capabilities).toContain('gallerySearch');
+  });
+
   it('requires the local administrator token to create an invite or change trust', async () => {
     const control = pairingControl();
     const options: NodeAgentServerOptions = { pairingControl: control, authorizePairingAdmin: (token) => token === 'admin-secret' };
