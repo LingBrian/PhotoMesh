@@ -341,6 +341,51 @@ describe('PM-048 gallery search index and cursor', () => {
     }
   });
 
+  it('reports duplicate candidates without merging sources or including tombstones', async () => {
+    const db = new Database(':memory:');
+    try {
+      const repository = new SqliteRepository(db, { backupBeforeMigration: async () => undefined });
+      await repository.migrate(migrations);
+      insertLocalAsset(db, { assetId: 'local-duplicate', filename: 'Local copy.jpg', path: '/photos/local-copy.jpg' });
+      db.prepare('UPDATE asset_files SET sha256=?, byte_size=? WHERE asset_id=?').run('c'.repeat(64), 7, 'local-duplicate');
+      insertProjection(db, { assetId: 'remote-duplicate', filename: 'Remote copy.jpg', path: '/remote/remote-copy.jpg' });
+      db.prepare('UPDATE sync_asset_projection SET sha256=?, byte_length=? WHERE asset_id=?').run('c'.repeat(64), 7, 'remote-duplicate');
+      insertLocalAsset(db, { assetId: 'unique-asset', filename: 'Unique.jpg', path: '/photos/unique.jpg' });
+      const groups = repository.listDuplicateCandidateGroups('library-a', 10);
+      expect(groups).toEqual([{
+        sha256: 'c'.repeat(64), byteSize: 7, truncated: false,
+        assets: expect.arrayContaining([
+          expect.objectContaining({ assetId: 'local-duplicate', sourcePath: '/photos/local-copy.jpg', availability: 'online' }),
+          expect.objectContaining({ assetId: 'remote-duplicate', sourcePath: '/remote/remote-copy.jpg', availability: 'missing' })
+        ])
+      }]);
+      expect(groups[0]?.assets).toHaveLength(2);
+      db.prepare("UPDATE sync_asset_projection SET tombstone_event_id='tombstone-duplicate' WHERE asset_id='remote-duplicate'").run();
+      expect(repository.listDuplicateCandidateGroups('library-a', 10)).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('limits duplicate candidate groups and members deterministically', async () => {
+    const db = new Database(':memory:');
+    try {
+      const repository = new SqliteRepository(db, { backupBeforeMigration: async () => undefined });
+      await repository.migrate(migrations);
+      for (let index = 0; index < 35; index += 1) {
+        insertLocalAsset(db, { assetId: `many-${String(index).padStart(2, '0')}`, filename: `many-${index}.jpg`, path: `/many/${index}.jpg` });
+        db.prepare('UPDATE asset_files SET sha256=?, byte_size=? WHERE asset_id=?').run('d'.repeat(64), 9, `many-${String(index).padStart(2, '0')}`);
+      }
+      const groups = repository.listDuplicateCandidateGroups('library-a', 1);
+      expect(groups).toHaveLength(1);
+      expect(groups[0]).toMatchObject({ sha256: 'd'.repeat(64), byteSize: 9, truncated: true });
+      expect(groups[0]?.assets).toHaveLength(32);
+      expect(groups[0]?.assets[0]?.assetId).toBe('many-34');
+    } finally {
+      db.close();
+    }
+  });
+
   it('pages through equal instants, floating wall times, and unknown dates without duplicates', async () => {
     const db = new Database(':memory:');
     try {

@@ -89,6 +89,7 @@ const unavailableDiagnostics: HealthDiagnosticsSource = {
 export interface GalleryServerControl {
   listLibraries(): Array<{ libraryId: string; title: string }>;
   listAssets(libraryId: string, cursor: string | undefined, limit: number, filters?: GallerySearchFilters): { items: unknown[]; nextCursor: string | null };
+  listDuplicateCandidateGroups?(libraryId: string, limit: number): unknown[];
   getOriginal(assetId: string): Promise<{ libraryId: string; filename: string; sha256: string; byteSize: number; availability: string; storageRef: string; originalPath: string | null } | undefined>;
   openOriginal(media: { storageRef: string; originalPath: string | null }): Promise<Readable | undefined> | Readable | undefined;
   listTombstones(libraryId?: string): unknown[];
@@ -204,7 +205,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       ...(options.mediaVersions ? ['mediaVersions'] : []),
       ...(options.thumbnails ? ['thumbnails'] : []),
       ...(options.assetTags ? ['assetTags'] : []),
-      ...(options.gallery ? ['gallerySearch', 'galleryFilters'] : []),
+      ...(options.gallery ? ['gallerySearch', 'galleryFilters', ...(options.gallery.listDuplicateCandidateGroups ? ['duplicateCandidates'] : [])] : []),
       ...(options.albums ? ['virtualAlbums'] : []),
       ...(options.tagSync ? ['tagSync'] : [])
     ];
@@ -387,6 +388,30 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (result === 'conflict') { sendJson(response, 409, { error: 'causal_context_conflict', requestId }); return; }
     if (result === 'unavailable') { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
     sendJson(response, 200, { status: 'restored', tombstoneEventId: input.eventId, restoreEventId: result.restoreEventId });
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/v1/assets/duplicate-candidates') {
+    const allowedParameters = new Set(['libraryId', 'limit']);
+    const parameterNames = [...url.searchParams.keys()];
+    if (parameterNames.some((name) => !allowedParameters.has(name)) || parameterNames.some((name) => url.searchParams.getAll(name).length !== 1)) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const libraryId = url.searchParams.get('libraryId');
+    const rawLimit = Number(url.searchParams.get('limit') ?? 50);
+    if (!options.gallery?.listDuplicateCandidateGroups || !libraryId || libraryId.length > 128 || !Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const peerId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!peerId || !options.gallery.listLibraries().some((library) => library.libraryId === libraryId)) {
+      sendJson(response, 403, { error: 'forbidden', requestId }); return;
+    }
+    try {
+      response.setHeader('cache-control', 'private, no-store');
+      sendJson(response, 200, { groups: options.gallery.listDuplicateCandidateGroups(libraryId, rawLimit) });
+    } catch {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+    }
     return;
   }
 

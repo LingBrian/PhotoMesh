@@ -311,6 +311,7 @@ const server = createNodeAgentServer({
   gallery: {
     listLibraries: () => repository.listGalleryLibraries(),
     listAssets: (libraryId, cursor, limit, filters) => repository.listGalleryAssets(libraryId, cursor, limit, filters),
+     listDuplicateCandidateGroups: (libraryId, limit) => repository.listDuplicateCandidateGroups(libraryId, limit),
     getOriginal: async (assetId) => repository.getGalleryMedia(assetId),
     openOriginal: openOriginalMedia,
     listTombstones: (libraryId) => repository.listActiveTombstones(libraryId),

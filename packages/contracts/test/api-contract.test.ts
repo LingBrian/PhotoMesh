@@ -85,6 +85,8 @@ const routes: RouteCase[] = [
   { template: '/v1/diagnostics', method: 'get', path: '/v1/diagnostics', status: 200, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'no-store' } },
   { template: '/v1/libraries', method: 'get', path: '/v1/libraries', status: 403, error: 'forbidden' },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 403, error: 'forbidden' },
+  { template: '/v1/assets/duplicate-candidates', method: 'get', path: '/v1/assets/duplicate-candidates?libraryId=lib', status: 403, error: 'forbidden' },
+  { template: '/v1/assets/duplicate-candidates', method: 'get', path: '/v1/assets/duplicate-candidates?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&q=photo&dateFrom=2026-01-01&dateTo=2026-02-01', status: 200, authorization: 'Bearer contract-admin', expectedTags: [], headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&kind=video&sourceKind=upload&availability=online', status: 200, authorization: 'Bearer contract-admin', expectedTags: [], headers: { 'Cache-Control': 'private, no-store' } },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib&q=ab', status: 400, error: 'invalid_request' },
@@ -230,6 +232,7 @@ const server = createNodeAgentServer({
       items: [{ assetId: 'asset', libraryId, tags: [...(visibleAssetTags.get(`${libraryId}:asset`) ?? [])].sort(),
         rating: 4, ratingConflict: false, ratingCandidates: [4] }], nextCursor: null
     }),
+    listDuplicateCandidateGroups: () => [],
     getOriginal: async () => undefined
   } as unknown as GalleryServerControl,
   albums: {

@@ -122,6 +122,25 @@ export interface GalleryAssetRecord extends LibraryIndexAsset {
   ratingCandidates: Array<number | null>;
 }
 
+export interface DuplicateCandidateAsset {
+  assetId: string;
+  originNodeId: string;
+  kind: AssetKind;
+  sha256: string;
+  byteSize: number;
+  filename: string;
+  sourcePath: string | null;
+  sourceKind: SourceKind;
+  availability: 'online' | 'cached' | 'offline' | 'missing';
+}
+
+export interface DuplicateCandidateGroup {
+  sha256: string;
+  byteSize: number;
+  assets: DuplicateCandidateAsset[];
+  truncated: boolean;
+}
+
 export interface GallerySearchFilters {
   q?: string;
   dateFrom?: string;
@@ -1195,6 +1214,54 @@ export class SqliteRepository implements UploadRepository {
         ? encodeGalleryCursor(last.sort_rank as 0 | 1 | 2, last.sort_key, last.asset_id, libraryId, filters)
         : null
     };
+  }
+
+  listDuplicateCandidateGroups(libraryId: string, limit = 50): DuplicateCandidateGroup[] {
+    if (typeof libraryId !== 'string' || libraryId.length < 1 || libraryId.length > 128) throw new Error('invalid library id');
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('invalid duplicate candidate limit');
+    const rows = this.db.prepare(`
+      WITH visible_assets AS (
+        SELECT a.asset_id,a.origin_node_id,a.kind,f.sha256,f.byte_size,
+          COALESCE(l.original_filename,a.asset_id) AS filename,NULLIF(l.original_path,'') AS source_path,
+          CASE WHEN l.source_kind='upload' THEN 'upload' ELSE 'import' END AS source_kind,
+          COALESCE(l.availability,'missing') AS availability
+        FROM assets a
+        JOIN asset_files f ON f.asset_id=a.asset_id AND f.media_role='original'
+        LEFT JOIN file_locations l ON l.location_id=(SELECT candidate.location_id FROM file_locations candidate
+          WHERE candidate.file_id=f.file_id AND candidate.node_id=a.origin_node_id
+          ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END,
+            candidate.location_id COLLATE BINARY LIMIT 1)
+        WHERE a.library_id=? AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p
+          WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id AND p.tombstone_event_id IS NOT NULL)
+        UNION ALL
+        SELECT p.asset_id,p.origin_node_id,p.kind,p.sha256,p.byte_length,
+          CASE WHEN json_type(p.metadata_json,'$.filename')='text' THEN json_extract(p.metadata_json,'$.filename') ELSE p.asset_id END,
+          CASE WHEN json_type(p.metadata_json,'$.sourcePath')='text' THEN NULLIF(json_extract(p.metadata_json,'$.sourcePath'),'') ELSE NULL END,
+          CASE WHEN json_extract(p.metadata_json,'$.sourceKind')='upload' THEN 'upload' ELSE 'import' END,
+          'missing'
+        FROM sync_asset_projection p
+        WHERE p.library_id=? AND p.tombstone_event_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id=p.library_id AND a.asset_id=p.asset_id)
+      ), duplicate_hashes AS (
+        SELECT sha256 FROM visible_assets GROUP BY sha256 HAVING COUNT(*) > 1 ORDER BY sha256 COLLATE BINARY LIMIT ?
+      ), ranked AS (
+        SELECT v.*, COUNT(*) OVER (PARTITION BY v.sha256) AS group_count,
+          ROW_NUMBER() OVER (PARTITION BY v.sha256 ORDER BY v.asset_id COLLATE BINARY DESC) AS member_rank
+        FROM visible_assets v JOIN duplicate_hashes d ON d.sha256=v.sha256
+      )
+      SELECT asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,group_count,member_rank
+      FROM ranked WHERE member_rank <= 32 ORDER BY sha256 COLLATE BINARY, asset_id COLLATE BINARY DESC`).all(libraryId, libraryId, limit) as Array<{
+        asset_id: string; origin_node_id: string; kind: AssetKind; sha256: string; byte_size: number; filename: string;
+        source_path: string | null; source_kind: SourceKind; availability: DuplicateCandidateAsset['availability']; group_count: number; member_rank: number;
+      }>;
+    const groups = new Map<string, DuplicateCandidateGroup>();
+    for (const row of rows) {
+      const group = groups.get(row.sha256) ?? { sha256: row.sha256, byteSize: row.byte_size, assets: [], truncated: row.group_count > 32 };
+      group.assets.push({ assetId: row.asset_id, originNodeId: row.origin_node_id, kind: row.kind, sha256: row.sha256,
+        byteSize: row.byte_size, filename: row.filename, sourcePath: row.source_path, sourceKind: row.source_kind, availability: row.availability });
+      groups.set(row.sha256, group);
+    }
+    return [...groups.values()];
   }
 
   getGalleryMedia(assetId: string): GalleryMediaRecord | undefined {

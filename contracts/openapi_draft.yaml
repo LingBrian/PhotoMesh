@@ -373,6 +373,28 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /v1/assets/duplicate-candidates:
+    get:
+      summary: 授权图库内的重复内容候选只读报告
+      parameters:
+        - in: query
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+      responses:
+        '200':
+          description: Candidate groups; no merge, delete, or tombstone action is performed.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DuplicateCandidatePage'}
+        '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: 'Invalid, duplicate, or unknown query parameter', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries/{libraryId}/assets/{assetId}/favorite:
     parameters:
       - in: path
@@ -1866,6 +1888,35 @@ components:
           uniqueItems: true
           description: Current causal MV-register candidates, without author or principal identity.
           items: {$ref: '#/components/schemas/NullableRatingValue'}
+    DuplicateCandidateAsset:
+      type: object
+      additionalProperties: false
+      required: [assetId, originNodeId, kind, sha256, byteSize, filename, sourcePath, sourceKind, availability]
+      properties:
+        assetId: {type: string}
+        originNodeId: {type: string}
+        kind: {type: string, enum: [photo, video, live_photo]}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        byteSize: {type: integer, minimum: 0}
+        filename: {type: string}
+        sourcePath: {type: [string, 'null']}
+        sourceKind: {type: string, enum: [upload, import]}
+        availability: {type: string, enum: [online, cached, offline, missing]}
+    DuplicateCandidateGroup:
+      type: object
+      additionalProperties: false
+      required: [sha256, byteSize, assets, truncated]
+      properties:
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        byteSize: {type: integer, minimum: 0}
+        assets: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/DuplicateCandidateAsset'}}
+        truncated: {type: boolean}
+    DuplicateCandidatePage:
+      type: object
+      additionalProperties: false
+      required: [groups]
+      properties:
+        groups: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/DuplicateCandidateGroup'}}
     AssetPage:
       type: object
       required: [items]
