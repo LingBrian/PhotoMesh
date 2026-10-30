@@ -2045,7 +2045,7 @@ components:
           type: string
           minLength: 1
           description: Stable machine-readable error code; unknown values are possible. This example list is not closed.
-          examples: [invalid_request, forbidden, not_found, capability_unavailable, writer_limit_reached, thumbnail_invalid, source_offline, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, conflict, rating_conflict_limit, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
+          examples: [invalid_request, forbidden, not_found, capability_unavailable, writer_limit_reached, thumbnail_invalid, source_offline, source_missing, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, conflict, rating_conflict_limit, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
         requestId:
           type: string
           minLength: 1

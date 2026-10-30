@@ -46,7 +46,8 @@
     "noSearchResultsHint": "Try different words or clear your search.",
     "emptyLibrary": "This library has no photos yet",
     "emptyHint": "Photos appear here after an authorized node indexes them.",
-    "sourceOffline": "The original source is currently unavailable.",
+    "sourceOffline": "The source node or external location is currently offline.",
+    "sourceMissing": "The indexed source file is missing; this does not delete the asset.",
     "availability": {
       "online": "Online",
       "cached": "Cached",

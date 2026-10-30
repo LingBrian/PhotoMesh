@@ -278,6 +278,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (!media) { sendJson(response, 404, { error: 'not_found', requestId }); return; }
     const principal = await options.authorizeLibraryRead?.(bearerToken(request), media.libraryId);
     if (!principal) { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    if (media.availability === 'missing') {
+      sendJson(response, 409, { error: 'source_missing', requestId }); return;
+    }
     if (!['online', 'cached'].includes(media.availability)) {
       sendJson(response, 409, { error: 'source_offline', requestId }); return;
     }
@@ -1370,6 +1373,7 @@ const thumbnailErrorStatuses: Record<string, number> = {
   NOT_FOUND: 404,
   SOURCE_CHANGED: 409,
   SOURCE_OFFLINE: 409,
+  SOURCE_MISSING: 409,
   TOO_LARGE: 413,
   UNSUPPORTED_MEDIA: 415,
   PROCESSING_FAILED: 500,

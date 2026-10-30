@@ -288,6 +288,17 @@ describe('authorized thumbnail endpoint', () => {
     expect(openOriginal).toHaveBeenCalledTimes(1);
   });
 
+  it('maps missing thumbnail sources to a non-destructive source_missing error', async () => {
+    const response = await request('/v1/libraries/library/assets/asset/thumbnail', {
+      authorizeLibraryRead: (token, libraryId) => token === 'reader' && libraryId === 'library' ? 'reader' : undefined,
+      thumbnails: {
+        readThumbnail: async () => { throw Object.assign(new Error('source absent'), { code: 'SOURCE_MISSING' }); }
+      }
+    }, { headers: { authorization: 'Bearer reader' } });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'source_missing' });
+  });
+
   it('advertises the optional thumbnail capability only when configured', async () => {
     const response = await request('/v1/health', {
       thumbnails: { readThumbnail: async () => ({ bytes: Buffer.from('x'), sha256: 'c'.repeat(64), byteSize: 1, width: 1, height: 1, mimeType: 'image/webp' }) }
@@ -343,6 +354,29 @@ describe('pairing and library authorization endpoints', () => {
     const recycle = await request('/v1/recycle-bin?libraryId=library', options, { headers: { authorization: 'Bearer admin' } });
     expect(recycle.status).toBe(200);
     expect(await recycle.json()).toMatchObject({ items: [{ assetId: 'deleted' }] });
+  });
+
+  it('distinguishes missing sources from offline sources without deleting the asset', async () => {
+    const source = (availability: 'offline' | 'missing') => ({
+      libraryId: 'library', filename: 'original.jpg', sha256: 'a'.repeat(64), byteSize: 3,
+      availability, storageRef: 'objects/a/original.blob', originalPath: null
+    });
+    const options: NodeAgentServerOptions = {
+      authorizeLibraryRead: (token, libraryId) => token === 'reader' && libraryId === 'library' ? 'reader' : undefined,
+      gallery: {
+        listLibraries: () => [], listAssets: () => ({ items: [], nextCursor: null }), listTombstones: () => [],
+        restoreTombstone: async () => 'not_found',
+        getOriginal: async () => source('missing'), openOriginal: async () => Readable.from([Buffer.from('raw')])
+      } as NonNullable<NodeAgentServerOptions['gallery']>
+    };
+    const missing = await request('/v1/assets/asset/original', options, { headers: { authorization: 'Bearer reader' } });
+    expect(missing.status).toBe(409);
+    expect(await missing.json()).toMatchObject({ error: 'source_missing' });
+
+    options.gallery!.getOriginal = async () => source('offline');
+    const offline = await request('/v1/assets/asset/original', options, { headers: { authorization: 'Bearer reader' } });
+    expect(offline.status).toBe(409);
+    expect(await offline.json()).toMatchObject({ error: 'source_offline' });
   });
 
   it('restores only authorized active tombstones and requires a valid causal parent identifier', async () => {

@@ -10,6 +10,7 @@ export type PreviewAsset = {
 export type GalleryPreviewErrorCode =
   | 'unsupported-media'
   | 'source-offline'
+  | 'source-missing'
   | 'preview-too-large'
   | 'unauthorized'
   | 'asset-unavailable'
@@ -46,6 +47,7 @@ export async function loadAssetPreview({
   signal,
 }: LoadAssetPreviewInput): Promise<Blob> {
   if (asset.kind !== 'photo') throw new GalleryPreviewError('unsupported-media');
+  if (asset.availability === 'missing') throw new GalleryPreviewError('source-missing');
   if (asset.availability !== 'online' && asset.availability !== 'cached') {
     throw new GalleryPreviewError('source-offline');
   }
@@ -69,7 +71,9 @@ export async function loadAssetPreview({
   }
 
   if (response.status === 409) {
+    const errorCode = await response.clone().json().catch(() => ({})) as { error?: unknown };
     await discardResponseBody(response);
+    if (errorCode.error === 'source_missing') throw new GalleryPreviewError('source-missing');
     throw new GalleryPreviewError('source-offline');
   }
   if (response.status === 401 || response.status === 403) {

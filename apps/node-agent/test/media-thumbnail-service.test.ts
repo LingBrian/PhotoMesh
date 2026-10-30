@@ -162,6 +162,11 @@ describe('MediaThumbnailService', () => {
     await expect(offline.getThumbnail('library', 'asset', 'timeline-192')).rejects.toMatchObject({ code: 'SOURCE_OFFLINE' });
     expect(offlineOpen).not.toHaveBeenCalled();
 
+    const missingSource = sourceFor(bytes, { availability: 'missing' });
+    const missing = new MediaThumbnailService({ getSource: () => missingSource, openOriginal: offlineOpen, transformer });
+    await expect(missing.getThumbnail('library', 'asset', 'timeline-192')).rejects.toMatchObject({ code: 'SOURCE_MISSING' });
+    expect(offlineOpen).not.toHaveBeenCalled();
+
     const missingStream = new MediaThumbnailService({ getSource: () => sourceFor(bytes), openOriginal: async () => undefined, transformer });
     await expect(missingStream.getThumbnail('library', 'asset', 'timeline-192')).rejects.toMatchObject({ code: 'SOURCE_OFFLINE' });
     const failedStream = new MediaThumbnailService({ getSource: () => sourceFor(bytes), openOriginal: async () => { throw new Error('offline'); }, transformer });

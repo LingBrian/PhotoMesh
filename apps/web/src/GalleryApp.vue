@@ -928,6 +928,7 @@ function onSearchShortcut(event: KeyboardEvent): void {
 function previewErrorMessage(code: GalleryPreviewErrorCode): string {
   switch (code) {
     case 'source-offline': return t('gallery.sourceOffline');
+    case 'source-missing': return t('gallery.sourceMissing');
     case 'preview-too-large': return t('gallery.previewTooLarge');
     case 'unsupported-media': return t('gallery.previewUnsupported');
     case 'unauthorized':

@@ -46,7 +46,8 @@
     "noSearchResultsHint": "请尝试其他关键词，或清除搜索。",
     "emptyLibrary": "这个图库还没有照片",
     "emptyHint": "照片会在授权节点索引后出现在这里。",
-    "sourceOffline": "原图来源当前不可用。",
+    "sourceOffline": "来源节点或外部位置当前离线。",
+    "sourceMissing": "已索引的来源文件缺失；这不会删除资产。",
     "availability": {
       "online": "在线",
       "cached": "缓存可用",
