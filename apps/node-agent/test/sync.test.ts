@@ -55,6 +55,26 @@ describe('P2P signed event synchronization', () => {
     expect(second.createdAt).toBe('1990-01-01T00:00:00.000Z');
   });
 
+  it('includes provenance on new asset-index drafts and defaults unknown dates safely', async () => {
+    const node = await createNode();
+    const captureDate = {
+      capturedAt: '2024-04-02T09:04:05.000Z', localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180,
+      source: 'exif_offset' as const, confidence: 'high' as const
+    };
+    const factory = node.sync.createAssetIndexedDraft({
+      libraryId: 'family', assetId: 'dated', originNodeId: node.identity.peerId, kind: 'photo', sha256: 'a'.repeat(64), byteLength: 10, captureDate
+    });
+    const draft = factory({ authorSequence: 1, causalParents: [] });
+    expect(draft.payload).toMatchObject({ capture: captureDate });
+
+    const unknownDraft = node.sync.createAssetIndexedDraft({
+      libraryId: 'family', assetId: 'unknown', originNodeId: node.identity.peerId, kind: 'photo', sha256: 'b'.repeat(64), byteLength: 10
+    })({ authorSequence: 1, causalParents: [] });
+    expect(unknownDraft.payload).toMatchObject({ capture: {
+      capturedAt: null, localTime: null, offsetMinutes: null, source: 'unknown', confidence: 'unknown'
+    } });
+  });
+
   it('does not echo a target peer’s own author stream while relaying third-party events', async () => {
     const author = await createNode();
     const relay = await createNode();
@@ -81,6 +101,29 @@ describe('P2P signed event synchronization', () => {
     const stored = node.database.prepare("SELECT payload_json, state FROM sync_event_log WHERE event_type = 'asset.indexed'").get() as { payload_json: string; state: string };
     expect(JSON.parse(stored.payload_json)).not.toHaveProperty('path');
     expect(stored.state).toBe('ready');
+  });
+
+  it('projects optional capture provenance while applying legacy asset-index events unchanged', async () => {
+    const author = await createNode();
+    const receiver = await createNode();
+    await trustEachOther(author, receiver);
+    const legacy = await indexAsset(author, 'legacy-peer-asset');
+    expect(receiver.syncRepository.ingest(author.identity.peerId, legacy).status).toBe('applied');
+    expect(receiver.syncRepository.getProjection('family', 'legacy-peer-asset')?.metadata.capture).toBeUndefined();
+
+    const current = await author.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.indexed', payload: {
+      assetId: 'dated-peer-asset', originNodeId: author.identity.peerId, kind: 'photo', sha256: 'b'.repeat(64), byteLength: 12,
+      capture: {
+        capturedAt: '2024-04-02T09:04:05.000Z', localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180,
+        source: 'exif_offset', confidence: 'high'
+      }
+    } });
+    expect(receiver.syncRepository.ingest(author.identity.peerId, current).status).toBe('applied');
+    expect(receiver.syncRepository.getProjection('family', 'dated-peer-asset')?.metadata).toMatchObject({
+      capturedAt: '2024-04-02T09:04:05.000Z', capture: {
+        localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180, source: 'exif_offset', confidence: 'high'
+      }
+    });
   });
 
   it('waits for missing causal parents and applies buffered out-of-order events after their parent arrives', async () => {

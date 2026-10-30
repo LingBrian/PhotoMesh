@@ -77,6 +77,12 @@
     "localAlbumPageHint": "Local albums filter pages already loaded on this device; load more pages to search further.",
     "loadMoreForAlbum": "Load the next page",
     "unknownDate": "Capture time unknown",
+    "captureTimezoneUnknown": "Time zone unknown",
+    "captureConfidence": {
+      "high": "EXIF capture time ({offset})",
+      "medium": "EXIF local time",
+      "unknown": "Capture date source unknown"
+    },
     "unknownStatus": "Unknown status",
     "unknownError": "An unknown error occurred",
     "connectionFailed": "Could not connect to this node.",

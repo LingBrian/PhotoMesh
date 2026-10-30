@@ -4,6 +4,7 @@ import { publicKeyFromProtobuf } from '@libp2p/crypto/keys';
 import { peerIdFromPublicKey } from '@libp2p/peer-id';
 import type { LocalIdentity } from '../auth/local-identity.js';
 import { validateTagOperationPayload } from './tag-orset.js';
+import { isCaptureDateMetadata } from '../metadata/capture-date.js';
 
 export const EVENT_PROTOCOL_VERSION = 1;
 export const EVENT_SCHEMA_VERSION = 1;
@@ -142,7 +143,8 @@ function validatePayload(type: SyncEventType, payload: Record<string, unknown>):
   if (type === 'asset.indexed') {
     if (!isPeerId(payload.originNodeId) || !['photo', 'video', 'live_photo'].includes(String(payload.kind)) ||
         typeof payload.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(payload.sha256) ||
-        !Number.isSafeInteger(payload.byteLength) || Number(payload.byteLength) < 0) throw new Error('invalid asset index payload');
+        !Number.isSafeInteger(payload.byteLength) || Number(payload.byteLength) < 0 ||
+        payload.capture !== undefined && !isCaptureDateMetadata(payload.capture)) throw new Error('invalid asset index payload');
     return;
   }
   if (type === 'asset.metadata.updated') {

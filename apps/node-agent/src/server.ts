@@ -7,7 +7,7 @@ import { resolveRequestId } from './audit/request-id.js';
 import { UploadError, UploadService, type CreateUploadRequest } from './uploads/service.js';
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
-import { RepositoryConflictError, normalizeGallerySearchFilters, type AlbumMemberMutationResult, type AlbumMemberPage, type AlbumPage, type AlbumRecord, type AssetTagMutationResult, type GallerySearchFilters, type TrustedPeerRecord } from './db/repository.js';
+import { RepositoryConflictError, StaleGalleryCursorError, normalizeGallerySearchFilters, type AlbumMemberMutationResult, type AlbumMemberPage, type AlbumPage, type AlbumRecord, type AssetTagMutationResult, type GallerySearchFilters, type TrustedPeerRecord } from './db/repository.js';
 import { maxAssetTagUtf8Bytes } from './asset-tag-limits.js';
 import { decodeAlbumCursor, InvalidAlbumCursorError, normalizeAlbumTitle, type AlbumCursorScope } from './albums/album-utils.js';
 import type { Readable } from 'node:stream';
@@ -423,8 +423,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       try {
         const page = options.gallery.listAssets(libraryId, cursor ?? undefined, rawLimit, filters);
         sendJson(response, 200, page);
-      } catch {
-        sendJson(response, 400, { error: 'invalid_request', requestId });
+      } catch (cause) {
+        if (cause instanceof StaleGalleryCursorError) sendJson(response, 410, { error: 'stale_cursor', requestId });
+        else sendJson(response, 400, { error: 'invalid_request', requestId });
       }
       return;
     }

@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
-type SearchFixtureOptions = { searchCapability?: boolean; failOnce?: boolean };
+type SearchFixtureOptions = { searchCapability?: boolean; failOnce?: boolean; captureProvenance?: 'offset' | 'floating' };
 
 async function connectSearchFixture(page: Page, options: SearchFixtureOptions = {}): Promise<{ queries: string[]; assetQueries: string[] }> {
   const queries: string[] = [];
@@ -25,7 +25,18 @@ async function connectSearchFixture(page: Page, options: SearchFixtureOptions = 
       return;
     }
     const items = q && q !== 'no-match'
-      ? [{ assetId: 'asset-id-42', libraryId: 'library-search', originNodeId: 'node-search', kind: 'photo', sha256: 'a'.repeat(64), availability: 'online', filename: 'Trip photo.jpg', capturedAt: '2026-10-29T00:00:00.000Z', sourcePath: null, sourceKind: 'import', byteSize: 10, version: 'v1' }]
+      ? [{
+          assetId: 'asset-id-42', libraryId: 'library-search', originNodeId: 'node-search', kind: 'photo',
+          sha256: 'a'.repeat(64), availability: 'online', filename: 'Trip photo.jpg', capturedAt: '2026-10-29T00:00:00.000Z',
+          sourcePath: null, sourceKind: 'import', byteSize: 10, version: 'v1',
+          ...(options.captureProvenance === 'floating' ? {
+            capturedAt: null, captureLocalTime: '2026-10-29T12:00:00.000', captureOffsetMinutes: null,
+            captureSource: 'exif_floating', captureConfidence: 'medium'
+          } : options.captureProvenance === 'offset' ? {
+            captureLocalTime: '2026-10-29T15:00:00.000', captureOffsetMinutes: 180,
+            captureSource: 'exif_offset', captureConfidence: 'high'
+          } : {})
+        }]
       : [];
     await route.fulfill({ status: 200, json: { items, nextCursor: null } });
   });
@@ -78,6 +89,21 @@ test('supports keyboard search, validates short terms locally, and keeps terms o
   expect(new URL(page.url()).search).toBe('');
   if (process.env.PHOTOMESH_SEARCH_SCREENSHOT_PATH) {
     await page.screenshot({ path: process.env.PHOTOMESH_SEARCH_SCREENSHOT_PATH, fullPage: true });
+  }
+});
+
+test('labels timezone-less EXIF as floating and retains its camera wall time', async ({ page }) => {
+  await connectSearchFixture(page, { captureProvenance: 'floating' });
+  const search = page.getByRole('searchbox', { name: 'Search gallery' });
+  await search.fill('Trip');
+  await search.press('Enter');
+
+  await expect(page.getByRole('heading', { name: 'Trip photo.jpg' })).toBeVisible();
+  await expect(page.locator('.asset-date time')).toContainText('Time zone unknown');
+  await expect(page.locator('.asset-date time')).toHaveAttribute('datetime', '2026-10-29T12:00:00.000');
+  await expect(page.locator('.capture-confidence')).toHaveText('EXIF local time');
+  if (process.env.PHOTOMESH_CAPTURE_DATE_SCREENSHOT_PATH) {
+    await page.screenshot({ path: process.env.PHOTOMESH_CAPTURE_DATE_SCREENSHOT_PATH, fullPage: true });
   }
 });
 

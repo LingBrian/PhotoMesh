@@ -130,6 +130,29 @@ describe('signed EventEnvelope', () => {
     expect(() => invalid(3, tooMany, tooMany)).toThrow();
   });
 
+  it('accepts legacy asset indexes and validates optional capture provenance', async () => {
+    const identity = await makeIdentity();
+    const common = {
+      libraryId: 'family', authorPeerId: identity.peerId, authorSequence: 1, causalParents: [],
+      eventType: 'asset.indexed' as const,
+      createdAt: '2026-10-21T00:00:00.000Z'
+    };
+    const payload = { assetId: 'asset-1', originNodeId: identity.peerId, kind: 'photo', sha256: 'a'.repeat(64), byteLength: 10 };
+    expect(() => makeUnsignedEvent({ ...common, payload })).not.toThrow();
+    expect(() => makeUnsignedEvent({ ...common, payload: { ...payload, capture: {
+      capturedAt: '2024-04-02T09:04:05.000Z', localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180,
+      source: 'exif_offset', confidence: 'high'
+    } } })).not.toThrow();
+    expect(() => makeUnsignedEvent({ ...common, payload: { ...payload, capture: {
+      capturedAt: '2024-04-02T12:04:05.000Z', localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180,
+      source: 'exif_offset', confidence: 'high'
+    } } })).toThrow(/asset index payload/i);
+    expect(() => makeUnsignedEvent({ ...common, payload: { ...payload, capture: {
+      capturedAt: null, localTime: '2023-02-29T12:04:05.000', offsetMinutes: null,
+      source: 'exif_floating', confidence: 'medium'
+    } } })).toThrow(/asset index payload/i);
+  });
+
   it('preserves a well-formed unknown event version for safe non-application', async () => {
     const identity = await makeIdentity();
     const known = await signEvent(makeUnsignedEvent({

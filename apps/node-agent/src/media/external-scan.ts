@@ -3,6 +3,7 @@ import { basename as posixBasename, isAbsolute as posixIsAbsolute, join as posix
 import { basename as winBasename, isAbsolute as winIsAbsolute, join as winJoin, relative as winRelative, resolve as winResolve, sep as winSep } from 'node:path/win32';
 import type { AssetKind, ExternalLocationRecord, IndexedExternalLocation } from '../db/repository.js';
 import type { EventDraftFactory } from '../sync/event-envelope.js';
+import { maxCaptureDatePrefixBytes, parseCaptureDatePrefix, unknownCaptureDateMetadata } from '../metadata/capture-date.js';
 
 export type ExternalEntryKind = 'file' | 'directory' | 'symlink' | 'other';
 export type ExternalPathStyle = 'posix' | 'win32';
@@ -293,9 +294,16 @@ export class ExternalScanService {
         if (before.kind !== 'file') return;
         const hash = createHash('sha256');
         let byteSize = 0;
+        let capturePrefixSize = 0;
+        const capturePrefixChunks: Uint8Array[] = [];
         for await (const chunk of this.options.fileSystem.readChunks(displayPath)) {
           hash.update(chunk);
           byteSize += chunk.byteLength;
+          const captureBytes = Math.min(chunk.byteLength, maxCaptureDatePrefixBytes - capturePrefixSize);
+          if (captureBytes > 0) {
+            capturePrefixChunks.push(Uint8Array.from(chunk.subarray(0, captureBytes)));
+            capturePrefixSize += captureBytes;
+          }
         }
         const after = await this.options.fileSystem.stat(displayPath);
         if (before.identity !== after.identity || before.size !== after.size || before.modifiedAt !== after.modifiedAt || byteSize !== after.size) {
@@ -304,9 +312,14 @@ export class ExternalScanService {
           return;
         }
         const filename = ops.basename(displayPath);
+        const kind = kindFromPath(filename);
+        const capturePrefix = new Uint8Array(capturePrefixSize);
+        let captureOffset = 0;
+        for (const chunk of capturePrefixChunks) { capturePrefix.set(chunk, captureOffset); captureOffset += chunk.byteLength; }
+        const captureDate = kind === 'video' ? { ...unknownCaptureDateMetadata } : parseCaptureDatePrefix(capturePrefix);
         const record: ExternalLocationRecord = {
           locationId: this.id(), fileId: this.id(), assetId: this.id(), nodeId: this.options.nodeId,
-          libraryId: root.libraryId, kind: kindFromPath(filename), filename, originalPath: displayPath,
+          libraryId: root.libraryId, kind, filename, originalPath: displayPath, captureDate,
           byteSize, sha256: hash.digest('hex'), storageRef: `external:${this.id()}`, now: this.now()
         };
         this.options.repository.recordExternalFile(record, this.options.createEventDraft?.(record));

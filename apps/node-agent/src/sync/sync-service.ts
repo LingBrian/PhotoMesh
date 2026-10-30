@@ -3,6 +3,7 @@ import type { PairingService } from '../auth/pairing-service.js';
 import type { EventEnvelope, EventContext, EventDraftFactory, JsonValue, SyncEventType, UnsignedEventEnvelope } from './event-envelope.js';
 import { makeUnsignedEvent, parseEventEnvelope, signEvent, verifyEvent, EVENT_SCHEMA_VERSION, MAX_EVENT_BYTES } from './event-envelope.js';
 import { SyncAuthorizationError, SyncCausalityError, SyncProtocolConflictError, SyncRepository, type IngestResult, type SyncCursor } from './sync-repository.js';
+import { unknownCaptureDateMetadata, type CaptureDateMetadata } from '../metadata/capture-date.js';
 
 export const SYNC_PROTOCOL = '/photomesh/event-sync/1.0.0';
 export const SYNC_BATCH_LIMIT = 64;
@@ -103,11 +104,22 @@ export class SyncService {
     throw new Error('unable to append local event');
   }
 
-  createAssetIndexedDraft(input: { libraryId: string; assetId: string; originNodeId: string; kind: string; sha256: string; byteLength: number }): EventDraftFactory {
+  createAssetIndexedDraft(input: {
+    libraryId: string; assetId: string; originNodeId: string; kind: string; sha256: string; byteLength: number;
+    captureDate?: CaptureDateMetadata;
+  }): EventDraftFactory {
+    const captureDate = input.captureDate ?? { ...unknownCaptureDateMetadata };
+    const capture: JsonValue = {
+      capturedAt: captureDate.capturedAt, localTime: captureDate.localTime, offsetMinutes: captureDate.offsetMinutes,
+      source: captureDate.source, confidence: captureDate.confidence
+    };
     return (context: EventContext): UnsignedEventEnvelope => makeUnsignedEvent({
       libraryId: input.libraryId, authorPeerId: this.identity.peerId, authorSequence: context.authorSequence,
       causalParents: context.causalParents, eventType: 'asset.indexed', createdAt: this.now(),
-      payload: { assetId: input.assetId, originNodeId: input.originNodeId, kind: input.kind, sha256: input.sha256, byteLength: input.byteLength }
+      payload: {
+        assetId: input.assetId, originNodeId: input.originNodeId, kind: input.kind, sha256: input.sha256,
+        byteLength: input.byteLength, capture
+      }
     });
   }
 

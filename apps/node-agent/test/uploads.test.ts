@@ -11,12 +11,17 @@ import { loadOrCreateLocalIdentity } from '../src/auth/local-identity.js';
 import { SyncRepository } from '../src/sync/sync-repository.js';
 import { makeUnsignedEvent, signEvent } from '../src/sync/event-envelope.js';
 import { VirtualFileSystem } from './support/virtual-file-system.js';
+import { jpegWithExifCaptureDate } from './support/capture-date-fixture.js';
 
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 const sourceBytes = new TextEncoder().encode('immutable-original');
 const chunkSize = 6;
 
-async function fixture(capacityBytes = Infinity, serviceOptions: { maxFileBytes?: number; maxChunkBytes?: number; sessionTtlMs?: number } = {}) {
+async function fixture(
+  capacityBytes = Infinity,
+  serviceOptions: { maxFileBytes?: number; maxChunkBytes?: number; sessionTtlMs?: number } = {},
+  originalBytes: Uint8Array = sourceBytes
+) {
   const db = new Database(':memory:');
   const repositoryFaults = { failFinalize: false, failRecordChunk: false };
   const repository = new SqliteRepository(db, {
@@ -35,7 +40,7 @@ async function fixture(capacityBytes = Infinity, serviceOptions: { maxFileBytes?
   });
   await repository.migrate();
   const fileSystem = new VirtualFileSystem({ capacityBytes });
-  fileSystem.seed('/source/2026/original.jpg', sourceBytes);
+  fileSystem.seed('/source/2026/original.jpg', originalBytes);
   const service = new UploadService({ repository, fileSystem, nodeId: 'node-local', now: () => '2026-10-21T00:00:00.000Z', ...serviceOptions });
   return {
     db, repository, fileSystem, service,
@@ -84,6 +89,41 @@ describe('immutable resumable upload pipeline', () => {
       .toMatchObject({ state: 'ready', signature: expect.any(String) });
     expect(syncRepository.getProjection(request.libraryId, completed.assetId)?.sha256).toBe(request.sha256);
     expect(fileSystem.read('/source/2026/original.jpg')).toEqual(sourceBytes);
+    db.close();
+  });
+
+  it('extracts capture provenance from the verified upload without altering the source bytes', async () => {
+    const original = jpegWithExifCaptureDate();
+    const { db, repository, fileSystem } = await fixture(Infinity, {}, original);
+    const service = new UploadService({
+      repository, fileSystem, nodeId: 'node-local',
+      createEventDraft: (session, assetId, captureDate) => (context) => makeUnsignedEvent({
+        libraryId: session.libraryId, authorPeerId: 'QmTestPeerId123456789', authorSequence: context.authorSequence,
+        causalParents: context.causalParents, eventType: 'asset.indexed', createdAt: '2026-10-21T00:00:00.000Z',
+        payload: {
+          assetId, originNodeId: 'QmTestPeerId123456789', kind: session.kind,
+          sha256: session.expectedSha256, byteLength: session.totalBytes,
+          capture: {
+            capturedAt: captureDate.capturedAt, localTime: captureDate.localTime, offsetMinutes: captureDate.offsetMinutes,
+            source: captureDate.source, confidence: captureDate.confidence
+          }
+        }
+      })
+    });
+    const uploadRequest = { ...request, totalBytes: original.byteLength, sha256: sha256(original) };
+    const session = await service.createSession('0123456789abcdef', uploadRequest);
+    await service.putChunk(session.sessionId, 0, 0, original, sha256(original));
+    const result = await service.complete(session.sessionId);
+
+    expect(db.prepare('SELECT capture_ts,capture_local_time,capture_offset_minutes,capture_source,capture_confidence FROM assets WHERE asset_id=?')
+      .get(result.assetId)).toEqual({
+        capture_ts: '2024-04-02T09:04:05.000Z', capture_local_time: '2024-04-02T12:04:05.000',
+        capture_offset_minutes: 180, capture_source: 'exif_offset', capture_confidence: 'high'
+      });
+    const event = db.prepare("SELECT payload_json FROM sync_event_log WHERE event_type='asset.indexed'").get() as { payload_json: string };
+    expect(JSON.parse(event.payload_json).capture).toMatchObject({ capturedAt: '2024-04-02T09:04:05.000Z', offsetMinutes: 180, confidence: 'high' });
+    expect(fileSystem.read('/source/2026/original.jpg')).toEqual(original);
+    expect(fileSystem.read(result.storageRef)).toEqual(original);
     db.close();
   });
 

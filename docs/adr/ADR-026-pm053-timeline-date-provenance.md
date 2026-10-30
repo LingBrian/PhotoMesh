@@ -19,7 +19,7 @@
 ### 日期来源与置信度（推荐）
 
 1. 为每个资产增加 `capture_source`、`capture_confidence`、可选 `capture_local_time` 和 `capture_offset_minutes`。推荐来源枚举为 `exif_offset`、`exif_floating`、`legacy_unknown`、`unknown`；置信度为 `high`、`medium`、`unknown`。
-2. EXIF `DateTimeOriginal` 带有效 offset 时，保存规范 UTC `capture_ts`，来源 `exif_offset`、置信度 `high`。
+2. EXIF `DateTimeOriginal` 带有效 offset 时，保存规范 UTC `capture_ts`，来源 `exif_offset`、置信度 `high`；存在但无效的 offset 属于损坏元数据，回退 `unknown`，不得伪装成无 offset。
 3. EXIF 有 `DateTimeOriginal` 但无 offset 时，保留无时区的本地墙钟值（floating local time），不猜测 UTC 或当前导入节点时区；来源 `exif_floating`、置信度 `medium`。界面显式标注时区未知，并放入独立的 floating-time 分段；UTC 日期筛选不将其伪装成 instant。
 4. 推荐不以文件系统 `mtime` 或 upload/import 的 `created_at` 冒充拍摄时间：复制可改变 mtime，创建时间不是拍摄时间；无可验证 EXIF 日期时保持 `NULL/unknown`。若用户希望采用低置信度 mtime 回退，应在实施前另行明确批准。
 5. EXIF 读取纳入 PM-053，初始只处理经许可/资源审查的 reader 明确支持的照片格式；unsupported、损坏或超资源边界的文件保持 `unknown`。新写入/扫描读取元数据，不改文件；旧资产标记 `legacy_unknown`，仅在后续正常只读扫描/重新上传时补充来源，不由迁移遍历文件。

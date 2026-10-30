@@ -77,6 +77,12 @@
     "localAlbumPageHint": "本地相册仅筛选此设备已加载的页面；继续加载可搜索更多项目。",
     "loadMoreForAlbum": "加载下一页",
     "unknownDate": "拍摄时间未知",
+    "captureTimezoneUnknown": "时区未知",
+    "captureConfidence": {
+      "high": "EXIF 拍摄时间（{offset}）",
+      "medium": "EXIF 本地时间",
+      "unknown": "拍摄时间来源未知"
+    },
     "unknownStatus": "状态未知",
     "unknownError": "发生未知错误",
     "connectionFailed": "无法连接到此节点。",

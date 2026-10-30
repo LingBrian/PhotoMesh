@@ -6,6 +6,7 @@ import { maxAssetTagsPerAsset } from '../asset-tag-limits.js';
 import { decodeAlbumCursor, encodeAlbumCursor, type AlbumCursorScope } from '../albums/album-utils.js';
 import { SyncRepository } from '../sync/sync-repository.js';
 import type { EventDraftFactory } from '../sync/event-envelope.js';
+import { isCanonicalCaptureLocalTime, isCaptureDateMetadata, type CaptureDateMetadata, type CaptureDateConfidence, type CaptureDateSource } from '../metadata/capture-date.js';
 
 export type UploadState = 'created' | 'uploading' | 'verifying' | 'completed' | 'failed';
 export type AssetKind = 'photo' | 'video' | 'live_photo';
@@ -57,6 +58,7 @@ export interface CompletedLocationRecord {
 }
 
 export interface ExternalLocationRecord {
+  captureDate: CaptureDateMetadata;
   locationId: string;
   fileId: string;
   assetId: string;
@@ -105,6 +107,10 @@ export interface LibraryIndexAsset {
 export interface GalleryAssetRecord extends LibraryIndexAsset {
   filename: string;
   capturedAt: string | null;
+  captureLocalTime: string | null;
+  captureOffsetMinutes: number | null;
+  captureSource: CaptureDateSource;
+  captureConfidence: CaptureDateConfidence;
   sourcePath: string | null;
   sourceKind: SourceKind;
   byteSize: number;
@@ -260,7 +266,8 @@ export interface UploadRepository {
   recordChunk(record: UploadChunkRecord, expectedOffset: number, now: string): void;
   markVerifying(sessionId: string, now: string): void;
   markFailed(sessionId: string, now: string): void;
-  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string, eventFactory?: EventDraftFactory): void;
+  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string,
+    captureDate: CaptureDateMetadata, eventFactory?: EventDraftFactory): void;
   getLocationForSession(sessionId: string): CompletedLocationRecord | undefined;
 }
 
@@ -275,6 +282,13 @@ export class RepositoryConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'RepositoryConflictError';
+  }
+}
+
+export class StaleGalleryCursorError extends Error {
+  constructor() {
+    super('legacy null-date cursor must be restarted');
+    this.name = 'StaleGalleryCursorError';
   }
 }
 
@@ -1120,6 +1134,14 @@ export class SqliteRepository implements UploadRepository {
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('invalid gallery limit');
     const filters = normalizeGallerySearchFilters(search);
     const position = cursor ? decodeGalleryCursor(cursor, libraryId, filters) : undefined;
+    const captureLocalExpression = "COALESCE(local_capture.capture_local_time,json_extract(remote_capture.metadata_json,'$.capture.localTime'))";
+    const captureOffsetExpression = "COALESCE(local_capture.capture_offset_minutes,json_extract(remote_capture.metadata_json,'$.capture.offsetMinutes'))";
+    const captureSourceExpression = `COALESCE(local_capture.capture_source,json_extract(remote_capture.metadata_json,'$.capture.source'),
+      CASE WHEN c.captured_at IS NULL THEN 'unknown' ELSE 'legacy_unknown' END)`;
+    const captureConfidenceExpression = `COALESCE(local_capture.capture_confidence,json_extract(remote_capture.metadata_json,'$.capture.confidence'),
+      CASE WHEN c.captured_at IS NULL THEN 'unknown' ELSE 'unknown' END)`;
+    const sortRankExpression = `CASE WHEN c.captured_at IS NOT NULL THEN 0 WHEN ${captureLocalExpression} IS NOT NULL THEN 1 ELSE 2 END`;
+    const sortKeyExpression = `CASE WHEN c.captured_at IS NOT NULL THEN c.captured_at ELSE ${captureLocalExpression} END`;
     const where: string[] = ['c.library_id = ?'];
     const parameters: Array<string | number> = [libraryId];
     if (filters.q) {
@@ -1138,31 +1160,40 @@ export class SqliteRepository implements UploadRepository {
     if (filters.sourceKind) { where.push('c.source_kind = ?'); parameters.push(filters.sourceKind); }
     if (filters.availability) { where.push('c.availability = ?'); parameters.push(filters.availability); }
     if (position) {
-      if (position.capturedAt === null) {
-        where.push('c.captured_at IS NULL AND c.asset_id COLLATE BINARY < ?');
-        parameters.push(position.assetId);
+      if (position.sortRank === 2) {
+        where.push(`(${sortRankExpression} > ? OR (${sortRankExpression} = ? AND c.asset_id COLLATE BINARY < ?))`);
+        parameters.push(position.sortRank, position.sortRank, position.assetId);
       } else {
-        where.push('(c.captured_at < ? OR c.captured_at IS NULL OR (c.captured_at = ? AND c.asset_id COLLATE BINARY < ?))');
-        parameters.push(position.capturedAt, position.capturedAt, position.assetId);
+        where.push(`(${sortRankExpression} > ? OR (${sortRankExpression} = ? AND
+          (${sortKeyExpression} < ? OR (${sortKeyExpression} = ? AND c.asset_id COLLATE BINARY < ?))))`);
+        parameters.push(position.sortRank, position.sortRank, position.sortKey!, position.sortKey!, position.assetId);
       }
     }
     const rows = this.db.prepare(`SELECT c.asset_id,c.library_id,c.origin_node_id,c.kind,c.captured_at AS captured_at,
+        ${captureLocalExpression} AS capture_local_time,${captureOffsetExpression} AS capture_offset_minutes,
+        ${captureSourceExpression} AS capture_source,${captureConfidenceExpression} AS capture_confidence,
+        ${sortRankExpression} AS sort_rank,${sortKeyExpression} AS sort_key,
         c.sha256,c.byte_size,c.filename,NULLIF(c.source_path,'') AS source_path,c.source_kind,c.availability,
         CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite,
         r.rating AS rating,COALESCE(r.conflict,0) AS rating_conflict,
         COALESCE(r.candidates_json,'[]') AS rating_candidates_json
       FROM gallery_search_content c
+      LEFT JOIN assets local_capture ON local_capture.library_id=c.library_id AND local_capture.asset_id=c.asset_id
+      LEFT JOIN sync_asset_projection remote_capture ON remote_capture.library_id=c.library_id AND remote_capture.asset_id=c.asset_id
       LEFT JOIN asset_favorites fav ON fav.library_id=c.library_id AND fav.asset_id=c.asset_id
       LEFT JOIN asset_rating_projection r ON r.library_id=c.library_id AND r.asset_id=c.asset_id
       WHERE ${where.join(' AND ')}
-      ORDER BY c.captured_at DESC,c.asset_id COLLATE BINARY DESC LIMIT ?`).all(...parameters, limit + 1) as GalleryAssetSqlRow[];
+      ORDER BY sort_rank ASC,sort_key DESC,c.asset_id COLLATE BINARY DESC LIMIT ?`).all(...parameters, limit + 1) as GalleryAssetSqlRow[];
     const hasMore = rows.length > limit;
-    const page = rows.slice(0, limit).map(toGalleryAsset);
-    const last = page.at(-1);
+    const pageRows = rows.slice(0, limit);
+    const page = pageRows.map(toGalleryAsset);
+    const last = pageRows.at(-1);
     const tagsByAsset = this.listAssetTags(libraryId, page.map((asset) => asset.assetId));
     return {
       items: page.map((asset) => ({ ...asset, tags: tagsByAsset.get(asset.assetId) ?? [] })),
-      nextCursor: hasMore && last ? encodeGalleryCursor(last.capturedAt, last.assetId, libraryId, filters) : null
+      nextCursor: hasMore && last
+        ? encodeGalleryCursor(last.sort_rank as 0 | 1 | 2, last.sort_key, last.asset_id, libraryId, filters)
+        : null
     };
   }
 
@@ -1370,15 +1401,19 @@ export class SqliteRepository implements UploadRepository {
     this.db.prepare(`UPDATE jobs SET state = 'failed', updated_at = ? WHERE job_id = ?`).run(now, sessionId);
   }
 
-  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string, eventFactory?: EventDraftFactory): void {
+  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string,
+    captureDate: CaptureDateMetadata, eventFactory?: EventDraftFactory): void {
+    if (!isCaptureDateMetadata(captureDate)) throw new RepositoryConflictError('capture date metadata is invalid');
     const finalize = this.db.transaction(() => {
       const session = this.getUploadSession(sessionId);
       if (!session) throw new RepositoryConflictError('upload session not found');
       if (session.state === 'completed') return;
       if (session.state !== 'verifying' || session.offset !== session.totalBytes) throw new RepositoryConflictError('upload is not ready to finalize');
       this.faults.beforeFinalize?.();
-      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at)
-        VALUES (?, ?, ?, ?, NULL, ?)`).run(assetId, session.libraryId, nodeId, session.kind, now);
+      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, capture_local_time,
+        capture_offset_minutes, capture_source, capture_confidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(assetId, session.libraryId, nodeId, session.kind, captureDate.capturedAt,
+          captureDate.localTime, captureDate.offsetMinutes, captureDate.source, captureDate.confidence, now);
       this.db.prepare(`INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at)
         VALUES (?, ?, ?, ?, 'original', ?, ?)`).run(fileId, assetId, session.expectedSha256, session.totalBytes, session.finalStorageRef, now);
       this.db.prepare(`INSERT INTO file_locations (
@@ -1419,18 +1454,30 @@ export class SqliteRepository implements UploadRepository {
   }
 
   recordExternalFile(record: ExternalLocationRecord, eventFactory?: EventDraftFactory): string {
+    if (!isCaptureDateMetadata(record.captureDate)) throw new RepositoryConflictError('capture date metadata is invalid');
     const write = this.db.transaction(() => {
-      const existing = this.db.prepare(`SELECT l.location_id, f.sha256 FROM file_locations l
+      const existing = this.db.prepare(`SELECT l.location_id, f.asset_id, f.sha256 FROM file_locations l
         JOIN asset_files f ON f.file_id = l.file_id
         WHERE l.node_id = ? AND l.storage_class = 'external' AND l.original_path = ?
-        ORDER BY l.created_at DESC LIMIT 1`).get(record.nodeId, record.originalPath) as { location_id: string; sha256: string } | undefined;
+        ORDER BY l.created_at DESC LIMIT 1`).get(record.nodeId, record.originalPath) as {
+          location_id: string; asset_id: string; sha256: string;
+        } | undefined;
       if (existing?.sha256 === record.sha256) {
         this.db.prepare("UPDATE file_locations SET availability = 'online' WHERE location_id = ?").run(existing.location_id);
+        if (record.captureDate.source === 'exif_offset' || record.captureDate.source === 'exif_floating') {
+          this.db.prepare(`UPDATE assets SET capture_ts=?,capture_local_time=?,capture_offset_minutes=?,capture_source=?,capture_confidence=?
+            WHERE asset_id=? AND capture_source IN ('unknown','legacy_unknown')`)
+            .run(record.captureDate.capturedAt, record.captureDate.localTime, record.captureDate.offsetMinutes,
+              record.captureDate.source, record.captureDate.confidence, existing.asset_id);
+        }
         return existing.location_id;
       }
       if (existing) this.db.prepare("UPDATE file_locations SET availability = 'missing' WHERE location_id = ?").run(existing.location_id);
-      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at)
-        VALUES (?, ?, ?, ?, NULL, ?)`).run(record.assetId, record.libraryId, record.nodeId, record.kind, record.now);
+      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, capture_local_time,
+        capture_offset_minutes, capture_source, capture_confidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(record.assetId, record.libraryId, record.nodeId, record.kind,
+          record.captureDate.capturedAt, record.captureDate.localTime, record.captureDate.offsetMinutes,
+          record.captureDate.source, record.captureDate.confidence, record.now);
       this.db.prepare(`INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at)
         VALUES (?, ?, ?, ?, 'original', ?, ?)`).run(record.fileId, record.assetId, record.sha256, record.byteSize, record.storageRef, record.now);
       this.db.prepare(`INSERT INTO file_locations (location_id, file_id, node_id, original_filename, original_path,
@@ -1480,6 +1527,12 @@ interface GalleryAssetSqlRow {
   origin_node_id: string;
   kind: AssetKind;
   captured_at: unknown;
+  capture_local_time: unknown;
+  capture_offset_minutes: unknown;
+  capture_source: unknown;
+  capture_confidence: unknown;
+  sort_rank: number;
+  sort_key: string | null;
   sha256: string | null;
   byte_size: number | null;
   filename: unknown;
@@ -1494,19 +1547,43 @@ interface GalleryAssetSqlRow {
 
 function toGalleryAsset(row: GalleryAssetSqlRow): GalleryAssetRecord {
   const capturedAt = typeof row.captured_at === 'string' ? row.captured_at : null;
+  const captureDate = normalizeStoredCaptureDate({
+    capturedAt,
+    localTime: typeof row.capture_local_time === 'string' ? row.capture_local_time : null,
+    offsetMinutes: typeof row.capture_offset_minutes === 'number' ? row.capture_offset_minutes : null,
+    source: row.capture_source,
+    confidence: row.capture_confidence
+  });
   const parsedCandidates = parseRatingCandidates(row.rating_candidates_json);
   const ratingConflict = Boolean(row.rating_conflict);
   return {
     assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id, kind: row.kind,
     sha256: row.sha256 ?? '', availability: row.availability,
     filename: typeof row.filename === 'string' ? row.filename : row.asset_id,
-    capturedAt, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
+    capturedAt: captureDate.capturedAt, captureLocalTime: captureDate.localTime,
+    captureOffsetMinutes: captureDate.offsetMinutes, captureSource: captureDate.source,
+    captureConfidence: captureDate.confidence, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
     sourceKind: row.source_kind === 'upload' ? 'upload' : 'import',
     byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id, tags: [], favorite: Boolean(row.favorite),
     rating: ratingConflict ? null : row.rating,
     ratingConflict,
     ratingCandidates: parsedCandidates
   };
+}
+
+function normalizeStoredCaptureDate(value: Record<string, unknown>): CaptureDateMetadata {
+  const candidate = {
+    capturedAt: value.capturedAt ?? null,
+    localTime: value.localTime ?? null,
+    offsetMinutes: value.offsetMinutes ?? null,
+    source: value.source,
+    confidence: value.confidence
+  };
+  if (isCaptureDateMetadata(candidate)) return candidate;
+  const capturedAt = typeof value.capturedAt === 'string' && isCanonicalUtcTimestamp(value.capturedAt) ? value.capturedAt : null;
+  return capturedAt
+    ? { capturedAt, localTime: null, offsetMinutes: null, source: 'legacy_unknown', confidence: 'unknown' }
+    : { capturedAt: null, localTime: null, offsetMinutes: null, source: 'unknown', confidence: 'unknown' };
 }
 
 function parseRatingCandidates(value: string | null): Array<number | null> {
@@ -1528,12 +1605,15 @@ interface NormalizedGallerySearchFilters {
 }
 
 interface GalleryCursorPosition {
-  capturedAt: string | null;
+  sortRank: 0 | 1 | 2;
+  sortKey: string | null;
   assetId: string;
 }
 
-const GALLERY_CURSOR_SORT = 'capture-desc-asset-binary-desc-v1';
-const GALLERY_CURSOR_KEYS = ['assetId', 'capturedAt', 'filterHash', 'libraryId', 'sort', 'version'];
+const LEGACY_GALLERY_CURSOR_SORT = 'capture-desc-asset-binary-desc-v1';
+const GALLERY_CURSOR_SORT = 'capture-groups-desc-asset-binary-desc-v2';
+const LEGACY_GALLERY_CURSOR_KEYS = ['assetId', 'capturedAt', 'filterHash', 'libraryId', 'sort', 'version'];
+const GALLERY_CURSOR_KEYS = ['assetId', 'filterHash', 'libraryId', 'sort', 'sortKey', 'sortRank', 'version'];
 
 export function normalizeGallerySearchFilters(filters: GallerySearchFilters): NormalizedGallerySearchFilters {
   const q = filters.q ?? '';
@@ -1571,7 +1651,7 @@ function galleryCursorVersion(filters: NormalizedGallerySearchFilters): 1 | 2 {
   return filters.kind || filters.sourceKind || filters.availability ? 2 : 1;
 }
 
-function gallerySearchFilterHash(filters: NormalizedGallerySearchFilters, version: 1 | 2): string {
+function gallerySearchFilterHash(filters: NormalizedGallerySearchFilters, version: 1 | 2 | 3): string {
   const canonical = version === 1
     ? { q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo }
     : { q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo, kind: filters.kind, sourceKind: filters.sourceKind, availability: filters.availability };
@@ -1579,11 +1659,10 @@ function gallerySearchFilterHash(filters: NormalizedGallerySearchFilters, versio
 }
 
 function encodeGalleryCursor(
-  capturedAt: string | null, assetId: string, libraryId: string, filters: NormalizedGallerySearchFilters
+  sortRank: 0 | 1 | 2, sortKey: string | null, assetId: string, libraryId: string, filters: NormalizedGallerySearchFilters
 ): string {
-  const version = galleryCursorVersion(filters);
   return Buffer.from(JSON.stringify({
-    version, libraryId, filterHash: gallerySearchFilterHash(filters, version), sort: GALLERY_CURSOR_SORT, capturedAt, assetId
+    version: 3, libraryId, filterHash: gallerySearchFilterHash(filters, 3), sort: GALLERY_CURSOR_SORT, sortRank, sortKey, assetId
   }), 'utf8').toString('base64url');
 }
 
@@ -1594,14 +1673,27 @@ function decodeGalleryCursor(
     if (value.length > 2048 || Buffer.from(value, 'base64url').toString('base64url') !== value) throw new Error('invalid cursor');
     const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>;
     const version = decoded.version;
-    if (Object.keys(decoded).sort().join(',') !== GALLERY_CURSOR_KEYS.join(',') || (version !== 1 && version !== 2) ||
-      version !== galleryCursorVersion(filters) || decoded.libraryId !== libraryId ||
-      decoded.filterHash !== gallerySearchFilterHash(filters, version) || decoded.sort !== GALLERY_CURSOR_SORT ||
-      !(decoded.capturedAt === null || isCanonicalUtcTimestamp(decoded.capturedAt)) || typeof decoded.assetId !== 'string' ||
-      decoded.assetId.length < 1 || decoded.assetId.length > 256) throw new Error('invalid cursor');
-    return { capturedAt: decoded.capturedAt as string | null, assetId: decoded.assetId };
-  } catch {
-    throw new Error('invalid gallery cursor');
+    if (typeof decoded.assetId !== 'string' || decoded.assetId.length < 1 || decoded.assetId.length > 256 || decoded.libraryId !== libraryId) {
+      throw new Error('invalid cursor');
+    }
+    if (version === 3) {
+      if (Object.keys(decoded).sort().join(',') !== GALLERY_CURSOR_KEYS.join(',') || decoded.sort !== GALLERY_CURSOR_SORT ||
+          decoded.filterHash !== gallerySearchFilterHash(filters, 3) ||
+          !(decoded.sortRank === 0 || decoded.sortRank === 1 || decoded.sortRank === 2) ||
+          (decoded.sortRank === 0 && !isCanonicalUtcTimestamp(decoded.sortKey)) ||
+          (decoded.sortRank === 1 && !isCanonicalCaptureLocalTime(decoded.sortKey)) ||
+          (decoded.sortRank === 2 && decoded.sortKey !== null)) throw new Error('invalid cursor');
+      return { sortRank: decoded.sortRank, sortKey: decoded.sortKey as string | null, assetId: decoded.assetId };
+    }
+    if ((version !== 1 && version !== 2) || version !== galleryCursorVersion(filters) ||
+        Object.keys(decoded).sort().join(',') !== LEGACY_GALLERY_CURSOR_KEYS.join(',') ||
+        decoded.filterHash !== gallerySearchFilterHash(filters, version) || decoded.sort !== LEGACY_GALLERY_CURSOR_SORT ||
+        !(decoded.capturedAt === null || isCanonicalUtcTimestamp(decoded.capturedAt))) throw new Error('invalid cursor');
+    if (decoded.capturedAt === null) throw new StaleGalleryCursorError();
+    return { sortRank: 0, sortKey: decoded.capturedAt as string, assetId: decoded.assetId };
+  } catch (cause) {
+    if (cause instanceof StaleGalleryCursorError) throw cause;
+    throw new Error('invalid gallery cursor', { cause });
   }
 }
 

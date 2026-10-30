@@ -1802,5 +1802,25 @@ export const migrations: readonly Migration[] = [
       CREATE INDEX metadata_audit_resource_idx ON metadata_audit_events(library_id, resource_type, resource_id, audit_id);
       CREATE INDEX metadata_audit_time_idx ON metadata_audit_events(created_at, audit_id);
     `
+  },
+  {
+    id: '0014_capture_date_provenance',
+    sql: `
+      ALTER TABLE assets ADD COLUMN capture_local_time TEXT;
+      ALTER TABLE assets ADD COLUMN capture_offset_minutes INTEGER CHECK (
+        capture_offset_minutes IS NULL OR capture_offset_minutes BETWEEN -840 AND 840
+      );
+      ALTER TABLE assets ADD COLUMN capture_source TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (capture_source IN ('exif_offset','exif_floating','legacy_unknown','unknown'));
+      ALTER TABLE assets ADD COLUMN capture_confidence TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (capture_confidence IN ('high','medium','unknown'));
+      UPDATE assets SET capture_source = CASE WHEN capture_ts IS NULL THEN 'unknown' ELSE 'legacy_unknown' END,
+        capture_confidence = 'unknown';
+      CREATE INDEX assets_library_capture_local_idx
+        ON assets(library_id,capture_local_time DESC,asset_id COLLATE BINARY DESC);
+      CREATE INDEX sync_projection_capture_local_idx
+        ON sync_asset_projection(library_id,json_extract(metadata_json,'$.capture.localTime') DESC,asset_id COLLATE BINARY DESC)
+        WHERE json_type(metadata_json,'$.capture.localTime')='text';
+    `
   }
 ];

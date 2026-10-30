@@ -3,6 +3,7 @@ import type { AssetKind, CreateUploadSessionRecord, SourceKind, UploadChunkRecor
 import { RepositoryConflictError } from '../db/repository.js';
 import type { FileDigest, UploadFileSystem } from './file-system.js';
 import type { EventDraftFactory } from '../sync/event-envelope.js';
+import { maxCaptureDatePrefixBytes, parseCaptureDatePrefix, unknownCaptureDateMetadata, type CaptureDateMetadata } from '../metadata/capture-date.js';
 
 export interface CreateUploadRequest {
   libraryId: string;
@@ -51,7 +52,7 @@ export interface UploadServiceOptions {
   maxFileBytes?: number;
   maxChunkBytes?: number;
   sessionTtlMs?: number;
-  createEventDraft?: (session: UploadSessionRecord, assetId: string) => EventDraftFactory;
+  createEventDraft?: (session: UploadSessionRecord, assetId: string, captureDate: CaptureDateMetadata) => EventDraftFactory;
   signPendingEvents?: () => Promise<void>;
 }
 
@@ -63,7 +64,7 @@ export class UploadService {
   private readonly maxFileBytes: number;
   private readonly maxChunkBytes: number;
   private readonly sessionTtlMs: number;
-  private readonly createEventDraft: ((session: UploadSessionRecord, assetId: string) => EventDraftFactory) | undefined;
+  private readonly createEventDraft: ((session: UploadSessionRecord, assetId: string, captureDate: CaptureDateMetadata) => EventDraftFactory) | undefined;
   private readonly signPendingEvents: (() => Promise<void>) | undefined;
   private readonly locks = new Map<string, Promise<void>>();
   private recoveryPromise: Promise<void> | undefined;
@@ -260,26 +261,32 @@ export class UploadService {
     try {
       let digest: FileDigest;
       if (await this.fileSystem.exists(session.finalStorageRef)) {
-        digest = await this.fileSystem.hashFile(session.finalStorageRef);
+        digest = await this.fileSystem.hashFile(session.finalStorageRef, maxCaptureDatePrefixBytes);
       } else {
         const temporaryRef = `staging/${sessionId}/assembled.tmp`;
         if (await this.fileSystem.exists(temporaryRef)) await this.fileSystem.remove(temporaryRef);
-        digest = await this.fileSystem.assembleAndHash(chunks.map((chunk) => chunk.stagingRef), temporaryRef);
+        digest = await this.fileSystem.assembleAndHash(chunks.map((chunk) => chunk.stagingRef), temporaryRef, maxCaptureDatePrefixBytes);
         if (digest.byteLength !== session.totalBytes || digest.sha256 !== session.expectedSha256) {
           this.repository.markFailed(sessionId, this.now());
           throw new UploadError('CHECKSUM_MISMATCH', 'Complete file checksum does not match the declared content');
         }
         await this.fileSystem.flush(temporaryRef);
         const published = await this.fileSystem.publishNoReplace(temporaryRef, session.finalStorageRef);
-        if (published === 'exists') digest = await this.fileSystem.hashFile(session.finalStorageRef);
+        if (published === 'exists') digest = await this.fileSystem.hashFile(session.finalStorageRef, maxCaptureDatePrefixBytes);
       }
       if (digest.byteLength !== session.totalBytes || digest.sha256 !== session.expectedSha256) {
         this.repository.markFailed(sessionId, this.now());
         throw new UploadError('CHECKSUM_MISMATCH', 'Published object checksum does not match the declared content');
       }
+      let captureDate: CaptureDateMetadata = { ...unknownCaptureDateMetadata };
+      try {
+        captureDate = parseCaptureDatePrefix(digest.prefix ?? new Uint8Array());
+      } catch {
+        // Optional metadata parsing must never make a checksum-verified original upload fail.
+      }
       const assetId = randomUUID();
-      this.repository.finalizeUpload(sessionId, assetId, randomUUID(), randomUUID(), this.nodeId, this.now(),
-        this.createEventDraft?.(session, assetId));
+      this.repository.finalizeUpload(sessionId, assetId, randomUUID(), randomUUID(), this.nodeId, this.now(), captureDate,
+        this.createEventDraft?.(session, assetId, captureDate));
       await this.signPendingEvents?.();
       const completed = this.requireSession(sessionId);
       await this.cleanupStaging(sessionId);

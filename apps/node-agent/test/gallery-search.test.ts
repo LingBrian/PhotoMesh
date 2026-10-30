@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { migrations } from '../src/db/migrations.js';
-import { SqliteRepository } from '../src/db/repository.js';
+import { SqliteRepository, StaleGalleryCursorError } from '../src/db/repository.js';
 import { makeUnsignedEvent } from '../src/sync/event-envelope.js';
 
 const now = '2026-10-29T00:00:00.000Z';
@@ -67,6 +68,7 @@ describe('PM-048 gallery search index and cursor', () => {
       expect(searchIds(db, '"photo"', 'library-a')).toEqual(['local-one', 'remote-one']);
       expect(searchIds(db, '"shared"', 'library-a')).toEqual(['shared-asset']);
       expect(searchIds(db, '"projection"', 'library-a')).toEqual([]);
+      await repository.migrate(migrations);
 
       insertLocalAsset(db, { assetId: 'local-after', filename: 'Fresh Archive.JPG', path: '/new/Fresh Archive.JPG' });
       expect(searchIds(db, '"fresh"', 'library-a')).toEqual(['local-after']);
@@ -160,7 +162,7 @@ describe('PM-048 gallery search index and cursor', () => {
       expect(third.items.map((asset) => asset.assetId)).toEqual(['asset-null', 'asset-invalid']);
       expect(third.nextCursor).toBeNull();
       const cursorPayload = JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')) as Record<string, unknown>;
-      expect(cursorPayload.version).toBe(1);
+      expect(cursorPayload.version).toBe(3);
       const extraCursorField = Buffer.from(JSON.stringify({ ...cursorPayload, unexpected: true }), 'utf8').toString('base64url');
       expect(() => repository.listGalleryAssets('library-a', extraCursorField, 2, { q: 'photo' })).toThrow(/cursor/i);
       expect(() => repository.listGalleryAssets('library-a', 'e30=', 2, { q: 'photo' })).toThrow(/cursor/i);
@@ -204,7 +206,7 @@ describe('PM-048 gallery search index and cursor', () => {
 
       const first = repository.listGalleryAssets('library-a', undefined, 1, { kind: 'video', sourceKind: 'upload' });
       const firstPayload = JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')) as { version: number };
-      expect(firstPayload.version).toBe(2);
+      expect(firstPayload.version).toBe(3);
       expect(first.items.map((asset) => asset.assetId)).toEqual(['asset-video-upload-cached']);
       const second = repository.listGalleryAssets('library-a', first.nextCursor!, 1, { kind: 'video', sourceKind: 'upload' });
       expect(second.items.map((asset) => asset.assetId)).toEqual(['asset-remote-video-upload']);
@@ -317,7 +319,7 @@ describe('PM-048 gallery search index and cursor', () => {
       await expect(pm048Binary.migrate(migrations.slice(0, 11))).rejects.toThrow(/unknown migration 0012_gallery_filter_indexes/i);
       const oldBinary = new SqliteRepository(db);
       await expect(oldBinary.migrate(migrations.slice(0, 10))).rejects.toThrow(/unknown migration 0011_gallery_search_index/i);
-      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 13 });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 14 });
     } finally {
       db.close();
     }
@@ -334,6 +336,69 @@ describe('PM-048 gallery search index and cursor', () => {
       expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 10 });
       expect(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='gallery_search_content'").get()).toBeUndefined();
       expect(db.prepare('SELECT asset_id FROM assets WHERE asset_id=?').get('before-search')).toEqual({ asset_id: 'before-search' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('pages through equal instants, floating wall times, and unknown dates without duplicates', async () => {
+    const db = new Database(':memory:');
+    try {
+      const repository = new SqliteRepository(db, { backupBeforeMigration: async () => undefined });
+      await repository.migrate(migrations);
+      const instant = '2024-05-06T07:08:09.000Z';
+      for (const assetId of ['instant-a', 'instant-b', 'instant-c', 'instant-d', 'instant-e']) {
+        insertLocalAsset(db, { assetId, capturedAt: instant, filename: `${assetId}.jpg`, path: `/photos/${assetId}.jpg` });
+        db.prepare(`UPDATE assets SET capture_local_time=?,capture_offset_minutes=120,capture_source='exif_offset',capture_confidence='high'
+          WHERE asset_id=?`).run('2024-05-06T09:08:09.000', assetId);
+      }
+      for (const assetId of ['floating-a', 'floating-b', 'floating-c']) {
+        insertLocalAsset(db, { assetId, filename: `${assetId}.jpg`, path: `/photos/${assetId}.jpg` });
+        db.prepare(`UPDATE assets SET capture_local_time=?,capture_source='exif_floating',capture_confidence='medium'
+          WHERE asset_id=?`).run('2024-05-06T09:08:09.000', assetId);
+      }
+      for (const assetId of ['unknown-a', 'unknown-b']) {
+        insertLocalAsset(db, { assetId, filename: `${assetId}.jpg`, path: `/photos/${assetId}.jpg` });
+      }
+
+      const collected: string[] = [];
+      const pages: Array<{ assetId: string; capturedAt: string | null; captureLocalTime: string | null; captureSource: string; captureConfidence: string }> = [];
+      let cursor: string | undefined;
+      let loops = 0;
+      do {
+        const page = repository.listGalleryAssets('library-a', cursor, 2);
+        pages.push(...page.items);
+        collected.push(...page.items.map((asset) => asset.assetId));
+        cursor = page.nextCursor ?? undefined;
+        loops += 1;
+        if (loops > 10) throw new Error('cursor did not terminate');
+      } while (cursor);
+
+      expect(collected).toEqual([
+        'instant-e', 'instant-d', 'instant-c', 'instant-b', 'instant-a',
+        'floating-c', 'floating-b', 'floating-a', 'unknown-b', 'unknown-a'
+      ]);
+      expect(new Set(collected).size).toBe(collected.length);
+      expect(pages[0]).toMatchObject({ capturedAt: instant, captureLocalTime: '2024-05-06T09:08:09.000', captureSource: 'exif_offset', captureConfidence: 'high' });
+      expect(pages[5]).toMatchObject({ capturedAt: null, captureLocalTime: '2024-05-06T09:08:09.000', captureSource: 'exif_floating', captureConfidence: 'medium' });
+      expect(pages.at(-1)).toMatchObject({ captureSource: 'unknown', captureConfidence: 'unknown' });
+
+      const first = repository.listGalleryAssets('library-a', undefined, 2);
+      const decoded = JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')) as Record<string, unknown>;
+      expect(decoded).toMatchObject({ version: 3, sortRank: 0, sortKey: instant });
+
+      const legacyFilterHash = createHash('sha256').update(JSON.stringify({ q: '', dateFrom: null, dateTo: null })).digest('hex');
+      const oldCursor = Buffer.from(JSON.stringify({
+        version: 1, libraryId: 'library-a', filterHash: legacyFilterHash,
+        sort: 'capture-desc-asset-binary-desc-v1', capturedAt: instant, assetId: 'instant-e'
+      }), 'utf8').toString('base64url');
+      expect(repository.listGalleryAssets('library-a', oldCursor, 2).items.map((asset) => asset.assetId))
+        .toEqual(['instant-d', 'instant-c']);
+      const oldNullCursor = Buffer.from(JSON.stringify({
+        version: 1, libraryId: 'library-a', filterHash: legacyFilterHash,
+        sort: 'capture-desc-asset-binary-desc-v1', capturedAt: null, assetId: 'unknown-b'
+      }), 'utf8').toString('base64url');
+      expect(() => repository.listGalleryAssets('library-a', oldNullCursor, 2)).toThrow(StaleGalleryCursorError);
     } finally {
       db.close();
     }

@@ -6,6 +6,11 @@ import { maxGalleryThumbnailBytes, readGalleryThumbnail } from './gallery-thumbn
 import { createMediaVersion, GalleryVersionError, getMediaVersion, isTerminalVersionStatus, loadMediaVersions, loadVersionContent, normalizeCrop, type VersionCollection } from './gallery-versions.js';
 import { assetTagPath, maxLegacyTagsPerAsset, mergeAssetTags, normalizeAssetTag } from './asset-tags.js';
 import { maxBulkSelection, updateAssetSelection } from './gallery-bulk.js';
+import {
+  captureDateGroupKey as getCaptureDateGroupKey, captureDateTimeValue as getCaptureDateTimeValue,
+  formatCaptureDate as displayCaptureDate, formatCaptureDateGroup as displayCaptureDateGroup,
+  formatCaptureTime as displayCaptureTime
+} from './capture-date-display.js';
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
 import './gallery.css';
 
@@ -13,6 +18,9 @@ type Library = { libraryId: string; title: string };
 type Asset = {
   assetId: string; libraryId: string; originNodeId: string; kind: string; sha256: string;
   availability: 'online' | 'cached' | 'offline' | 'missing'; filename: string; capturedAt: string | null;
+  captureLocalTime?: string | null; captureOffsetMinutes?: number | null;
+  captureSource?: 'exif_offset' | 'exif_floating' | 'legacy_unknown' | 'unknown';
+  captureConfidence?: 'high' | 'medium' | 'unknown';
   sourcePath: string | null; sourceKind: string; byteSize: number; version: string; tags?: string[]; favorite?: boolean;
 };
 type Page = { items: Asset[]; nextCursor: string | null };
@@ -143,10 +151,14 @@ let endpointSwitchNeedsFreshToken = false;
 const sessionRequests = new SessionRequestScope();
 const rowHeight = 164;
 const pageSize = 100;
-const fullDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }));
-const groupDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { dateStyle: 'long' }));
-const dayKeyFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { year: 'numeric', month: '2-digit', day: '2-digit' }));
-const timeFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { timeStyle: 'short' }));
+const systemTimeZone = (() => {
+  try {
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    new Intl.DateTimeFormat('en-US', { timeZone });
+    return timeZone;
+  } catch { return 'UTC'; }
+})();
+const fullDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short', timeZone: systemTimeZone }));
 
 const searchTerm = computed(() => search.value.trim());
 const filteredAssets = computed(() => {
@@ -469,6 +481,10 @@ async function loadPage(reset = false, preserveOnFailure = false): Promise<boole
     return true;
   } catch (cause) {
     if (generation === pageGeneration) {
+      if (cause instanceof NodeApiError && cause.status === 410 && !reset && previousCursor) {
+        assets.value = []; cursor.value = null; serverTags.value = {};
+        return await loadPage(true);
+      }
       if (cause instanceof TypeError) connected.value = false;
       if (preserveOnFailure && hasSession.value) { assets.value = previousAssets; cursor.value = previousCursor; }
       error.value = errorText(cause);
@@ -1407,26 +1423,30 @@ function formatDate(value: string | null): string {
   const date = parsedDate(value);
   return date ? fullDateFormatter.value.format(date) : t('gallery.unknownDate');
 }
-function formatDateGroup(value: string | null): string {
-  const date = parsedDate(value);
-  return date ? groupDateFormatter.value.format(date) : t('gallery.unknownDate');
+function formatCaptureDate(asset: Asset): string {
+  return displayCaptureDate(asset, locale.value, systemTimeZone, t('gallery.unknownDate'), t('gallery.captureTimezoneUnknown'));
 }
-function formatTime(value: string | null): string {
-  const date = parsedDate(value);
-  return date ? timeFormatter.value.format(date) : t('gallery.unknownDate');
+function formatCaptureDateGroup(asset: Asset): string {
+  return displayCaptureDateGroup(asset, locale.value, systemTimeZone, t('gallery.unknownDate'), t('gallery.captureTimezoneUnknown'));
 }
-function dateGroupKey(value: string | null): string {
-  const date = parsedDate(value);
-  return date ? dayKeyFormatter.value.format(date) : 'unknown';
+function formatCaptureTime(asset: Asset): string {
+  return displayCaptureTime(asset, locale.value, systemTimeZone, t('gallery.unknownDate'), t('gallery.captureTimezoneUnknown'));
 }
-function dateTimeValue(value: string | null): string | undefined {
-  return parsedDate(value)?.toISOString();
+function captureConfidenceText(asset: Asset): string {
+  if (!asset.capturedAt && !asset.captureLocalTime) return '';
+  if (asset.captureConfidence === 'high') {
+    if (typeof asset.captureOffsetMinutes !== 'number') return t('gallery.captureConfidence.unknown');
+    const absoluteMinutes = Math.abs(asset.captureOffsetMinutes);
+    const offset = `UTC${asset.captureOffsetMinutes < 0 ? '-' : '+'}${String(Math.floor(absoluteMinutes / 60)).padStart(2, '0')}:${String(absoluteMinutes % 60).padStart(2, '0')}`;
+    return t('gallery.captureConfidence.high', { offset });
+  }
+  return t(`gallery.captureConfidence.${asset.captureConfidence ?? 'unknown'}`);
 }
 function isDateGroupStart(asset: Asset, visibleIndex: number): boolean {
   const absoluteIndex = visibleStart.value + visibleIndex;
   if (absoluteIndex === 0) return true;
   const previous = filteredAssets.value[absoluteIndex - 1];
-  return dateGroupKey(previous?.capturedAt ?? null) !== dateGroupKey(asset.capturedAt);
+  return getCaptureDateGroupKey(previous, systemTimeZone) !== getCaptureDateGroupKey(asset, systemTimeZone);
 }
 function versionStatusText(status: string): string {
   switch (status.toLowerCase()) {
@@ -1969,9 +1989,14 @@ async function idbClear(store: string): Promise<void> {
                 <p class="asset-date">
                   <time
                     :class="{ 'timeline-day-heading': isDateGroupStart(asset, visibleIndex) }"
-                    :datetime="dateTimeValue(asset.capturedAt)"
-                    :aria-label="formatDate(asset.capturedAt)"
-                  >{{ isDateGroupStart(asset, visibleIndex) ? formatDateGroup(asset.capturedAt) : formatTime(asset.capturedAt) }}</time>
+                    :datetime="getCaptureDateTimeValue(asset)"
+                    :aria-label="formatCaptureDate(asset)"
+                    :title="captureConfidenceText(asset)"
+                  >{{ isDateGroupStart(asset, visibleIndex) ? formatCaptureDateGroup(asset) : formatCaptureTime(asset) }}</time>
+                  <span
+                    v-if="captureConfidenceText(asset)"
+                    class="capture-confidence"
+                  >{{ captureConfidenceText(asset) }}</span>
                   <span>·</span> {{ formatSize(asset.byteSize) }}
                 </p>
                 <p class="source-line"><span>⌂ {{ asset.originNodeId }}</span><span v-if="asset.sourcePath">· {{ asset.sourcePath }}</span></p><div class="tag-list">
@@ -2493,7 +2518,7 @@ async function idbClear(store: string): Promise<void> {
           <dl class="preview-metadata">
             <div>
               <dt>{{ t('gallery.captureTime') }}</dt>
-              <dd>{{ formatDate(previewAsset.capturedAt) }}</dd>
+              <dd>{{ formatCaptureDate(previewAsset) }}</dd>
             </div>
             <div>
               <dt>{{ t('gallery.originNode') }}</dt>

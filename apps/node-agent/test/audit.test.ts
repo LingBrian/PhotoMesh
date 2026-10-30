@@ -44,19 +44,19 @@ function seedAlbumAsset(db: Database.Database): void {
 }
 
 describe('PM-052 metadata audit ledger', () => {
-  it('appends migration 0013 without changing the existing migration tail', () => {
-    expect(migrations.slice(-2).map((migration) => migration.id)).toEqual([
-      '0012_gallery_filter_indexes', '0013_metadata_audit_events'
+  it('keeps migration 0013 intact before the appended PM-053 migration', () => {
+    expect(migrations.slice(-3).map((migration) => migration.id)).toEqual([
+      '0012_gallery_filter_indexes', '0013_metadata_audit_events', '0014_capture_date_provenance'
     ]);
   });
 
   it('backs up before applying migration 0013 and preserves all previous checksums', async () => {
     const db = new Database(':memory:');
-    await new SqliteRepository(db).migrate(migrations.slice(0, -1));
+    await new SqliteRepository(db).migrate(migrations.slice(0, -2));
     const previous = db.prepare('SELECT migration_id,checksum FROM schema_migrations ORDER BY migration_id').all();
     let backups = 0;
     const repository = new SqliteRepository(db, { backupBeforeMigration: async () => { backups += 1; } });
-    await repository.migrate();
+    await repository.migrate(migrations.slice(0, -1));
     expect(backups).toBe(1);
     expect(db.prepare('SELECT migration_id,checksum FROM schema_migrations WHERE migration_id <> ? ORDER BY migration_id').all('0013_metadata_audit_events'))
       .toEqual(previous);
@@ -66,10 +66,10 @@ describe('PM-052 metadata audit ledger', () => {
 
   it('leaves the prior schema intact when the pre-migration backup fails', async () => {
     const db = new Database(':memory:');
-    await new SqliteRepository(db).migrate(migrations.slice(0, -1));
+    await new SqliteRepository(db).migrate(migrations.slice(0, -2));
     const previous = db.prepare('SELECT migration_id,checksum FROM schema_migrations ORDER BY migration_id').all();
     const repository = new SqliteRepository(db, { backupBeforeMigration: async () => { throw new Error('backup unavailable'); } });
-    await expect(repository.migrate()).rejects.toThrow('backup unavailable');
+    await expect(repository.migrate(migrations.slice(0, -1))).rejects.toThrow('backup unavailable');
     expect(db.prepare('SELECT migration_id,checksum FROM schema_migrations ORDER BY migration_id').all()).toEqual(previous);
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='metadata_audit_events'").get()).toBeUndefined();
   });

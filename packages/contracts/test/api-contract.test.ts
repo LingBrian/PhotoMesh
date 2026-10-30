@@ -304,6 +304,12 @@ describe('implemented Node HTTP API contract', () => {
     expect(parameters.get('availability')?.schema?.enum).toEqual(['online', 'cached', 'offline', 'missing']);
     expect(JSON.stringify(contract.components.schemas.DiagnosticComponent)).toContain('galleryFilters');
     expect(operation?.responses['400']).toBeDefined();
+    expect(operation?.responses['410']).toBeDefined();
+    const assetSchema = contract.components.schemas.Asset as { required?: string[]; properties?: Record<string, unknown> };
+    for (const field of ['captureLocalTime', 'captureOffsetMinutes', 'captureSource', 'captureConfidence']) {
+      expect(assetSchema.required).not.toContain(field);
+      expect(assetSchema.properties).toHaveProperty(field);
+    }
     expect((operation?.responses['200']?.headers?.['Cache-Control'] as { schema?: { const?: string } } | undefined)?.schema?.const)
       .toBe('private, no-store');
   });

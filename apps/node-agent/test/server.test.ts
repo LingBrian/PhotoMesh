@@ -8,7 +8,7 @@ import {
 } from '../src/server.js';
 import { MediaThumbnailService } from '../src/media/thumbnail-service.js';
 import type { MediaThumbnailTransformer } from '../src/media/image-transformer.js';
-import { RepositoryConflictError, type MediaVersionSourceRecord } from '../src/db/repository.js';
+import { RepositoryConflictError, StaleGalleryCursorError, type MediaVersionSourceRecord } from '../src/db/repository.js';
 import { decodeAlbumCursor, encodeAlbumCursor } from '../src/albums/album-utils.js';
 
 const servers: ReturnType<typeof createNodeAgentServer>[] = [];
@@ -677,6 +677,19 @@ describe('pairing and library authorization endpoints', () => {
     expect(listAssets).toHaveBeenCalledWith('library-a', undefined, 20, {
       q: '猫咪狗', dateFrom: '2026-05-01', dateTo: '2026-06-01', kind: 'video', sourceKind: 'upload', availability: 'cached'
     });
+  });
+
+  it('returns an identifiable stale-cursor status so clients can restart pagination', async () => {
+    const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {
+      listLibraries: () => [], listAssets: () => { throw new StaleGalleryCursorError(); },
+      getOriginal: async () => undefined, openOriginal: () => undefined, listTombstones: () => [],
+      restoreTombstone: async () => 'not_found'
+    };
+    const response = await request('/v1/assets?libraryId=library-a&cursor=legacy', {
+      gallery, authorizeLibraryRead: () => 'admin'
+    }, { headers: { authorization: 'Bearer admin' } });
+    expect(response.status).toBe(410);
+    expect(await response.json()).toMatchObject({ error: 'stale_cursor' });
   });
 
   it('rejects short q, duplicate or unknown gallery query parameters before searching', async () => {

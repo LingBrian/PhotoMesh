@@ -363,6 +363,7 @@ paths:
               schema: {type: string, const: 'private, no-store'}
         '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '400': {description: 'Invalid, duplicate, or unknown query parameter; short q; invalid UTC date/enum; or cursor/filter mismatch.', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: 'Legacy null-date cursor is stale after floating-date timeline ordering; restart pagination from the first page.', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default:
           description: Unexpected HTTP error using the common error envelope.
           headers:
@@ -1834,7 +1835,11 @@ components:
         originNodeId: {type: string}
         kind: {type: string, enum: [photo, video, live_photo]}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
-        capturedAt: {type: [string, 'null'], format: date-time}
+        capturedAt: {type: [string, 'null'], format: date-time, description: Absolute capture instant normalized to UTC; null when the source has no verified timezone.}
+        captureLocalTime: {type: [string, 'null'], pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}$', description: Source wall time without a timezone; do not interpret it as UTC.}
+        captureOffsetMinutes: {type: [integer, 'null'], minimum: -840, maximum: 840, description: EXIF original-time offset from UTC in minutes, if verified.}
+        captureSource: {type: string, enum: [exif_offset, exif_floating, legacy_unknown, unknown]}
+        captureConfidence: {type: string, enum: [high, medium, unknown]}
         availability: {type: string, enum: [online, cached, offline, missing]}
         filename: {type: string}
         sourcePath: {type: [string, 'null']}

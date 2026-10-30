@@ -160,9 +160,10 @@ const uploadService = new UploadService({
   fileSystem: managedFileSystem,
   nodeId,
   ...(syncService ? {
-    createEventDraft: (session: import('./db/repository.js').UploadSessionRecord, assetId: string) => syncService!.createAssetIndexedDraft({
+    createEventDraft: (session: import('./db/repository.js').UploadSessionRecord, assetId: string,
+      captureDate: import('./metadata/capture-date.js').CaptureDateMetadata) => syncService!.createAssetIndexedDraft({
       libraryId: session.libraryId, assetId, originNodeId: nodeId,
-      kind: session.kind, sha256: session.expectedSha256, byteLength: session.totalBytes
+      kind: session.kind, sha256: session.expectedSha256, byteLength: session.totalBytes, captureDate
     }),
     signPendingEvents: () => syncService!.signPendingLocalEvents()
   } : {})
@@ -386,7 +387,7 @@ if (rootsJson) {
     ...(syncService ? {
       createEventDraft: (record) => syncService!.createAssetIndexedDraft({
         libraryId: record.libraryId, assetId: record.assetId, originNodeId: nodeId,
-        kind: record.kind, sha256: record.sha256, byteLength: record.byteSize
+        kind: record.kind, sha256: record.sha256, byteLength: record.byteSize, captureDate: record.captureDate
       }),
       signPendingEvents: () => syncService!.signPendingLocalEvents()
     } : {})

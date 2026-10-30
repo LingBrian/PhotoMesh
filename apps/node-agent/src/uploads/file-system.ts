@@ -8,14 +8,15 @@ export type StorageFailureCode = 'ENOSPC' | 'EIO' | 'ENOENT' | 'EEXIST' | 'EPERM
 export interface FileDigest {
   byteLength: number;
   sha256: string;
+  prefix?: Uint8Array;
 }
 
 export interface UploadFileSystem {
   writeExclusive(path: string, bytes: Uint8Array): Promise<void>;
   flush(path: string): Promise<void>;
   publishNoReplace(temporaryPath: string, finalPath: string): Promise<'created' | 'exists'>;
-  assembleAndHash(sourcePaths: readonly string[], destinationPath: string): Promise<FileDigest>;
-  hashFile(path: string): Promise<FileDigest>;
+  assembleAndHash(sourcePaths: readonly string[], destinationPath: string, maxPrefixBytes?: number): Promise<FileDigest>;
+  hashFile(path: string, maxPrefixBytes?: number): Promise<FileDigest>;
   exists(path: string): Promise<boolean>;
   remove(path: string): Promise<void>;
   removeTree(path: string): Promise<void>;
@@ -77,7 +78,10 @@ export class NodeUploadFileSystem implements UploadFileSystem {
     return 'created';
   }
 
-  async assembleAndHash(sourcePaths: readonly string[], destinationPath: string): Promise<FileDigest> {
+  async assembleAndHash(sourcePaths: readonly string[], destinationPath: string, maxPrefixBytes = 0): Promise<FileDigest> {
+    const prefixLimit = validatePrefixLimit(maxPrefixBytes);
+    const prefix = prefixLimit > 0 ? new Uint8Array(prefixLimit) : undefined;
+    let prefixLength = 0;
     const destination = this.resolveManagedPath(destinationPath);
     await this.ensureSafeParents(destinationPath, true);
     const output = await open(destination, 'wx', 0o600);
@@ -91,6 +95,11 @@ export class NodeUploadFileSystem implements UploadFileSystem {
           const chunk = value as Buffer;
           hash.update(chunk);
           byteLength += chunk.byteLength;
+          if (prefix && prefixLength < prefix.byteLength) {
+            const count = Math.min(chunk.byteLength, prefix.byteLength - prefixLength);
+            prefix.set(chunk.subarray(0, count), prefixLength);
+            prefixLength += count;
+          }
           let written = 0;
           while (written < chunk.byteLength) {
             const result = await output.write(chunk, written, chunk.byteLength - written, position + written);
@@ -106,10 +115,16 @@ export class NodeUploadFileSystem implements UploadFileSystem {
       throw error;
     }
     await output.close();
-    return { byteLength, sha256: hash.digest('hex') };
+    return {
+      byteLength, sha256: hash.digest('hex'),
+      ...(prefix ? { prefix: prefix.slice(0, prefixLength) } : {})
+    };
   }
 
-  async hashFile(path: string): Promise<FileDigest> {
+  async hashFile(path: string, maxPrefixBytes = 0): Promise<FileDigest> {
+    const prefixLimit = validatePrefixLimit(maxPrefixBytes);
+    const prefix = prefixLimit > 0 ? new Uint8Array(prefixLimit) : undefined;
+    let prefixLength = 0;
     const hash = createHash('sha256');
     let byteLength = 0;
     const stream = await this.openReadStream(path);
@@ -117,8 +132,16 @@ export class NodeUploadFileSystem implements UploadFileSystem {
       const chunk = value as Buffer;
       byteLength += chunk.byteLength;
       hash.update(chunk);
+      if (prefix && prefixLength < prefix.byteLength) {
+        const count = Math.min(chunk.byteLength, prefix.byteLength - prefixLength);
+        prefix.set(chunk.subarray(0, count), prefixLength);
+        prefixLength += count;
+      }
     }
-    return { byteLength, sha256: hash.digest('hex') };
+    return {
+      byteLength, sha256: hash.digest('hex'),
+      ...(prefix ? { prefix: prefix.slice(0, prefixLength) } : {})
+    };
   }
 
   async exists(path: string): Promise<boolean> {
@@ -198,6 +221,13 @@ export class NodeUploadFileSystem implements UploadFileSystem {
     if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) throw new Error('managed storage reference escapes storage root');
     return join(this.root, fromRoot);
   }
+}
+
+function validatePrefixLimit(maxPrefixBytes: number): number {
+  if (!Number.isSafeInteger(maxPrefixBytes) || maxPrefixBytes < 0 || maxPrefixBytes > 1024 * 1024) {
+    throw new Error('invalid bounded prefix size');
+  }
+  return maxPrefixBytes;
 }
 
 function assertUnderRoot(root: string, candidate: string): void {

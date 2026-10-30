@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ExternalLocationRecord, IndexedExternalLocation } from '../src/db/repository.js';
 import { ExternalScanService, type AuthorizedExternalRoot, type ExternalFileSystem, type ExternalStat, type ExternalWatcher } from '../src/media/external-scan.js';
 import { makeUnsignedEvent } from '../src/sync/event-envelope.js';
+import { jpegWithExifCaptureDate } from './support/capture-date-fixture.js';
 
 type NodeValue = { kind: ExternalStat['kind']; bytes?: Uint8Array; target?: string; denied?: boolean; modifiedAt?: number };
 
@@ -11,6 +12,7 @@ class VirtualExternalFileSystem implements ExternalFileSystem {
   readonly invalidNames = new Map<string, string[]>();
   addDirectory(path: string): void { this.nodes.set(this.key(path), { kind: 'directory' }); }
   addFile(path: string, bytes: string): void { this.nodes.set(this.key(path), { kind: 'file', bytes: new TextEncoder().encode(bytes) }); }
+  addFileBytes(path: string, bytes: Uint8Array): void { this.nodes.set(this.key(path), { kind: 'file', bytes: Uint8Array.from(bytes) }); }
   addSymlink(path: string, target: string): void { this.nodes.set(this.key(path), { kind: 'symlink', target }); }
   setDenied(path: string, denied: boolean): void { const value = this.nodes.get(this.key(path)); if (value) value.denied = denied; }
   setModified(path: string, modifiedAt: number): void { const value = this.nodes.get(this.key(path)); if (value) value.modifiedAt = modifiedAt; }
@@ -119,6 +121,23 @@ describe('external read-only directory scanning', () => {
     expect(drafts).toBe(2);
     expect(signed).toBe(1);
     expect(fs.nodes.get('/photos/a.jpg')?.bytes).toEqual(new TextEncoder().encode('original-a'));
+  });
+
+  it('extracts bounded EXIF capture provenance during a read-only external scan', async () => {
+    const fs = new VirtualExternalFileSystem();
+    const original = jpegWithExifCaptureDate();
+    fs.addDirectory('/photos');
+    fs.addFileBytes('/photos/camera.jpg', original);
+    const { service, repository } = setup(root(), fs);
+
+    await service.scanAll();
+
+    const record = [...repository.rows.values()][0]?.record;
+    expect(record?.captureDate).toEqual({
+      capturedAt: '2024-04-02T09:04:05.000Z', localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180,
+      source: 'exif_offset', confidence: 'high'
+    });
+    expect(fs.nodes.get('/photos/camera.jpg')?.bytes).toEqual(original);
   });
 
   it('rejects traversal and symlink escapes and detects symlink cycles', async () => {

@@ -371,7 +371,8 @@ describe('SQLite repository and migrations', () => {
     await repository.migrate();
     const base = {
       nodeId: 'node-1', libraryId: 'library-1', kind: 'photo' as const, filename: 'same.jpg',
-      byteSize: 3, sha256: 'a'.repeat(64), now: '2026-10-21T00:00:00.000Z'
+      byteSize: 3, sha256: 'a'.repeat(64), now: '2026-10-21T00:00:00.000Z',
+      captureDate: { capturedAt: null, localTime: null, offsetMinutes: null, source: 'unknown' as const, confidence: 'unknown' as const }
     };
     repository.recordExternalFile({ ...base, locationId: 'location-a', fileId: 'file-a', assetId: 'asset-a', originalPath: '/photos/a.jpg', storageRef: 'external:a' });
     repository.recordExternalFile({ ...base, locationId: 'location-b', fileId: 'file-b', assetId: 'asset-b', originalPath: '/photos/b.jpg', storageRef: 'external:b' });
@@ -388,11 +389,42 @@ describe('SQLite repository and migrations', () => {
     db.close();
   });
 
+  it('enriches legacy external assets on a later scan without replacing verified capture provenance', async () => {
+    const db = new Database(':memory:');
+    const repository = new SqliteRepository(db);
+    await repository.migrate();
+    const unknown = { capturedAt: null, localTime: null, offsetMinutes: null, source: 'unknown' as const, confidence: 'unknown' as const };
+    const verified = {
+      capturedAt: '2024-04-02T09:04:05.000Z', localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180,
+      source: 'exif_offset' as const, confidence: 'high' as const
+    };
+    const record = {
+      locationId: 'location-a', fileId: 'file-a', assetId: 'asset-a', nodeId: 'node-a', libraryId: 'library-a',
+      kind: 'photo' as const, filename: 'camera.jpg', originalPath: '/photos/camera.jpg', byteSize: 3,
+      sha256: 'a'.repeat(64), storageRef: 'external:camera', now: '2026-10-21T00:00:00.000Z', captureDate: unknown
+    };
+    repository.recordExternalFile(record);
+    repository.recordExternalFile({ ...record, captureDate: verified });
+    expect(db.prepare('SELECT capture_ts,capture_local_time,capture_offset_minutes,capture_source,capture_confidence FROM assets WHERE asset_id=?')
+      .get('asset-a')).toEqual({
+        capture_ts: verified.capturedAt, capture_local_time: verified.localTime, capture_offset_minutes: 180,
+        capture_source: 'exif_offset', capture_confidence: 'high'
+      });
+
+    repository.recordExternalFile({ ...record, captureDate: { ...verified, capturedAt: '2020-01-01T00:00:00.000Z', localTime: '2020-01-01T00:00:00.000', offsetMinutes: 0 } });
+    expect((db.prepare('SELECT capture_ts,capture_source FROM assets WHERE asset_id=?').get('asset-a') as { capture_ts: string; capture_source: string }))
+      .toEqual({ capture_ts: verified.capturedAt, capture_source: 'exif_offset' });
+    db.close();
+  });
+
   it('creates a new immutable file record when an external path changes content', async () => {
     const db = new Database(':memory:');
     const repository = new SqliteRepository(db);
     await repository.migrate();
-    const common = { nodeId: 'n', libraryId: 'l', kind: 'photo' as const, filename: 'a.jpg', originalPath: '/photos/a.jpg', now: 'now', byteSize: 1 };
+    const common = {
+      nodeId: 'n', libraryId: 'l', kind: 'photo' as const, filename: 'a.jpg', originalPath: '/photos/a.jpg', now: 'now', byteSize: 1,
+      captureDate: { capturedAt: null, localTime: null, offsetMinutes: null, source: 'unknown' as const, confidence: 'unknown' as const }
+    };
     repository.recordExternalFile({ ...common, locationId: 'l1', fileId: 'f1', assetId: 'a1', sha256: 'a'.repeat(64), storageRef: 'ext:1' });
     repository.recordExternalFile({ ...common, locationId: 'l2', fileId: 'f2', assetId: 'a2', sha256: 'b'.repeat(64), storageRef: 'ext:2' });
     expect(repository.listExternalLocations('n')).toEqual(expect.arrayContaining([
