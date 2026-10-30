@@ -213,7 +213,7 @@
 
 ## ADR-026：PM-053 时间线时区、日期来源置信度与稳定排序（待批准）
 
-- **状态：** [ADR-026 提案](adr/ADR-026-pm053-timeline-date-provenance.md)；本地/远端日期来源的置信度、无时区 EXIF 处理、时区偏好与 cursor 兼容待用户确认。批准前不改 DB schema、P2P 元数据契约或 API 行为。
+- **状态：** 用户于 2026-10-30 批准 [ADR-026](adr/ADR-026-pm053-timeline-date-provenance.md) 推荐方案；隔离 worktree 实现中。用户选择系统时区、不做时区覆盖、不做一次性历史扫描；仅本地 migration/schema 与兼容 P2P 元数据实现，不授权生产迁移。
 - **现状：** 上传/外部只读扫描不写拍摄时间；Gallery 不保存来源/置信度；UI 跟随运行时默认时区，API 日期区间固定 UTC；分页已按时间+asset ID 排序但未专项覆盖大量相同时间戳。
 - **推荐范围：** EXIF 有明确 offset 时保存 UTC instant/high；无 offset 时保留 floating local time/medium 并在独立分段显示，不猜当前节点时区；不将文件 mtime 或 ingest 时间冒充拍摄时间；旧行来源标记 `legacy_unknown`。可选 P2P 字段必须保持旧 event 兼容。
 - **数据/恢复风险：** 可能追加 `0014`；必须备份前置、追加式迁移、旧 checksum 不变与失败原子性验证；不由迁移遍历媒体或改写原图。生产迁移未授权。

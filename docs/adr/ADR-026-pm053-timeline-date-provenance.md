@@ -1,6 +1,6 @@
 # ADR-026：PM-053 时间线时区、日期来源置信度与稳定排序
 
-- **状态：** 提案，等待用户批准后再修改数据库 schema、P2P 元数据契约或 API 行为。
+- **状态：** 用户于 2026-10-30 批准推荐日期语义、系统时区默认和不做一次性扫描；隔离分支实现中。批准限本地实现/测试，不授权生产迁移、push、merge、release 或部署。
 - **日期：** 2026-10-30
 - **路线图：** PM-053（时间线时区、日期来源置信度与稳定排序）。
 - **依赖：** PM-048 授权 Gallery 搜索 API；PM-049 日期筛选与 keyset cursor；现有 `asset.indexed` / `asset.metadata.updated` P2P 事件。
@@ -9,7 +9,7 @@
 
 本地 `assets.capture_ts` 和 Gallery 响应 `capturedAt` 可表达 UTC 时间，但目前 upload 与外部只读扫描均写入 `NULL`，没有日期来源/置信度字段；同步投影只在 metadata 中可选读取 `capturedAt`。Web 使用浏览器默认时区格式化日期，未显式命名或可选用户时区；`dateFrom`/`dateTo` 在 API 合约中定义为 UTC 日历边界。Gallery 当前按 `captured_at DESC, asset_id COLLATE BINARY DESC` 排序并以时间 + ID 做 keyset cursor，已有稳定排序基础，但尚无相同时间戳跨页专项验收。
 
-## 提案（尚未批准）
+## 决策（用户已批准）
 
 ### 目标与非目标
 
@@ -44,7 +44,7 @@
 - 文件 `mtime` 可被复制/编辑改变，故推荐不作拍摄时间回退；部分 RAW/视频容器可能不支持 metadata reader，需要明确 `unknown` 回退，不能静默失败或改写原图。
 - SQLite 日期字符串、EXIF offset/DST 边界、旧同步 payload 与 cursor 语义都需要跨时区和分页测试。实现前确定 metadata reader 依赖与资源上限，禁止无界整文件载入。
 
-## 验收计划（待批准后执行）
+## 验收计划
 
 - 测试带 offset / 无 offset / 非法 EXIF 时间、旧/unknown 日期与置信度映射；验证日期提取只读、不修改文件，并对大文件资源使用有界；无 offset/缺失 EXIF 不得由 mtime 或 ingest 时间伪造拍摄时间。
 - 在至少 UTC、Asia/Shanghai、America/Los_Angeles 的时区环境验证显示、跨午夜分组和 DST 边界；floating 值不被错误转换。
@@ -52,4 +52,4 @@
 - 验证旧 event 缺日期可应用、新 event 字段可被旧/新版本兼容处理；更新 OpenAPI 测试及 UI 双语/可访问性测试。
 - PM-053 完成时运行根级 `pnpm install --frozen-lockfile`、`pnpm lint`、`pnpm typecheck`、`pnpm test`、`pnpm contracts:check`、`pnpm build`；仅临时测试数据库执行迁移。
 
-**审批请求：** 请确认是否批准以上推荐语义，尤其是“EXIF 有 offset 时才作为绝对 UTC；无 offset 保留 floating 值并独立排序；不使用 mtime/ingest 时间回退；系统时区用于显示且 UTC API 日期筛选不变；追加迁移 0014 与可选 P2P 字段”。同时请确认首期是否含新旧资产的 EXIF 读取/补充，以及是否需要本地时区覆盖设置。批准仅覆盖隔离 worktree 的本地实现与测试，不授权生产迁移、push、merge、release 或部署。
+**批准记录（2026-10-30）：** 用户批准以上语义：EXIF 有 offset 时才作为绝对 UTC；无 offset 保留 floating 值并独立排序；不使用 mtime/ingest 时间回退；系统时区用于显示且 UTC API 日期筛选不变；追加迁移 0014 与可选 P2P 字段。用户选择系统时区、不增加本地覆盖设置、不做一次性旧资产扫描；旧资产只在后续正常只读扫描/重新上传时补充。此批准仅覆盖隔离 worktree 的本地实现与测试，不授权生产迁移、push、merge、release 或部署。
