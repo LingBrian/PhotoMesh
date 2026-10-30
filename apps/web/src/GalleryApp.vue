@@ -939,7 +939,19 @@ function navigatePreview(direction: -1 | 1): void {
   if (target) void openPreview(target);
 }
 function onPreviewKeydown(event: KeyboardEvent): void {
-  if (!previewAsset.value || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if (!previewAsset.value || event.altKey || event.ctrlKey || event.metaKey) return;
+  if (event.key === 'Escape') { event.preventDefault(); closePreview(true); return; }
+  if (event.key === 'Tab') {
+    const dialog = document.querySelector<HTMLElement>('.preview-dialog');
+    const focusable = dialog ? [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')].filter((element) => element.offsetParent !== null) : [];
+    if (focusable.length === 0) return;
+    const current = focusable.indexOf(document.activeElement as HTMLElement);
+    const next = event.shiftKey ? (current <= 0 ? focusable.length - 1 : current - 1) : (current + 1) % focusable.length;
+    event.preventDefault();
+    focusable[next]?.focus();
+    return;
+  }
+  if (event.shiftKey) return;
   const target = event.target;
   if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [role="textbox"]'))) return;
   if (event.key === 'ArrowLeft') { event.preventDefault(); navigatePreview(-1); }
