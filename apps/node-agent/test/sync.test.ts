@@ -293,6 +293,19 @@ describe('P2P signed event synchronization', () => {
     expect(node.syncRepository.getProjection('family', 'asset-1')?.tombstoned).toBe(false);
   });
 
+  it('does not restore an older active tombstone generation after a newer delete', async () => {
+    const node = await createNode();
+    await indexAsset(node);
+    const first = await node.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.tombstoned', payload: { assetId: 'asset-1', reason: 'first delete' } });
+    const second = await node.sync.createLocalEvent({ libraryId: 'family', eventType: 'asset.tombstoned', payload: { assetId: 'asset-1', reason: 'second delete' } });
+    const active = node.syncRepository.getActiveTombstoneEventId('family', 'asset-1');
+    const stale = active === first.eventId ? second.eventId : first.eventId;
+    const result = await restoreTombstoneOperation('family', stale, node.sync, (libraryId) => node.pairingRepository.listActiveTombstones(libraryId));
+    expect(result).toBe('conflict');
+    expect(node.syncRepository.getTombstoneRestoreEventId('family', stale)).toBeNull();
+    expect(node.syncRepository.getProjection('family', 'asset-1')?.tombstoned).toBe(true);
+  });
+
   it('keeps tombstones as metadata, wins concurrent updates, and requires an explicit causally linked restore', async () => {
     const a = await createNode();
     const b = await createNode();

@@ -51,6 +51,12 @@ export class SyncRepository {
     return row?.restored_by_event_id ?? null;
   }
 
+  getActiveTombstoneEventId(libraryId: string, assetId: string): string | null {
+    const row = this.db.prepare(`SELECT tombstone_event_id FROM sync_asset_projection
+      WHERE library_id = ? AND asset_id = ?`).get(libraryId, assetId) as { tombstone_event_id: string | null } | undefined;
+    return row?.tombstone_event_id ?? null;
+  }
+
   /** Caller includes this write in the same SQLite transaction as its source mutation. */
   reserveLocalEventDraft(libraryId: string, authorPeerId: string, factory: EventDraftFactory): UnsignedEventEnvelope {
     const event = factory(this.readLocalEventContext(libraryId, authorPeerId));
