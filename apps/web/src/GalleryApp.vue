@@ -24,6 +24,8 @@ type Asset = {
   sourcePath: string | null; sourceKind: string; byteSize: number; version: string; tags?: string[]; favorite?: boolean;
 };
 type Page = { items: Asset[]; nextCursor: string | null };
+type DuplicateCandidateAsset = { assetId: string; originNodeId: string; kind: string; sha256: string; byteSize: number; filename: string; sourcePath: string | null; sourceKind: string; availability: string };
+type DuplicateCandidateGroup = { sha256: string; byteSize: number; assets: DuplicateCandidateAsset[]; truncated: boolean };
 type Tombstone = { assetId: string; libraryId: string; eventId: string };
 type PendingPeerApproval = { peerId: string; publicKey: string; proposedLabel: string; requestedAt: string };
 type Album = { id: string; name: string; tag: string };
@@ -60,8 +62,13 @@ const cursor = ref<string | null>(null);
 const search = ref('');
 const searchInput = ref<HTMLInputElement>();
 const gallerySearchEnabled = ref(false);
+const duplicateCandidatesEnabled = ref(false);
+const duplicateGroups = ref<DuplicateCandidateGroup[]>([]);
+const duplicateBusy = ref(false);
+const duplicateError = ref('');
+const ignoredDuplicateHashes = ref<Set<string>>(new Set());
 const searchStatus = ref<'idle' | 'debouncing' | 'loading' | 'results' | 'empty' | 'invalid' | 'unsupported' | 'error'>('idle');
-const section = ref<'timeline' | 'recycle' | 'settings'>('timeline');
+const section = ref<'timeline' | 'duplicates' | 'recycle' | 'settings'>('timeline');
 const tombstones = ref<Tombstone[]>([]);
 const tombstonesBusy = ref(false);
 const tombstoneError = ref('');
@@ -384,7 +391,8 @@ async function connect(preserveSession = false): Promise<void> {
     if (generation !== connectionGeneration) return;
     const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
     gallerySearchEnabled.value = capabilities.includes('gallerySearch');
-    mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
+    duplicateCandidatesEnabled.value = capabilities.includes('duplicateCandidates');
+       mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
     thumbnailsEnabled.value = capabilities.includes('thumbnails');
     assetTagsEnabled.value = capabilities.includes('assetTags');
     assetFavoritesEnabled.value = capabilities.includes('assetFavorites');
@@ -439,7 +447,8 @@ async function checkHealth(): Promise<void> {
       if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
       const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
       gallerySearchEnabled.value = capabilities.includes('gallerySearch');
-      mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
+      duplicateCandidatesEnabled.value = capabilities.includes('duplicateCandidates');
+       mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
       thumbnailsEnabled.value = capabilities.includes('thumbnails');
       assetTagsEnabled.value = capabilities.includes('assetTags');
       assetFavoritesEnabled.value = capabilities.includes('assetFavorites');
@@ -449,6 +458,7 @@ async function checkHealth(): Promise<void> {
       await loadPage(true, true);
       await loadPeerList();
       if (section.value === 'recycle') await loadRecycleBin();
+       if (section.value === 'duplicates') await loadDuplicateCandidates();
     }
   } catch (cause) {
     if (generation === healthGeneration && !isRequestAborted(cause)) {
@@ -1050,6 +1060,20 @@ async function clearLocalCache(): Promise<void> {
     if (connected.value && thumbnailsEnabled.value) await loadVisibleThumbnails();
   } catch { cacheAvailable.value = false; error.value = t('gallery.cacheClearFailed'); }
 }
+async function loadDuplicateCandidates(): Promise<void> {
+  if (!libraryId.value || !hasSession.value || !connected.value || !duplicateCandidatesEnabled.value) return;
+  const revision = sessionRevision;
+  const requestedLibraryId = libraryId.value;
+  duplicateBusy.value = true; duplicateError.value = '';
+  try {
+    const result = await request<{ groups: DuplicateCandidateGroup[] }>(`/v1/assets/duplicate-candidates?libraryId=${encodeURIComponent(requestedLibraryId)}`);
+    if (revision === sessionRevision && hasSession.value && libraryId.value === requestedLibraryId) duplicateGroups.value = result.groups;
+  } catch (cause) { if (revision === sessionRevision) duplicateError.value = errorText(cause); }
+  finally { if (revision === sessionRevision) duplicateBusy.value = false; }
+}
+function ignoreDuplicateGroup(hash: string): void {
+  ignoredDuplicateHashes.value = new Set([...ignoredDuplicateHashes.value, hash]);
+}
 async function loadRecycleBin(): Promise<void> {
   if (!libraryId.value || !hasSession.value || !connected.value) return;
   const revision = sessionRevision;
@@ -1461,6 +1485,7 @@ function changeSection(value: typeof section.value): void {
   if (value !== 'timeline') { selectedAssetIds.value = new Set(); selectionError.value = ''; }
   section.value = value;
   if (value === 'recycle') void loadRecycleBin();
+   if (value === 'duplicates') void loadDuplicateCandidates();
 }
 onMounted(() => {
   void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value;
@@ -1641,6 +1666,14 @@ async function idbClear(store: string): Promise<void> {
           @click="activeAlbum = activeAlbum === album.id ? '' : album.id; changeSection('timeline')"
         >
           <span>◷</span>{{ album.name }}
+        </button>
+        <button
+          v-if="duplicateCandidatesEnabled"
+          class="nav-item"
+          :class="{ active: section === 'duplicates' }"
+          @click="changeSection('duplicates')"
+        >
+          <span>⧉</span>{{ t('gallery.duplicateCandidates') }}
         </button>
         <button
           class="nav-item"
@@ -2072,6 +2105,66 @@ async function idbClear(store: string): Promise<void> {
             </div>
           </div>
         </template>
+        <section
+          v-else-if="section === 'duplicates'"
+          class="page-section"
+        >
+          <div class="page-heading">
+            <div><p class="eyebrow">{{ t('gallery.libraryLabel') }}</p><h1>{{ t('gallery.duplicateCandidates') }}</h1><p class="muted">{{ t('gallery.duplicateCandidatesDescription') }}</p></div><button
+              type="button"
+              class="secondary-button"
+              :disabled="duplicateBusy"
+              @click="loadDuplicateCandidates"
+            >
+              {{ t('gallery.refreshNodeStatus') }}
+            </button>
+          </div>
+          <div
+            v-if="duplicateError"
+            class="notice error-notice"
+            role="alert"
+          >
+            {{ duplicateError }}
+          </div>
+          <div
+            v-if="duplicateBusy"
+            class="notice"
+            role="status"
+          >
+            {{ t('gallery.loading') }}
+          </div>
+          <div
+            v-else-if="!duplicateGroups.filter((group) => !ignoredDuplicateHashes.has(group.sha256)).length"
+            class="empty-state"
+          >
+            <h2>{{ t('gallery.noDuplicateCandidates') }}</h2><p>{{ t('gallery.noDuplicateCandidatesDescription') }}</p>
+          </div>
+          <article
+            v-for="group in duplicateGroups.filter((item) => !ignoredDuplicateHashes.has(item.sha256))"
+            :key="group.sha256"
+            class="duplicate-card"
+          >
+            <div class="duplicate-card-heading">
+              <div><h2>{{ t('gallery.candidateGroup') }} · {{ formatSize(group.byteSize) }}</h2><code>{{ group.sha256 }}</code></div><button
+                type="button"
+                class="secondary-button"
+                @click="ignoreDuplicateGroup(group.sha256)"
+              >
+                {{ t('gallery.ignoreCandidate') }}
+              </button>
+            </div>
+            <p class="muted">{{ t('gallery.candidateWarning') }}<span v-if="group.truncated"> {{ t('gallery.candidateTruncated') }}</span></p>
+            <div class="duplicate-assets">
+              <div
+                v-for="asset in group.assets"
+                :key="asset.assetId"
+                class="duplicate-asset"
+              >
+                <strong>{{ asset.filename }}</strong><span>{{ asset.sourcePath ?? t('gallery.pathUnavailable') }}</span><span>{{ asset.originNodeId }} · {{ asset.availability }} · {{ formatSize(asset.byteSize) }}</span>
+              </div>
+            </div>
+          </article>
+        </section>
         <section
           v-else-if="section === 'recycle'"
           class="page-section"
