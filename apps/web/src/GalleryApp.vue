@@ -12,6 +12,7 @@ import {
   formatCaptureTime as displayCaptureTime
 } from './capture-date-display.js';
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
+import { defaultGalleryCacheSettings, normalizeGalleryCacheSettings, persistentCacheEvictions, type GalleryCacheSettings, type PersistentCacheEntry } from './gallery-cache.js';
 import './gallery.css';
 
 type Library = { libraryId: string; title: string };
@@ -40,6 +41,27 @@ class NodeApiError extends Error {
 }
 function readPreference(key: string): string | null { try { return localStorage.getItem(key); } catch { return null; } }
 function writePreference(key: string, value: string): void { try { localStorage.setItem(key, value); } catch { /* Preferences are optional and never block the gallery. */ } }
+function loadCacheSettings(): GalleryCacheSettings {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('photomesh-gallery-cache-settings') ?? 'null') as Partial<GalleryCacheSettings> | null;
+    return normalizeGalleryCacheSettings(parsed);
+  } catch { return defaultGalleryCacheSettings; }
+}
+const persistentThumbnailIndexKey = 'photomesh-gallery-thumbnail-index';
+function loadPersistentThumbnailIndex(): PersistentCacheEntry[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(persistentThumbnailIndexKey) ?? '[]') as unknown;
+    return Array.isArray(value) ? value.filter((entry): entry is PersistentCacheEntry => Boolean(entry) && typeof entry === 'object' && typeof (entry as PersistentCacheEntry).key === 'string' && Number.isFinite((entry as PersistentCacheEntry).byteSize) && Number.isFinite((entry as PersistentCacheEntry).lastUsed)) : [];
+  } catch { return []; }
+}
+async function rememberPersistentThumbnail(key: string, byteSize: number): Promise<void> {
+  const entries = loadPersistentThumbnailIndex().filter((entry) => entry.key !== key);
+  entries.push({ key, byteSize, lastUsed: Date.now() });
+  const evictions = persistentCacheEvictions(entries, cacheSettings.value);
+  for (const evicted of evictions) await idbDelete('thumbnails', evicted);
+  const removed = new Set(evictions);
+  writePreference(persistentThumbnailIndexKey, JSON.stringify(entries.filter((entry) => !removed.has(entry.key))));
+}
 const { t, locale } = useI18n();
 const savedLocale = readPreference('photomesh-ui-locale');
 if (savedLocale === 'zh-CN' || savedLocale === 'en') locale.value = savedLocale;
@@ -52,6 +74,7 @@ const connected = ref(false);
 const hasSession = ref(false);
 const lastHealthCheck = ref<Date | null>(null);
 const cacheAvailable = ref(true);
+const cacheSettings = ref<GalleryCacheSettings>(loadCacheSettings());
 const isCachedPreview = ref(false);
 const isDesktopRuntime = '__TAURI_INTERNALS__' in window;
 const busy = ref(false);
@@ -138,8 +161,6 @@ const versionPreviewUrl = ref('');
 const activeVersionId = ref('');
 const tagInput = ref('');
 const thumbnailUrls = ref<Record<string, string>>({});
-const maxThumbnailMemoryBytes = 8 * 1024 * 1024;
-const maxThumbnailMemoryEntries = 128;
 const thumbnailUrlCache = new Map<string, { url: string; byteSize: number }>();
 const thumbnailRequests = new Map<string, AbortController>();
 let thumbnailMemoryBytes = 0;
@@ -718,7 +739,7 @@ function removeThumbnailUrl(assetId: string): void {
 }
 
 function setThumbnailUrl(assetId: string, blob: Blob): void {
-  if (blob.size < 1 || blob.size > maxThumbnailMemoryBytes) return;
+  if (blob.size < 1 || blob.size > cacheSettings.value.maxBytes) return;
   const previous = thumbnailUrlCache.get(assetId);
   if (previous) {
     revokeObjectUrls([previous.url], (url) => URL.revokeObjectURL(url));
@@ -729,7 +750,7 @@ function setThumbnailUrl(assetId: string, blob: Blob): void {
   thumbnailUrlCache.set(assetId, { url, byteSize: blob.size });
   thumbnailMemoryBytes += blob.size;
   thumbnailUrls.value = { ...thumbnailUrls.value, [assetId]: url };
-  while (thumbnailUrlCache.size > maxThumbnailMemoryEntries || thumbnailMemoryBytes > maxThumbnailMemoryBytes) {
+  while (thumbnailUrlCache.size > cacheSettings.value.maxEntries || thumbnailMemoryBytes > cacheSettings.value.maxBytes) {
     const oldest = thumbnailUrlCache.entries().next().value as [string, { url: string; byteSize: number }] | undefined;
     if (!oldest) break;
     thumbnailUrlCache.delete(oldest[0]);
@@ -755,7 +776,7 @@ async function ensureThumbnail(assetId: string): Promise<void> {
     let cached: Blob | undefined;
     try { cached = await idbGet<Blob>('thumbnails', key); } catch { /* A cache miss does not trigger original bytes. */ }
     if (!lease.isCurrent()) return;
-    if (cached && cached.size > 0 && cached.size <= maxThumbnailMemoryBytes &&
+    if (cached && cached.size > 0 && cached.size <= cacheSettings.value.maxBytes &&
         generation === cacheGeneration && assets.value.some((item) => thumbnailCacheKey(item) === key)) {
       setThumbnailUrl(assetId, cached);
       return;
@@ -879,6 +900,7 @@ async function openPreview(asset: Asset): Promise<void> {
     if (generation !== previewGeneration) return;
     try {
       await idbPut('thumbnails', { key: thumbnailCacheKey(asset), value: thumbnail });
+      await rememberPersistentThumbnail(thumbnailCacheKey(asset), thumbnail.size);
       cacheAvailable.value = true;
     } catch { cacheAvailable.value = false; }
     if (generation !== previewGeneration) return;
@@ -1058,11 +1080,17 @@ async function downloadOriginal(asset: Asset): Promise<void> {
     lease.release();
   }
 }
+function updateCacheSettings(): void {
+  cacheSettings.value = normalizeGalleryCacheSettings(cacheSettings.value);
+  writePreference('photomesh-gallery-cache-settings', JSON.stringify(cacheSettings.value));
+  clearThumbnailUrls();
+}
 async function clearLocalCache(): Promise<void> {
   if (!window.confirm(t('gallery.clearCacheConfirm'))) return;
   closePreview();
   try {
     await idbClear('thumbnails');
+    writePreference(persistentThumbnailIndexKey, '[]');
     clearThumbnailUrls(); cacheAvailable.value = true; error.value = '';
     if (connected.value && thumbnailsEnabled.value) await loadVisibleThumbnails();
   } catch { cacheAvailable.value = false; error.value = t('gallery.cacheClearFailed'); }
@@ -1548,6 +1576,16 @@ async function idbGet<T>(store: string, key: string): Promise<T | undefined> {
     const req = db.transaction(store).objectStore(store).get(key);
     req.onsuccess = () => { const value = req.result?.value as T | undefined; db.close(); resolve(value); };
     req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+async function idbDelete(store: string, key: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).delete(key);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+    tx.onabort = () => { db.close(); reject(tx.error); };
   });
 }
 async function idbPut(store: string, record: { key: string; value: unknown }): Promise<void> {
@@ -2578,7 +2616,7 @@ async function idbClear(store: string): Promise<void> {
             </template>
           </div>
           <div class="settings-card cleanup-card">
-            <div><h2>{{ t('gallery.localCacheTitle') }}</h2><p>{{ t('gallery.localCacheDescription') }}</p></div><button
+            <div><h2>{{ t('gallery.localCacheTitle') }}</h2><p>{{ t('gallery.localCacheDescription') }}</p><div class="cache-settings-grid"><label>{{ t('gallery.cacheSizeLabel') }}<input v-model.number="cacheSettings.maxBytes" type="number" min="1048576" max="67108864" step="1048576" @change="updateCacheSettings"></label><label>{{ t('gallery.cacheEntriesLabel') }}<input v-model.number="cacheSettings.maxEntries" type="number" min="16" max="512" step="1" @change="updateCacheSettings"></label></div></div><button
               class="secondary-button"
               @click="clearLocalCache"
             >

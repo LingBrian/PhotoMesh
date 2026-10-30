@@ -199,6 +199,8 @@
     "localCacheTitle": "Local thumbnail cache",
     "localCacheDescription": "Clears all regenerable thumbnails in this browser or desktop profile. It does not change the library index or source files.",
     "clearCache": "Clear local cache",
+    "cacheSizeLabel": "Thumbnail cache limit (bytes)",
+    "cacheEntriesLabel": "Thumbnail entry limit",
     "clearCacheConfirm": "Clear all regenerable thumbnails stored in this browser or desktop profile? The library index and source files will not be changed.",
     "virtualAlbum": "Local virtual album",
     "tagName": "Tag name",

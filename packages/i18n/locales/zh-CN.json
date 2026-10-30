@@ -199,6 +199,8 @@
     "localCacheTitle": "本机缩略图缓存",
     "localCacheDescription": "清理此浏览器或桌面配置中的全部可再生缩略图，不会修改图库索引或来源文件。",
     "clearCache": "清理本机缓存",
+    "cacheSizeLabel": "缩略图缓存上限（字节）",
+    "cacheEntriesLabel": "缩略图条目上限",
     "clearCacheConfirm": "清理此浏览器或桌面配置中保存的全部可再生缩略图？不会修改图库索引或来源文件。",
     "virtualAlbum": "本地虚拟相册",
     "tagName": "标签名称",
