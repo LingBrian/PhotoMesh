@@ -95,6 +95,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /v1/libraries/{libraryId}/external-scan-review:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 读取外部目录扫描人工核对报告
+      description: 只读报告；不触发扫描、不删除文件、不写入墓碑。仅返回当前主体有权查看的图库。
+      responses:
+        '200':
+          description: External scan review
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ExternalScanReviewPage'}}}
+        '400': {description: Invalid path or query, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown or unauthorized library, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: External scan capability unavailable, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries/{libraryId}/albums:
     parameters:
       - in: path
@@ -1848,6 +1868,31 @@ components:
       required: [items]
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Library'}}
+    ExternalScanReviewPage:
+      type: object
+      required: [roots]
+      properties:
+        roots: {type: array, items: {$ref: '#/components/schemas/ExternalScanReview'}}
+    ExternalScanReview:
+      type: object
+      required: [rootId, libraryId, complete, indexed, missing, offline, directories, issues, locations]
+      properties:
+        rootId: {type: string}
+        libraryId: {type: string}
+        complete: {type: boolean}
+        indexed: {type: integer, minimum: 0}
+        missing: {type: integer, minimum: 0}
+        offline: {type: integer, minimum: 0}
+        directories: {type: array, items: {type: string}}
+        issues: {type: array, items: {type: object, required: [code], properties: {code: {type: string}}}}
+        locations: {type: array, items: {$ref: '#/components/schemas/ExternalScanReviewLocation'}}
+    ExternalScanReviewLocation:
+      type: object
+      required: [locationId, originalPath, availability]
+      properties:
+        locationId: {type: string}
+        originalPath: {type: string}
+        availability: {type: string, enum: [offline, missing]}
     Asset:
       type: object
       required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version, tags, rating, ratingConflict, ratingCandidates]

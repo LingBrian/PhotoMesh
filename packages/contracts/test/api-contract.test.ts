@@ -84,6 +84,7 @@ const routes: RouteCase[] = [
   { template: '/v1/diagnostics', method: 'get', path: '/v1/diagnostics', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'no-store' } },
   { template: '/v1/diagnostics', method: 'get', path: '/v1/diagnostics', status: 200, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'no-store' } },
   { template: '/v1/libraries', method: 'get', path: '/v1/libraries', status: 403, error: 'forbidden' },
+  { template: '/v1/libraries/{libraryId}/external-scan-review', method: 'get', path: '/v1/libraries/lib/external-scan-review', status: 404, error: 'not_found' },
   { template: '/v1/assets', method: 'get', path: '/v1/assets?libraryId=lib', status: 403, error: 'forbidden' },
   { template: '/v1/assets/duplicate-candidates', method: 'get', path: '/v1/assets/duplicate-candidates?libraryId=lib', status: 403, error: 'forbidden' },
   { template: '/v1/assets/duplicate-candidates', method: 'get', path: '/v1/assets/duplicate-candidates?libraryId=lib', status: 200, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'private, no-store' } },

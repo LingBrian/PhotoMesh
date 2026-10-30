@@ -26,6 +26,7 @@ type Asset = {
 type Page = { items: Asset[]; nextCursor: string | null };
 type DuplicateCandidateAsset = { assetId: string; originNodeId: string; kind: string; sha256: string; byteSize: number; filename: string; sourcePath: string | null; sourceKind: string; availability: string };
 type DuplicateCandidateGroup = { sha256: string; byteSize: number; assets: DuplicateCandidateAsset[]; truncated: boolean };
+type ExternalScanReview = { rootId: string; libraryId: string; complete: boolean; indexed: number; missing: number; offline: number; directories: string[]; issues: Array<{ code: string }>; locations: Array<{ locationId: string; originalPath: string; availability: 'offline' | 'missing' }> };
 type Tombstone = { assetId: string; libraryId: string; eventId: string };
 type PendingPeerApproval = { peerId: string; publicKey: string; proposedLabel: string; requestedAt: string };
 type Album = { id: string; name: string; tag: string };
@@ -63,12 +64,16 @@ const search = ref('');
 const searchInput = ref<HTMLInputElement>();
 const gallerySearchEnabled = ref(false);
 const duplicateCandidatesEnabled = ref(false);
+const externalScanReviewEnabled = ref(false);
+const scanReviews = ref<ExternalScanReview[]>([]);
+const scanReviewBusy = ref(false);
+const scanReviewError = ref('');
 const duplicateGroups = ref<DuplicateCandidateGroup[]>([]);
 const duplicateBusy = ref(false);
 const duplicateError = ref('');
 const ignoredDuplicateHashes = ref<Set<string>>(new Set());
 const searchStatus = ref<'idle' | 'debouncing' | 'loading' | 'results' | 'empty' | 'invalid' | 'unsupported' | 'error'>('idle');
-const section = ref<'timeline' | 'duplicates' | 'recycle' | 'settings'>('timeline');
+const section = ref<'timeline' | 'duplicates' | 'scan-review' | 'recycle' | 'settings'>('timeline');
 const tombstones = ref<Tombstone[]>([]);
 const tombstonesBusy = ref(false);
 const tombstoneError = ref('');
@@ -448,6 +453,7 @@ async function checkHealth(): Promise<void> {
       const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
       gallerySearchEnabled.value = capabilities.includes('gallerySearch');
       duplicateCandidatesEnabled.value = capabilities.includes('duplicateCandidates');
+     externalScanReviewEnabled.value = capabilities.includes('externalScanReview');
        mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
       thumbnailsEnabled.value = capabilities.includes('thumbnails');
       assetTagsEnabled.value = capabilities.includes('assetTags');
@@ -1075,6 +1081,17 @@ async function loadDuplicateCandidates(): Promise<void> {
 function ignoreDuplicateGroup(hash: string): void {
   ignoredDuplicateHashes.value = new Set([...ignoredDuplicateHashes.value, hash]);
 }
+async function loadScanReview(): Promise<void> {
+  if (!libraryId.value || !hasSession.value || !connected.value || !externalScanReviewEnabled.value) return;
+  const revision = sessionRevision;
+  const requestedLibraryId = libraryId.value;
+  scanReviewBusy.value = true; scanReviewError.value = '';
+  try {
+    const result = await request<{ roots: ExternalScanReview[] }>(`/v1/libraries/${encodeURIComponent(requestedLibraryId)}/external-scan-review`);
+    if (revision === sessionRevision && hasSession.value && libraryId.value === requestedLibraryId) scanReviews.value = result.roots;
+  } catch (cause) { if (revision === sessionRevision) scanReviewError.value = errorText(cause); }
+  finally { if (revision === sessionRevision) scanReviewBusy.value = false; }
+}
 async function loadRecycleBin(): Promise<void> {
   if (!libraryId.value || !hasSession.value || !connected.value) return;
   const revision = sessionRevision;
@@ -1487,6 +1504,7 @@ function changeSection(value: typeof section.value): void {
   section.value = value;
   if (value === 'recycle') void loadRecycleBin();
    if (value === 'duplicates') void loadDuplicateCandidates();
+   if (value === 'scan-review') void loadScanReview();
 }
 onMounted(() => {
   void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value;
@@ -1675,6 +1693,14 @@ async function idbClear(store: string): Promise<void> {
           @click="changeSection('duplicates')"
         >
           <span>⧉</span>{{ t('gallery.duplicateCandidates') }}
+        </button>
+        <button
+          v-if="externalScanReviewEnabled"
+          class="nav-item"
+          :class="{ active: section === 'scan-review' }"
+          @click="changeSection('scan-review')"
+        >
+          <span>⌕</span>{{ t('gallery.scanReview') }}
         </button>
         <button
           class="nav-item"
@@ -2106,6 +2132,58 @@ async function idbClear(store: string): Promise<void> {
             </div>
           </div>
         </template>
+        <section
+          v-else-if="section === 'scan-review'"
+          class="page-section"
+        >
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">{{ t('gallery.libraryLabel') }}</p><h1>{{ t('gallery.scanReview') }}</h1><p class="muted">{{ t('gallery.scanReviewDescription') }}</p>
+            </div>
+            <button
+              type="button"
+              class="secondary-button"
+              :disabled="scanReviewBusy"
+              @click="loadScanReview"
+            >{{ t('gallery.refreshNodeStatus') }}</button>
+          </div>
+          <div
+            v-if="scanReviewError"
+            class="notice error-notice"
+            role="alert"
+          >{{ scanReviewError }}</div>
+          <div
+            v-if="scanReviewBusy"
+            class="notice"
+            role="status"
+          >{{ t('gallery.loading') }}</div>
+          <div
+            v-else-if="!scanReviews.length"
+            class="empty-state"
+          >{{ t('gallery.scanReviewEmpty') }}</div>
+          <article
+            v-for="review in scanReviews"
+            :key="review.rootId"
+            class="scan-review-card"
+          >
+            <div class="duplicate-card-heading"><strong>{{ review.rootId }}</strong><span :class="['scan-review-status', review.complete ? 'complete' : 'incomplete']">{{ review.complete ? t('gallery.scanComplete') : t('gallery.scanIncomplete') }}</span></div>
+            <p class="muted">{{ t('gallery.scanSummary', { indexed: review.indexed, missing: review.missing, offline: review.offline }) }}</p>
+            <ul
+              v-if="review.locations.length"
+              class="scan-review-list"
+            >
+              <li
+                v-for="location in review.locations"
+                :key="location.locationId"
+              ><code>{{ location.originalPath }}</code><span :class="['availability', location.availability]">{{ t(`gallery.availability.${location.availability}`) }}</span></li>
+            </ul>
+            <p
+              v-else
+              class="muted"
+            >{{ t('gallery.scanNoAffectedPaths') }}</p>
+            <p class="muted">{{ t('gallery.scanReviewReadOnly') }}</p>
+          </article>
+        </section>
         <section
           v-else-if="section === 'duplicates'"
           class="page-section"

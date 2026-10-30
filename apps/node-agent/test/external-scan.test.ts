@@ -88,6 +88,31 @@ function root(path = '/photos', pathStyle: 'posix' | 'win32' = 'posix'): Authori
 }
 
 describe('external read-only directory scanning', () => {
+  it('exposes a read-only review for missing paths without requiring confirmation writes', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addFile('/photos/gone.jpg', 'gone-original');
+    const { service, repository } = setup(root(), fs);
+    await service.scanAll();
+    fs.remove('/photos/gone.jpg');
+    const results = await service.scanAll();
+    expect(results[0]?.complete).toBe(true);
+    const review = service.getReview('library-1');
+    expect(review[0]?.locations).toEqual([{ locationId: expect.any(String), originalPath: '/photos/gone.jpg', availability: 'missing' }]);
+    expect(repository.rows.size).toBe(1);
+  });
+
+  it('does not infer unobserved paths as missing after an incomplete scan', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addFile('/photos/kept.jpg', 'kept-original');
+    const { service } = setup(root(), fs);
+    await service.scanAll();
+    fs.setDenied('/photos', true);
+    const results = await service.scanAll();
+    expect(results[0]?.complete).toBe(false);
+    expect(service.getReview('library-1')[0]?.locations).toEqual([{ locationId: expect.any(String), originalPath: '/photos/kept.jpg', availability: 'offline' }]);
+    expect(service.getReview('library-1')[0]?.missing).toBe(0);
+  });
+
   it('resolves original reads only inside an explicitly authorized real root', async () => {
     const fs = new VirtualExternalFileSystem();
     fs.addDirectory('/photos'); fs.addFile('/photos/visible.jpg', 'visible-original');

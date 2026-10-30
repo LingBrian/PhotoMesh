@@ -54,6 +54,18 @@ export interface ExternalScanResult {
   issues: ExternalScanIssue[];
 }
 
+export interface ExternalScanReview {
+  rootId: string;
+  libraryId: string;
+  complete: boolean;
+  indexed: number;
+  missing: number;
+  offline: number;
+  directories: string[];
+  issues: ExternalScanIssue[];
+  locations: Array<{ locationId: string; originalPath: string; availability: ExternalAvailability }>;
+}
+
 export interface ExternalWatcher {
   watch(path: string, onChange: () => void, onError?: () => void): { close(): void };
 }
@@ -122,8 +134,23 @@ export class ExternalScanService {
   private rerun = false;
   private stopping = false;
   private readonly watches = new Map<string, { close(): void }>();
+  private readonly latestResults = new Map<string, ExternalScanResult>();
 
   constructor(private readonly options: ExternalScanOptions) {}
+
+  /** Returns the latest read-only report; it never starts a scan or mutates indexed state. */
+  getReview(libraryId: string): ExternalScanReview[] {
+    return this.options.roots.filter((root) => root.libraryId === libraryId).flatMap((root) => {
+      const result = this.latestResults.get(root.rootId);
+      if (!result) return [];
+      const ops = pathOps(root.pathStyle);
+      const caseSensitive = root.caseSensitive ?? root.pathStyle !== 'win32';
+      const locations = this.options.repository.listExternalLocations(this.options.nodeId)
+        .filter((location) => isWithin(ops, ops.resolve(root.path), location.originalPath, caseSensitive))
+        .filter((location) => location.availability === 'missing' || location.availability === 'offline');
+      return [{ ...result, libraryId: root.libraryId, locations }];
+    });
+  }
 
   async scanAll(): Promise<ExternalScanResult[]> {
     if (this.stopping) return [];
@@ -138,9 +165,11 @@ export class ExternalScanService {
         results = [];
         const overlappingRoots = await this.findOverlappingRoots();
         for (const root of this.options.roots) {
-          results.push(overlappingRoots.has(root) ? {
-            rootId: root.rootId, complete: false, indexed: 0, missing: 0, offline: 0, directories: [], issues: [{ code: 'invalid_root' }]
-          } : await this.scanRoot(root));
+          const result = overlappingRoots.has(root) ? {
+            rootId: root.rootId, complete: false, indexed: 0, missing: 0, offline: 0, directories: [], issues: [{ code: 'invalid_root' as const }]
+          } : await this.scanRoot(root);
+          this.latestResults.set(root.rootId, result);
+          results.push(result);
         }
         if (!this.stopping) this.refreshWatches(results.flatMap((result) => result.directories));
       } while (this.rerun && !this.stopping);

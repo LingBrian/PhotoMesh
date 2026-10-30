@@ -29,6 +29,17 @@ async function request(path: string, options: NodeAgentServerOptions = {}, init?
 }
 
 describe('node-agent health endpoint', () => {
+  it('advertises and protects the read-only external scan review capability', async () => {
+    const review = { getReview: vi.fn(() => [{ rootId: 'photos', libraryId: 'library-1', complete: false, indexed: 1, missing: 0, offline: 1, directories: [], issues: [{ code: 'permission_denied' as const }], locations: [{ locationId: 'loc-1', originalPath: '/photos/a.jpg', availability: 'offline' as const }] }]) };
+    const options: NodeAgentServerOptions = { externalScan: review, authorizeLibraryRead: (token, libraryId) => token === 'ok' && libraryId === 'library-1' ? 'principal' : undefined };
+    const denied = await request('/v1/libraries/library-1/external-scan-review', options, { headers: { authorization: 'Bearer bad' } });
+    expect(denied.status).toBe(404);
+    expect(review.getReview).not.toHaveBeenCalled();
+    const allowed = await request('/v1/libraries/library-1/external-scan-review', options, { headers: { authorization: 'Bearer ok' } });
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toMatchObject({ roots: [{ rootId: 'photos', locations: [{ availability: 'offline' }] }] });
+  });
+
   it('returns the health contract on loopback', async () => {
     const response = await request('/v1/health');
     expect(response.status).toBe(200);

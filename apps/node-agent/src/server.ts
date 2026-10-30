@@ -13,6 +13,7 @@ import { decodeAlbumCursor, InvalidAlbumCursorError, normalizeAlbumTitle, type A
 import type { Readable } from 'node:stream';
 import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage, MediaVersionView } from './media/media-version-service.js';
 import type { ThumbnailContent } from './media/thumbnail-service.js';
+import type { ExternalScanReview } from './media/external-scan.js';
 import { maxThumbnailOutputBytes } from './media/image-transformer.js';
 import { FavoriteSyncConflictError } from './sync/favorite-sync-repository.js';
 import { RatingSyncConflictError } from './sync/rating-sync-repository.js';
@@ -45,6 +46,7 @@ export interface NodeAgentServerOptions {
   tagSync?: boolean;
   mediaVersions?: MediaVersionServerControl;
   thumbnails?: ThumbnailServerControl;
+  externalScan?: ExternalScanServerControl;
   pairingControl?: PairingServerControl;
   allowedWebOrigins?: readonly string[];
   maxRequestBytes?: number;
@@ -107,6 +109,10 @@ export interface MediaVersionServerControl {
 
 export interface ThumbnailServerControl {
   readThumbnail(libraryId: string, assetId: string, profile: string): Promise<ThumbnailContent>;
+}
+
+export interface ExternalScanServerControl {
+  getReview(libraryId: string): ExternalScanReview[];
 }
 
 export interface AssetTagServerControl {
@@ -204,6 +210,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const capabilities = [
       ...(options.mediaVersions ? ['mediaVersions'] : []),
       ...(options.thumbnails ? ['thumbnails'] : []),
+      ...(options.externalScan ? ['externalScanReview'] : []),
       ...(options.assetTags ? ['assetTags'] : []),
       ...(options.gallery ? ['gallerySearch', 'galleryFilters', ...(options.gallery.listDuplicateCandidateGroups ? ['duplicateCandidates'] : [])] : []),
       ...(options.albums ? ['virtualAlbums'] : []),
@@ -230,6 +237,19 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
 
   if (await handleAlbumRequest(request, response, options, requestId, url)) return;
+
+  const externalScanReviewPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/external-scan-review$/);
+  if (request.method === 'GET' && externalScanReviewPath?.[1]) {
+    const libraryId = decodePathSegment(externalScanReviewPath[1]);
+    if (!libraryId || [...url.searchParams.keys()].length > 0) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    if (!await options.authorizeLibraryRead?.(bearerToken(request), libraryId)) {
+      sendJson(response, 404, { error: 'not_found', requestId }); return;
+    }
+    if (!options.externalScan) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    response.setHeader('cache-control', 'no-store');
+    sendJson(response, 200, { roots: options.externalScan.getReview(libraryId) });
+    return;
+  }
 
   const thumbnailPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/thumbnail$/);
   if (request.method === 'GET' && thumbnailPath?.[1] && thumbnailPath[2]) {

@@ -279,7 +279,7 @@ const authorizePairingAdmin = createAdminTokenAuthorizer(process.env.PHOTOMESH_A
 repository.markExternalLocationsOffline(nodeId);
 const host = process.env.PHOTOMESH_API_BIND_ADDRESS ?? '127.0.0.1';
 if (!isSafeServiceBind(host)) throw new Error('PHOTOMESH_API_BIND_ADDRESS must be loopback or an explicit private LAN IP');
-const server = createNodeAgentServer({
+const serverOptions: import('./server.js').NodeAgentServerOptions = {
   uploadService, authorizePairingAdmin,
   diagnostics: {
     checkDatabase: () => { database.prepare('SELECT 1').get(); },
@@ -368,7 +368,8 @@ const server = createNodeAgentServer({
       mediaThumbnailService!.getThumbnail(libraryId, assetId, profile)
   } } : {}),
   ...(pairingControl ? { pairingControl } : {})
-});
+};
+const server = createNodeAgentServer(serverOptions);
 server.listen(port, host, () => process.stdout.write(`PhotoMesh node-agent listening on ${host}:${port}\n`));
 void uploadService.resumePending().catch(() => process.stderr.write('Upload recovery could not be completed; pending uploads remain resumable\n'));
 const resumeMediaVersions = (): void => {
@@ -393,6 +394,7 @@ if (rootsJson) {
       signPendingEvents: () => syncService!.signPendingLocalEvents()
     } : {})
   });
+  serverOptions.externalScan = externalScan;
   void externalScan.start().then((results) => {
     const indexed = results.reduce((total, result) => total + result.indexed, 0);
     process.stdout.write(`External directory scan initialized (${results.length} roots, ${indexed} indexed paths)\n`);
