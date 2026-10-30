@@ -13,6 +13,7 @@ import {
 } from './capture-date-display.js';
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
 import { defaultGalleryCacheSettings, normalizeGalleryCacheSettings, persistentCacheEvictions, type GalleryCacheSettings, type PersistentCacheEntry } from './gallery-cache.js';
+import BackupStatusCard, { type BackupStatusSnapshot } from './BackupStatusCard.vue';
 import './gallery.css';
 
 type Library = { libraryId: string; title: string };
@@ -75,6 +76,7 @@ const hasSession = ref(false);
 const lastHealthCheck = ref<Date | null>(null);
 const cacheAvailable = ref(true);
 const cacheSettings = ref<GalleryCacheSettings>(loadCacheSettings());
+const backupSnapshot = ref<BackupStatusSnapshot>({ status: 'idle', bytesDone: 0, bytesTotal: 0, elapsedSeconds: 0, result: null, error: null });
 const isCachedPreview = ref(false);
 const isDesktopRuntime = '__TAURI_INTERNALS__' in window;
 const busy = ref(false);
@@ -2364,6 +2366,11 @@ async function idbClear(store: string): Promise<void> {
           class="page-section settings-page"
         >
           <p class="eyebrow">{{ t('gallery.settingsLabel') }}</p><h1>{{ t('gallery.nodeSettings') }}</h1><p class="muted">{{ t('gallery.settingsDescription') }}</p>
+           <BackupStatusCard
+             :snapshot="backupSnapshot"
+             :can-start="false"
+             :can-cancel="false"
+           />
           <div
             v-if="!connected"
             class="notice offline-notice"
