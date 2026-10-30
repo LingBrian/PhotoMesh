@@ -15,6 +15,7 @@ import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage
 import type { ThumbnailContent } from './media/thumbnail-service.js';
 import type { ExternalScanReview } from './media/external-scan.js';
 import { maxThumbnailOutputBytes } from './media/image-transformer.js';
+import { metadataExportLimit, metadataRecordsToCsv, toMetadataExportRecords } from './metadata/export.js';
 import { FavoriteSyncConflictError } from './sync/favorite-sync-repository.js';
 import { RatingSyncConflictError } from './sync/rating-sync-repository.js';
 
@@ -251,6 +252,40 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const review = { roots: options.externalScan.getReview(libraryId) };
     const canReadPaths = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
     sendJson(response, 200, canReadPaths ? review : redactPathFields(review));
+    return;
+  }
+
+  const metadataExportPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/metadata-export$/);
+  if (request.method === 'GET' && metadataExportPath?.[1]) {
+    const libraryId = decodePathSegment(metadataExportPath[1]);
+    const formats = url.searchParams.getAll('format');
+    if (!libraryId || formats.length !== 1 || !['json', 'csv'].includes(formats[0] ?? '') || [...url.searchParams.keys()].some((key) => key !== 'format')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    if (!await options.authorizeLibraryRead?.(bearerToken(request), libraryId)) {
+      sendJson(response, 403, { error: 'forbidden', requestId }); return;
+    }
+    if (!options.gallery) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const includePath = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+    const items: unknown[] = [];
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    do {
+      const page = options.gallery.listAssets(libraryId, cursor, Math.min(200, metadataExportLimit - items.length));
+      items.push(...page.items);
+      if (!page.nextCursor || items.length >= metadataExportLimit || cursors.has(page.nextCursor)) break;
+      cursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    } while (items.length < metadataExportLimit);
+    const records = toMetadataExportRecords(items, includePath);
+    response.setHeader('cache-control', 'private, no-store');
+    if (formats[0] === 'csv') {
+      const csv = metadataRecordsToCsv(records);
+      response.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="photomesh-metadata.csv"', 'content-length': String(Buffer.byteLength(csv)), 'x-content-type-options': 'nosniff' });
+      response.end(csv);
+    } else {
+      sendJson(response, 200, { items: records });
+    }
     return;
   }
 

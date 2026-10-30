@@ -711,6 +711,24 @@ describe('pairing and library authorization endpoints', () => {
     expect((await visible.json() as { items: Array<{ sourcePath: string }> }).items[0]?.sourcePath).toBe('C:\\\\private\\\\photo.jpg');
   });
 
+  it('exports bounded JSON and CSV metadata after library authorization', async () => {
+    const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {
+      listLibraries: () => [{ libraryId: 'library-a', title: 'A' }],
+      listAssets: () => ({ items: [{ assetId: 'asset', libraryId: 'library-a', filename: '=formula.jpg', sourcePath: 'C:\\\\private\\\\photo.jpg', tags: ['x,y'] }], nextCursor: null }),
+      getOriginal: async () => undefined, openOriginal: () => undefined, listTombstones: () => [], restoreTombstone: async () => 'not_found'
+    };
+    const options: NodeAgentServerOptions = { gallery, authorizeLibraryRead: (token) => token === 'reader' || token === 'path-reader' ? 'principal' : undefined,
+      authorizeLibraryPathRead: (token) => token === 'path-reader' };
+    const json = await request('/v1/libraries/library-a/metadata-export?format=json', options, { headers: { authorization: 'Bearer reader' } });
+    expect(json.status).toBe(200);
+    expect((await json.json() as { items: Array<{ sourcePath: string | null }> }).items[0]?.sourcePath).toBeNull();
+    const csv = await request('/v1/libraries/library-a/metadata-export?format=csv', options, { headers: { authorization: 'Bearer path-reader' } });
+    expect(csv.status).toBe(200);
+    const csvText = await csv.text();
+    expect(csvText).toContain("'=formula.jpg");
+    expect(csvText).toContain('"x,y"');
+  });
+
   it('passes validated search filters to the gallery after library-read authorization', async () => {
     const listAssets = vi.fn(() => ({ items: [], nextCursor: null }));
     const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {

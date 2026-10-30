@@ -115,6 +115,33 @@ paths:
         '404': {description: Unknown or unauthorized library, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '503': {description: External scan capability unavailable, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/metadata-export:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 导出授权图库元数据
+      description: 仅导出元数据，不包含原图、密钥或秘密；CSV 固定列并防止公式注入，最多 5000 条。
+      parameters:
+        - in: query
+          name: format
+          required: true
+          schema: {type: string, enum: [json, csv]}
+      responses:
+        '200':
+          description: Metadata export
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/MetadataExportPage'}}
+            text/csv: {schema: {type: string}}
+        '400': {description: Invalid format, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Unauthorized library, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Gallery capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries/{libraryId}/albums:
     parameters:
       - in: path
@@ -1868,6 +1895,33 @@ components:
       required: [items]
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Library'}}
+    MetadataExportPage:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, maxItems: 5000, items: {$ref: '#/components/schemas/MetadataExportItem'}}
+    MetadataExportItem:
+      type: object
+      required: [assetId, libraryId, originNodeId, kind, sha256, byteSize, filename, capturedAt, captureLocalTime, captureOffsetMinutes, captureSource, captureConfidence, sourcePath, sourceKind, availability, tags, favorite, rating]
+      properties:
+        assetId: {type: string}
+        libraryId: {type: string}
+        originNodeId: {type: string}
+        kind: {type: string}
+        sha256: {type: string}
+        byteSize: {type: [integer, 'null']}
+        filename: {type: [string, 'null']}
+        capturedAt: {type: [string, 'null'], format: date-time}
+        captureLocalTime: {type: [string, 'null']}
+        captureOffsetMinutes: {type: [integer, 'null']}
+        captureSource: {type: [string, 'null']}
+        captureConfidence: {type: [string, 'null']}
+        sourcePath: {type: [string, 'null']}
+        sourceKind: {type: [string, 'null']}
+        availability: {type: [string, 'null']}
+        tags: {type: array, items: {type: string}}
+        favorite: {type: [boolean, 'null']}
+        rating: {type: [integer, 'null']}
     ExternalScanReviewPage:
       type: object
       required: [roots]
