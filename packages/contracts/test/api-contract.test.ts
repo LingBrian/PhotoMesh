@@ -82,6 +82,7 @@ interface OpenApiContract {
 const routes: RouteCase[] = [
   { template: '/v1/health', method: 'get', path: '/v1/health', status: 200 },
   { template: '/v1/diagnostics', method: 'get', path: '/v1/diagnostics', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'no-store' } },
+  { template: '/v1/resources', method: 'get', path: '/v1/resources', status: 403, error: 'forbidden', headers: { 'Cache-Control': 'no-store' } },
   { template: '/v1/diagnostics', method: 'get', path: '/v1/diagnostics', status: 200, authorization: 'Bearer contract-admin', headers: { 'Cache-Control': 'no-store' } },
   { template: '/v1/libraries', method: 'get', path: '/v1/libraries', status: 403, error: 'forbidden' },
   { template: '/v1/libraries/{libraryId}/external-scan-review', method: 'get', path: '/v1/libraries/lib/external-scan-review', status: 404, error: 'not_found' },

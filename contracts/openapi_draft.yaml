@@ -73,6 +73,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /v1/resources:
+    get:
+      summary: 管理员查看节点资源与任务队列指标
+      description: Requires the node administrator bearer token. Returns bounded counts and byte totals only; paths, secrets, and user data are excluded. Low space makes new work unavailable.
+      security:
+        - nodeAdminBearer: []
+      responses:
+        '200':
+          description: Resource metrics
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ResourceMetrics'}}}
+        '403': {description: Forbidden, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Resource metrics unavailable, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries:
     get:
       summary: 当前主体有权查看的照片库
@@ -1432,6 +1448,7 @@ paths:
         '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '409': {description: Idempotency key reused for a different request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '413': {description: Upload exceeds configured limits, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '507': {description: Low storage; new work is paused, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '500': {description: Upload session creation failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         default:
           description: Unexpected HTTP error using the common error envelope.
@@ -1795,6 +1812,27 @@ components:
         peerId: {type: string, minLength: 1, maxLength: 128}
         pendingEvents: {type: integer, minimum: 0}
         lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
+    ResourceMetrics:
+      type: object
+      required: [status, acceptsNewWork, storage, queue]
+      properties:
+        status: {type: string, enum: [ok, low_space, unavailable]}
+        acceptsNewWork: {type: boolean}
+        storage:
+          type: object
+          required: [totalBytes, availableBytes, usedBytes, lowSpace]
+          properties:
+            totalBytes: {type: integer, minimum: 0}
+            availableBytes: {type: integer, minimum: 0}
+            usedBytes: {type: integer, minimum: 0}
+            lowSpace: {type: boolean}
+        queue:
+          type: object
+          required: [pending, running, failed]
+          properties:
+            pending: {type: integer, minimum: 0}
+            running: {type: integer, minimum: 0}
+            failed: {type: integer, minimum: 0}
     NodeDiagnostics:
       type: object
       additionalProperties: false

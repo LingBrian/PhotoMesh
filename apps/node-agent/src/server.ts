@@ -15,6 +15,7 @@ import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage
 import type { ThumbnailContent } from './media/thumbnail-service.js';
 import type { ExternalScanReview } from './media/external-scan.js';
 import { maxThumbnailOutputBytes } from './media/image-transformer.js';
+import { getResourceMetrics, type ResourceMetricsSource } from './resource-metrics.js';
 import { metadataExportLimit, metadataRecordsToCsv, toMetadataExportRecords } from './metadata/export.js';
 import { FavoriteSyncConflictError } from './sync/favorite-sync-repository.js';
 import { RatingSyncConflictError } from './sync/rating-sync-repository.js';
@@ -37,6 +38,7 @@ export interface NodeAgentServerOptions {
   authorizeUpload?: UploadAuthorizer;
   authorizePairingAdmin?: (token: string | undefined) => boolean;
   diagnostics?: HealthDiagnosticsSource;
+  resources?: ResourceMetricsSource;
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
   authorizeLibraryPathRead?: (token: string | undefined, libraryId: string) => boolean | Promise<boolean>;
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
@@ -219,6 +221,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       ...(options.tagSync ? ['tagSync'] : [])
     ];
     sendJson(response, 200, getHealth(capabilities));
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/v1/resources') {
+    response.setHeader('cache-control', 'no-store');
+    if (!options.authorizePairingAdmin?.(bearerToken(request))) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    if (!options.resources) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    sendJson(response, 200, await getResourceMetrics(options.resources));
     return;
   }
 
@@ -653,6 +663,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     });
     if (!principal) {
       sendJson(response, 403, { error: 'forbidden', requestId });
+      return;
+    }
+    if (options.resources && !(await getResourceMetrics(options.resources)).acceptsNewWork) {
+      sendJson(response, 507, { error: 'insufficient_storage', requestId });
       return;
     }
     const idempotencyKey = headerValue(request, 'idempotency-key');
