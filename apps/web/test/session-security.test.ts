@@ -16,6 +16,20 @@ describe('session security primitives', () => {
     expect(second.isCurrent()).toBe(false);
   });
 
+  it('blocks new requests after session or device revocation until a new session is established', () => {
+    const scope = new SessionRequestScope();
+    const active = scope.begin();
+    scope.revoke('device_revoked');
+    expect(active.signal.aborted).toBe(true);
+    expect(scope.isRevoked()).toBe(true);
+    expect(scope.revocationReason()).toBe('device_revoked');
+    const blocked = scope.begin();
+    expect(blocked.signal.aborted).toBe(true);
+    scope.reset();
+    expect(scope.isRevoked()).toBe(false);
+    expect(scope.begin().isCurrent()).toBe(true);
+  });
+
   it('does not abort a request after its lease has been released', () => {
     const scope = new SessionRequestScope();
     const request = scope.begin();

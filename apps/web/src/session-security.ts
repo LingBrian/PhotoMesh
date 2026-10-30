@@ -6,11 +6,13 @@ export type SessionRequestLease = {
 
 export class SessionRequestScope {
   private generation = 0;
+  private revokedReason: string | null = null;
   private readonly activeControllers = new Set<AbortController>();
 
   begin(parentSignal?: AbortSignal | null): SessionRequestLease {
     const controller = new AbortController();
     const requestGeneration = this.generation;
+    if (this.revokedReason !== null) controller.abort();
     const abortFromParent = (): void => controller.abort();
     if (parentSignal?.aborted) controller.abort();
     else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
@@ -34,6 +36,19 @@ export class SessionRequestScope {
     for (const controller of this.activeControllers) controller.abort();
     this.activeControllers.clear();
   }
+
+  revoke(reason = 'session_revoked'): void {
+    this.revokedReason = reason || 'session_revoked';
+    this.invalidate();
+  }
+
+  reset(): void {
+    this.revokedReason = null;
+    this.generation += 1;
+  }
+
+  isRevoked(): boolean { return this.revokedReason !== null; }
+  revocationReason(): string | null { return this.revokedReason; }
 }
 
 export function isAuthorizationFailure(status: number): boolean {
