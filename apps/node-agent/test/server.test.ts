@@ -696,6 +696,21 @@ describe('pairing and library authorization endpoints', () => {
     expect(readIndex).toHaveBeenCalledWith('trusted-peer', 'private-library');
   });
 
+  it('redacts local paths unless the separate path permission is granted', async () => {
+    const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {
+      listLibraries: () => [{ libraryId: 'library-a', title: 'A' }],
+      listAssets: () => ({ items: [{ assetId: 'asset', sourcePath: 'C:\\\\private\\\\photo.jpg', filename: 'photo.jpg' }], nextCursor: null }),
+      getOriginal: async () => undefined, openOriginal: () => undefined, listTombstones: () => [], restoreTombstone: async () => 'not_found'
+    };
+    const options: NodeAgentServerOptions = { gallery, authorizeLibraryRead: (token) => token === 'reader' || token === 'path-reader' ? 'principal' : undefined,
+      authorizeLibraryPathRead: (token) => token === 'path-reader' };
+    const redacted = await request('/v1/assets?libraryId=library-a', options, { headers: { authorization: 'Bearer reader' } });
+    expect(redacted.status).toBe(200);
+    expect((await redacted.json() as { items: Array<{ sourcePath: string | null }> }).items[0]?.sourcePath).toBeNull();
+    const visible = await request('/v1/assets?libraryId=library-a', options, { headers: { authorization: 'Bearer path-reader' } });
+    expect((await visible.json() as { items: Array<{ sourcePath: string }> }).items[0]?.sourcePath).toBe('C:\\\\private\\\\photo.jpg');
+  });
+
   it('passes validated search filters to the gallery after library-read authorization', async () => {
     const listAssets = vi.fn(() => ({ items: [], nextCursor: null }));
     const gallery: NonNullable<NodeAgentServerOptions['gallery']> = {

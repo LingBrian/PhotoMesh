@@ -26,7 +26,7 @@ type Asset = {
 type Page = { items: Asset[]; nextCursor: string | null };
 type DuplicateCandidateAsset = { assetId: string; originNodeId: string; kind: string; sha256: string; byteSize: number; filename: string; sourcePath: string | null; sourceKind: string; availability: string };
 type DuplicateCandidateGroup = { sha256: string; byteSize: number; assets: DuplicateCandidateAsset[]; truncated: boolean };
-type ExternalScanReview = { rootId: string; libraryId: string; complete: boolean; indexed: number; missing: number; offline: number; directories: string[]; issues: Array<{ code: string }>; locations: Array<{ locationId: string; originalPath: string; availability: 'offline' | 'missing' }> };
+type ExternalScanReview = { rootId: string; libraryId: string; complete: boolean; indexed: number; missing: number; offline: number; directories: string[]; issues: Array<{ code: string }>; locations: Array<{ locationId: string; originalPath: string | null; availability: 'offline' | 'missing' }> };
 type Tombstone = { assetId: string; libraryId: string; eventId: string };
 type PendingPeerApproval = { peerId: string; publicKey: string; proposedLabel: string; requestedAt: string };
 type Album = { id: string; name: string; tag: string };
@@ -2175,7 +2175,7 @@ async function idbClear(store: string): Promise<void> {
               <li
                 v-for="location in review.locations"
                 :key="location.locationId"
-              ><code>{{ location.originalPath }}</code><span :class="['availability', location.availability]">{{ t(`gallery.availability.${location.availability}`) }}</span></li>
+              ><code>{{ location.originalPath ?? t('gallery.pathUnavailable') }}</code><span :class="['availability', location.availability]">{{ t(`gallery.availability.${location.availability}`) }}</span></li>
             </ul>
             <p
               v-else

@@ -37,6 +37,7 @@ export interface NodeAgentServerOptions {
   authorizePairingAdmin?: (token: string | undefined) => boolean;
   diagnostics?: HealthDiagnosticsSource;
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
+  authorizeLibraryPathRead?: (token: string | undefined, libraryId: string) => boolean | Promise<boolean>;
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
   albums?: AlbumServerControl;
@@ -247,7 +248,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     }
     if (!options.externalScan) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
     response.setHeader('cache-control', 'no-store');
-    sendJson(response, 200, { roots: options.externalScan.getReview(libraryId) });
+    const review = { roots: options.externalScan.getReview(libraryId) };
+    const canReadPaths = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+    sendJson(response, 200, canReadPaths ? review : redactPathFields(review));
     return;
   }
 
@@ -431,7 +434,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     }
     try {
       response.setHeader('cache-control', 'private, no-store');
-      sendJson(response, 200, { groups: options.gallery.listDuplicateCandidateGroups(libraryId, rawLimit) });
+      const groups = options.gallery.listDuplicateCandidateGroups(libraryId, rawLimit);
+      const canReadPaths = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+      sendJson(response, 200, canReadPaths ? { groups } : redactPathFields({ groups }));
     } catch {
       sendJson(response, 400, { error: 'invalid_request', requestId });
     }
@@ -470,7 +475,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       response.setHeader('cache-control', 'private, no-store');
       try {
         const page = options.gallery.listAssets(libraryId, cursor ?? undefined, rawLimit, filters);
-        sendJson(response, 200, page);
+        const canReadPaths = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+        sendJson(response, 200, canReadPaths ? page : redactPathFields(page));
       } catch (cause) {
         if (cause instanceof StaleGalleryCursorError) sendJson(response, 410, { error: 'stale_cursor', requestId });
         else sendJson(response, 400, { error: 'invalid_request', requestId });
@@ -1367,6 +1373,13 @@ function isCreateMediaVersionRequest(value: unknown): value is CreateMediaVersio
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function redactPathFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactPathFields(item));
+  if (!isPlainRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+    key === 'sourcePath' || key === 'originalPath' ? [key, null] : [key, redactPathFields(item)]));
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {

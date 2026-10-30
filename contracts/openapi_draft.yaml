@@ -1891,7 +1891,7 @@ components:
       required: [locationId, originalPath, availability]
       properties:
         locationId: {type: string}
-        originalPath: {type: string}
+        originalPath: {type: [string, 'null']}
         availability: {type: string, enum: [offline, missing]}
     Asset:
       type: object

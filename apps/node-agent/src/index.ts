@@ -308,6 +308,7 @@ const serverOptions: import('./server.js').NodeAgentServerOptions = {
   authorizeUpload: (request) => authorizePairingAdmin(request.token) ? { principalId: 'local-admin' } : undefined,
   authorizeLibraryList: (token) => authorizePairingAdmin(token),
   authorizeLibraryRead: (token) => authorizePairingAdmin(token) ? 'local-admin' : undefined,
+  authorizeLibraryPathRead: (token) => authorizePairingAdmin(token),
   gallery: {
     listLibraries: () => repository.listGalleryLibraries(),
     listAssets: (libraryId, cursor, limit, filters) => repository.listGalleryAssets(libraryId, cursor, limit, filters),

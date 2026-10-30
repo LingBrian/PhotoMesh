@@ -63,7 +63,7 @@ export interface ExternalScanReview {
   offline: number;
   directories: string[];
   issues: ExternalScanIssue[];
-  locations: Array<{ locationId: string; originalPath: string; availability: ExternalAvailability }>;
+  locations: Array<{ locationId: string; originalPath: string | null; availability: ExternalAvailability }>;
 }
 
 export interface ExternalWatcher {
