@@ -14,6 +14,7 @@ import {
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
 import { classifyConnectionFailure } from './connection-diagnostics.js';
 import { recoveryGuidance } from './recovery-guidance.js';
+import { mergeTimelinePage, validNextCursor } from './timeline-pagination.js';
 import { defaultGalleryCacheSettings, normalizeGalleryCacheSettings, persistentCacheEvictions, type GalleryCacheSettings, type PersistentCacheEntry } from './gallery-cache.js';
 import BackupStatusCard, { type BackupStatusSnapshot } from './BackupStatusCard.vue';
 import './gallery.css';
@@ -515,9 +516,9 @@ async function loadPage(reset = false, preserveOnFailure = false): Promise<boole
     if (generation !== pageGeneration) return false;
     const pageTags = Object.fromEntries(page.items.map((asset) => [asset.assetId, Array.isArray(asset.tags) ? asset.tags : []]));
     serverTags.value = reset ? pageTags : { ...serverTags.value, ...pageTags };
-    assets.value = reset ? page.items : [...assets.value, ...page.items];
+    assets.value = mergeTimelinePage(assets.value, page.items, reset);
     refreshTagView(page.items.map((asset) => asset.assetId));
-    cursor.value = page.nextCursor ?? '';
+    cursor.value = validNextCursor(page.nextCursor);
     void importLegacyTagsForAssets(page.items);
     return true;
   } catch (cause) {
