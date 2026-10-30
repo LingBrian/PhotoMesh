@@ -120,6 +120,8 @@
     "forbiddenRequired": "This node refused the requested action. Check the selected library and your permissions.",
     "connectionTimeout": "The node did not respond in time. Check the address or VPN and try again.",
     "certificateFailed": "The node certificate could not be verified. Check HTTPS and the trusted certificate.",
+    "rateLimited": "The node is rate-limiting requests. Wait briefly and try again.",
+    "resourceUnavailable": "The node is busy or low on resources. Wait and try again; existing work was not canceled.",
     "tokenRequired": "Enter the node admin token before connecting.",
     "nodeSessionChanged": "The node address changed. The session and its requests were cleared to avoid sending the old token to a new node; enter the destination node's token again.",
     "librarySessionChanged": "The library changed, so the session and its requests were cleared. Re-enter the token to connect to the selected library.",

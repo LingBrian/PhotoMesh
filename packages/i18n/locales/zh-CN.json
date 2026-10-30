@@ -120,6 +120,8 @@
     "forbiddenRequired": "节点拒绝了此操作。请检查所选图库和当前权限。",
     "connectionTimeout": "节点未及时响应。请检查地址或 VPN 后重试。",
     "certificateFailed": "无法验证节点证书。请检查 HTTPS 和受信任证书。",
+    "rateLimited": "节点正在限制请求频率。请稍候再试。",
+    "resourceUnavailable": "节点繁忙或资源不足。请稍候重试；现有任务未被取消。",
     "tokenRequired": "请先输入节点管理员令牌，再连接节点。",
     "nodeSessionChanged": "节点地址已更改。为避免将旧令牌发送到新节点，会话和请求已清除；请重新输入目标节点令牌。",
     "librarySessionChanged": "已切换图库，会话和请求已清除。请重新输入令牌连接所选图库。",

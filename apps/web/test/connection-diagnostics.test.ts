@@ -10,6 +10,9 @@ describe('connection diagnostics', () => {
     expect(classifyConnectionFailure(new TypeError('Failed to fetch'))).toBe('offline');
     expect(classifyConnectionFailure(new Error('TLS certificate name mismatch'))).toBe('certificate');
     expect(classifyConnectionFailure(new DOMException('request timed out', 'TimeoutError'))).toBe('timeout');
+    expect(classifyConnectionFailure({ status: 409 })).toBe('conflict');
+    expect(classifyConnectionFailure({ status: 429 })).toBe('rate-limited');
+    expect(classifyConnectionFailure({ status: 507 })).toBe('resource');
     expect(classifyConnectionFailure(new Error('unexpected'))).toBe('unknown');
   });
 });

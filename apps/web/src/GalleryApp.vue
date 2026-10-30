@@ -13,6 +13,7 @@ import {
 } from './capture-date-display.js';
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
 import { classifyConnectionFailure } from './connection-diagnostics.js';
+import { recoveryGuidance } from './recovery-guidance.js';
 import { defaultGalleryCacheSettings, normalizeGalleryCacheSettings, persistentCacheEvictions, type GalleryCacheSettings, type PersistentCacheEntry } from './gallery-cache.js';
 import BackupStatusCard, { type BackupStatusSnapshot } from './BackupStatusCard.vue';
 import './gallery.css';
@@ -1490,16 +1491,9 @@ function tagMutationErrorText(cause: unknown): string {
 }
 function errorText(cause: unknown): string {
   if (isRequestAborted(cause)) return '';
-  if (cause instanceof NodeApiError && cause.status === 409) return t('gallery.requestConflict');
-  switch (classifyConnectionFailure(cause)) {
-    case 'authorization': return t('gallery.authorizationRequired');
-    case 'forbidden': return t('gallery.forbiddenRequired');
-    case 'offline': return t('gallery.connectionFailed');
-    case 'timeout': return t('gallery.connectionTimeout');
-    case 'certificate': return t('gallery.certificateFailed');
-  }
+  const kind = classifyConnectionFailure(cause);
+  if (kind !== 'unknown') return t(`gallery.${recoveryGuidance(kind).messageKey}`);
   if (cause instanceof NodeApiError) return t('gallery.requestFailedWithStatus', { status: cause.status });
-  if (cause instanceof Error) return cause.message;
   return t('gallery.unknownError');
 }
 function parsedDate(value: string | null): Date | null {
