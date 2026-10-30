@@ -1,5 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import { appendMetadataAudit, type AuditRepository } from '../audit/audit-repository.js';
 import { migrations, type Migration } from './migrations.js';
 import { maxAssetTagsPerAsset } from '../asset-tag-limits.js';
 import { decodeAlbumCursor, encodeAlbumCursor, type AlbumCursorScope } from '../albums/album-utils.js';
@@ -151,6 +152,7 @@ export interface AlbumOperationContext {
   libraryId: string;
   requestFingerprint: string;
   createdAt: string;
+  requestId?: string;
 }
 
 export interface AlbumOperationEventDraftInput {
@@ -359,7 +361,11 @@ export class SqliteRepository implements UploadRepository {
   private albumOperationEventDrafter: AlbumOperationEventDrafter | undefined;
   private albumLifecycleEventDrafter: AlbumLifecycleEventDrafter | undefined;
 
-  constructor(private readonly db: Database.Database, private readonly faults: RepositoryFaults = {}) {
+  constructor(
+    private readonly db: Database.Database,
+    private readonly faults: RepositoryFaults = {},
+    private readonly auditRepository?: AuditRepository
+  ) {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('journal_mode = WAL');
@@ -574,7 +580,13 @@ export class SqliteRepository implements UploadRepository {
   createAlbum(input: AlbumOperationContext & { title: string }): AlbumRecord | 'writer_limit' | undefined {
     const write = this.db.transaction((): AlbumRecord | 'writer_limit' | undefined => {
       const replay = this.getAlbumOperationReplay<AlbumRecord>(input, ['album.created']);
-      if (replay !== undefined) return replay;
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.create', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: replay.albumId, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
       if (!this.hasGalleryLibrary(input.libraryId)) return undefined;
       if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return 'writer_limit';
       const album: AlbumRecord = {
@@ -587,6 +599,10 @@ export class SqliteRepository implements UploadRepository {
       this.albumOperationEventDrafter?.({
         operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
         albumId: album.albumId, assetId: null, operationType: 'album.created', createdAt: input.createdAt, title: album.title
+      });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.create', resourceType: 'virtual_album', libraryId: input.libraryId,
+        resourceId: album.albumId, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
       });
       this.faults.beforeAlbumOperationCommit?.();
       return album;
@@ -659,7 +675,13 @@ export class SqliteRepository implements UploadRepository {
   deleteAlbum(input: AlbumOperationContext & { albumId: string; scope: AlbumDeleteScope }): AlbumDeletionResult {
     const write = this.db.transaction((): AlbumDeletionResult => {
       const replay = this.getAlbumLifecycleReplay<AlbumDeletionResult>(input, input.scope, ['local.hidden', 'local.hide.noop', 'album.deleted', 'album.delete.noop']);
-      if (replay !== undefined) return replay;
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
       if (!this.hasAlbum(input.libraryId, input.albumId)) return 'not_found';
       if (input.scope === 'local') {
         const hidden = this.db.prepare('SELECT 1 FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
@@ -669,6 +691,10 @@ export class SqliteRepository implements UploadRepository {
         this.insertAlbumVisibilityOperation(input, input.albumId, operationType, result);
         if (!hidden) this.db.prepare(`INSERT INTO album_local_visibility(library_id,album_id,operation_id,hidden_at) VALUES(?,?,?,?)`)
           .run(input.libraryId, input.albumId, input.operationId, input.createdAt);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: hidden ? 'unchanged' : 'applied', requestId: input.requestId, createdAt: input.createdAt
+        });
         this.faults.beforeAlbumOperationCommit?.();
         return result;
       }
@@ -677,6 +703,10 @@ export class SqliteRepository implements UploadRepository {
       if (active.length > 0) {
         const result: AlbumDeletionResult = 'already_deleted';
         this.insertAlbumLifecycleOperation(input, input.albumId, 'album.delete.noop', [], result);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
         this.faults.beforeAlbumOperationCommit?.();
         return result;
       }
@@ -689,6 +719,10 @@ export class SqliteRepository implements UploadRepository {
         operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
         albumId: input.albumId, operationType: 'album.deleted', createdAt: input.createdAt
       });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+        resourceId: input.albumId, scope: input.scope, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
       this.faults.beforeAlbumOperationCommit?.();
       return result;
     });
@@ -698,7 +732,13 @@ export class SqliteRepository implements UploadRepository {
   restoreAlbum(input: AlbumOperationContext & { albumId: string; scope: AlbumDeleteScope }): AlbumRestoreResult {
     const write = this.db.transaction((): AlbumRestoreResult => {
       const replay = this.getAlbumLifecycleReplay<AlbumRestoreResult>(input, input.scope, ['local.restored', 'local.restore.noop', 'album.restored', 'album.restore.noop']);
-      if (replay !== undefined) return replay;
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
       if (!this.hasAlbum(input.libraryId, input.albumId)) return 'not_found';
       if (input.scope === 'local') {
         const hidden = this.db.prepare('SELECT 1 FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
@@ -708,6 +748,10 @@ export class SqliteRepository implements UploadRepository {
         this.insertAlbumVisibilityOperation(input, input.albumId, operationType, result);
         if (hidden) this.db.prepare('DELETE FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
           .run(input.libraryId, input.albumId);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: hidden ? 'applied' : 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
         this.faults.beforeAlbumOperationCommit?.();
         return result;
       }
@@ -717,6 +761,10 @@ export class SqliteRepository implements UploadRepository {
       if (observedDeleteIds.length === 0) {
         const result: AlbumRestoreResult = 'already_active';
         this.insertAlbumLifecycleOperation(input, input.albumId, 'album.restore.noop', [], result);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
         this.faults.beforeAlbumOperationCommit?.();
         return result;
       }
@@ -729,6 +777,10 @@ export class SqliteRepository implements UploadRepository {
       this.albumLifecycleEventDrafter({
         operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
         albumId: input.albumId, operationType: 'album.restored', createdAt: input.createdAt, observedDeleteIds
+      });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+        resourceId: input.albumId, scope: input.scope, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
       });
       this.faults.beforeAlbumOperationCommit?.();
       return result;
@@ -766,7 +818,13 @@ export class SqliteRepository implements UploadRepository {
   addAlbumMember(input: AlbumOperationContext & { albumId: string; assetId: string }): AlbumMemberMutationResult {
     const write = this.db.transaction((): AlbumMemberMutationResult => {
       const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.added', 'member.add.noop']);
-      if (replay !== undefined) return replay;
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.member.add', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+          resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
       if (!this.hasVisibleAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
         return { status: 'not_found' };
       }
@@ -777,6 +835,10 @@ export class SqliteRepository implements UploadRepository {
       if (active) {
         const result: AlbumMemberMutationResult = { status: 'already_present' };
         this.insertAlbumOperation(input, input.albumId, input.assetId, 'member.add.noop', result);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.member.add', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+          resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
         this.faults.beforeAlbumOperationCommit?.();
         return result;
       }
@@ -790,6 +852,10 @@ export class SqliteRepository implements UploadRepository {
         operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
         albumId: input.albumId, assetId: input.assetId, operationType: 'member.added', createdAt: input.createdAt
       });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.member.add', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+        resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
       this.faults.beforeAlbumOperationCommit?.();
       return result;
     });
@@ -799,7 +865,13 @@ export class SqliteRepository implements UploadRepository {
   removeAlbumMember(input: AlbumOperationContext & { albumId: string; assetId: string }): AlbumMemberMutationResult {
     const write = this.db.transaction((): AlbumMemberMutationResult => {
       const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.removed', 'member.remove.noop']);
-      if (replay !== undefined) return replay;
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.member.remove', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+          resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
       if (!this.hasVisibleAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
         return { status: 'not_found' };
       }
@@ -827,32 +899,52 @@ export class SqliteRepository implements UploadRepository {
         albumId: input.albumId, assetId: input.assetId, operationType: 'member.removed', createdAt: input.createdAt,
         observedAddIds
       });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.member.remove', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+        resourceId: input.assetId, relatedResourceId: input.albumId,
+        outcome: targets.length > 0 ? 'applied' : 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+      });
       this.faults.beforeAlbumOperationCommit?.();
       return result;
     });
     return write.immediate();
   }
 
-  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string): AssetTagMutationResult {
+  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string, requestId?: string): AssetTagMutationResult {
     const write = this.db.transaction((): AssetTagMutationResult => {
       if (!this.hasVisibleGalleryAsset(libraryId, assetId)) return 'not_found';
       if (this.db.prepare('SELECT 1 FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
-        .get(libraryId, assetId, tag)) return 'already_present';
+        .get(libraryId, assetId, tag)) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'asset.tag.add', resourceType: 'asset', libraryId, resourceId: assetId,
+          outcome: 'unchanged', requestId, createdAt
+        });
+        return 'already_present';
+      }
       const count = this.db.prepare('SELECT COUNT(*) AS count FROM asset_tags WHERE library_id = ? AND asset_id = ?')
         .get(libraryId, assetId) as { count: number };
       if (count.count >= maxAssetTagsPerAsset) return 'limit_reached';
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO asset_tags (library_id, asset_id, tag, created_at)
         VALUES (?, ?, ?, ?)`).run(libraryId, assetId, tag, createdAt);
-      return inserted.changes === 1 ? 'added' : 'already_present';
+      const result = inserted.changes === 1 ? 'added' : 'already_present';
+      appendMetadataAudit(this.auditRepository, {
+        action: 'asset.tag.add', resourceType: 'asset', libraryId, resourceId: assetId,
+        outcome: inserted.changes === 1 ? 'applied' : 'unchanged', requestId, createdAt
+      });
+      return result;
     });
     return write.immediate();
   }
 
-  removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult {
+  removeAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string = new Date().toISOString(), requestId?: string): AssetTagMutationResult {
     const write = this.db.transaction((): AssetTagMutationResult => {
       if (!this.hasVisibleGalleryAsset(libraryId, assetId)) return 'not_found';
       const removed = this.db.prepare('DELETE FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
         .run(libraryId, assetId, tag);
+      appendMetadataAudit(this.auditRepository, {
+        action: 'asset.tag.remove', resourceType: 'asset', libraryId, resourceId: assetId,
+        outcome: removed.changes === 1 ? 'applied' : 'unchanged', requestId, createdAt
+      });
       return removed.changes === 1 ? 'removed' : 'unchanged';
     });
     return write.immediate();

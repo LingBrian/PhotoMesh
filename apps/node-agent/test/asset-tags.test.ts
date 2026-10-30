@@ -9,7 +9,7 @@ import { createNodeAgentServer } from '../src/server.js';
 
 const migrationIds = [
   '0001_upload_foundation', '0002_lan_pairing', '0003_sync_event_log',
-  '0004_media_versions', '0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync', '0009_asset_favorites', '0010_asset_ratings', '0011_gallery_search_index', '0012_gallery_filter_indexes'
+  '0004_media_versions', '0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync', '0009_asset_favorites', '0010_asset_ratings', '0011_gallery_search_index', '0012_gallery_filter_indexes', '0013_metadata_audit_events'
 ];
 
 function seedLocalAsset(db: Database.Database, libraryId: string, assetId: string): void {
@@ -42,7 +42,7 @@ describe('server-persisted asset tags', () => {
     await repository.migrate(migrations);
     expect(backupCalls).toBe(1);
     expect(db.prepare(`SELECT migration_id, checksum FROM schema_migrations
-      WHERE migration_id NOT IN ('0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync', '0009_asset_favorites', '0010_asset_ratings', '0011_gallery_search_index', '0012_gallery_filter_indexes') ORDER BY migration_id`).all())
+      WHERE migration_id NOT IN ('0005_asset_tags', '0006_asset_tag_sync', '0007_virtual_albums', '0008_virtual_album_sync', '0009_asset_favorites', '0010_asset_ratings', '0011_gallery_search_index', '0012_gallery_filter_indexes', '0013_metadata_audit_events') ORDER BY migration_id`).all())
       .toEqual(priorChecksums);
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'asset_tags'").get()).toEqual({ name: 'asset_tags' });
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'asset_tags_insert_guard'").get())
@@ -146,18 +146,22 @@ describe('server-persisted asset tags', () => {
 
   it('protects tag mutations with authorization and validates idempotent state transitions', async () => {
     const tags = new Set<string>();
+    const addRequestIds: string[] = [];
+    const removeRequestIds: string[] = [];
     let visible = true;
     const server = createNodeAgentServer({
       authorizeLibraryRead: (token, libraryId) => token === 'admin' && libraryId === 'library-a' ? 'local-admin' : undefined,
       assetTags: {
-        addAssetTag: (_libraryId, _assetId, tag) => {
+        addAssetTag: (_libraryId, _assetId, tag, _createdAt, requestId) => {
+          addRequestIds.push(requestId);
           if (!visible) return 'not_found';
           if (tag === 'limit') return 'limit_reached';
           if (tags.has(tag)) return 'already_present';
           tags.add(tag);
           return 'added';
         },
-        removeAssetTag: (_libraryId, _assetId, tag) => {
+        removeAssetTag: (_libraryId, _assetId, tag, _createdAt, requestId) => {
+          removeRequestIds.push(requestId);
           if (!visible) return 'not_found';
           return tags.delete(tag) ? 'removed' : 'unchanged';
         }
@@ -179,10 +183,12 @@ describe('server-persisted asset tags', () => {
       expect((await send('PUT', '%20%20')).status).toBe(400);
       expect((await send('PUT', 'limit')).status).toBe(400);
       expect((await send('PUT', '%ZZ')).status).toBe(400);
-      expect((await send('PUT', 'Summer')).status).toBe(204);
-      expect((await send('PUT', 'Summer')).status).toBe(204);
-      expect((await send('DELETE', 'Summer')).status).toBe(204);
-      expect((await send('DELETE', 'Summer')).status).toBe(204);
+      expect((await send('PUT', 'Summer', true, 'tag-add')).status).toBe(204);
+      expect((await send('PUT', 'Summer', true, 'tag-add-noop')).status).toBe(204);
+      expect((await send('DELETE', 'Summer', true, 'tag-remove')).status).toBe(204);
+      expect((await send('DELETE', 'Summer', true, 'tag-remove-noop')).status).toBe(204);
+      expect(addRequestIds).toEqual(['tag-api-test', 'tag-add', 'tag-add-noop']);
+      expect(removeRequestIds).toEqual(['tag-remove', 'tag-remove-noop']);
       visible = false;
       expect((await send('PUT', 'Hidden')).status).toBe(404);
       expect((await send('DELETE', 'Hidden')).status).toBe(404);

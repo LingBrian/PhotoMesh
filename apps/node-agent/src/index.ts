@@ -2,6 +2,7 @@ import { constants as fsConstants } from 'node:fs';
 import { access, mkdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import Database from 'better-sqlite3';
+import { AuditRepository } from './audit/audit-repository.js';
 import { SqliteRepository, verifySqliteIntegrity, RepositoryConflictError } from './db/repository.js';
 import { createNodeAgentServer } from './server.js';
 import { createShutdownHandler } from './lifecycle.js';
@@ -39,6 +40,7 @@ const dataDirectory = resolve(process.env.PHOTOMESH_DATA_DIR ?? './data');
 await mkdir(dataDirectory, { recursive: true });
 const databasePath = join(dataDirectory, 'photomesh.sqlite');
 const database = new Database(databasePath);
+const auditRepository = new AuditRepository(database);
 try {
   verifySqliteIntegrity(database);
 } catch {
@@ -49,7 +51,7 @@ const repository = new SqliteRepository(database, {
   backupBeforeMigration: async () => {
     await database.backup(`${databasePath}.backup-${new Date().toISOString().replaceAll(':', '-')}`);
   }
-});
+}, auditRepository);
 await repository.migrate();
 repository.recoverInterruptedJobs(new Date().toISOString());
 const pairingApprovals = new PairingApprovalQueue();
@@ -75,10 +77,10 @@ try {
   nodeId = identity.peerId;
   albumPeerId = identity.peerId;
   pairing = new PairingService(repository, identity.peerId, pairingApprovals.request);
-  tagSyncRepository = new TagSyncRepository(database);
+  tagSyncRepository = new TagSyncRepository(database, undefined, auditRepository);
   albumSyncRepository = new AlbumSyncRepository(database);
-  favoriteSyncRepository = new FavoriteSyncRepository(database);
-  ratingSyncRepository = new RatingSyncRepository(database);
+  favoriteSyncRepository = new FavoriteSyncRepository(database, undefined, auditRepository);
+  ratingSyncRepository = new RatingSyncRepository(database, undefined, auditRepository);
   syncService = new SyncService(new SyncRepository(database), identity, pairing, undefined, (event) => {
     const payload = event.payload;
     if (typeof payload === 'object' && payload !== null && !Array.isArray(payload) &&
@@ -347,9 +349,10 @@ const server = createNodeAgentServer({
   } } : {}),
   tagSync: Boolean(tagSyncService),
   ...(tagSyncService ? { assetTags: {
-    addAssetTag: (libraryId: string, assetId: string, tag: string, createdAt: string) =>
-      tagSyncService!.addAssetTag(libraryId, assetId, tag, createdAt),
-    removeAssetTag: (libraryId: string, assetId: string, tag: string) => tagSyncService!.removeAssetTag(libraryId, assetId, tag)
+    addAssetTag: (libraryId: string, assetId: string, tag: string, createdAt: string, requestId: string) =>
+      tagSyncService!.addAssetTag(libraryId, assetId, tag, createdAt, requestId),
+    removeAssetTag: (libraryId: string, assetId: string, tag: string, createdAt: string, requestId: string) =>
+      tagSyncService!.removeAssetTag(libraryId, assetId, tag, createdAt, requestId)
   } } : {}),
   ...(favoriteSyncService ? { assetFavorites: {
     setAssetFavorite: (input: import('./server.js').AssetFavoriteMutationRequest) => favoriteSyncService!.setAssetFavorite(input)

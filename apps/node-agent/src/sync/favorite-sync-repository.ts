@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { appendMetadataAudit, type AuditRepository } from '../audit/audit-repository.js';
 import { eventDigest, isFavoriteSyncEventType, makeUnsignedEvent, parseEventEnvelope, type EventEnvelope, type UnsignedEventEnvelope } from './event-envelope.js';
 
 export const maxFavoriteAuthorsPerLibrary = 64;
@@ -12,18 +13,33 @@ export class FavoriteSyncAuthorizationError extends Error { constructor(message 
 interface Row { event_id:string; library_id:string; author_peer_id:string; author_sequence:number; envelope_json:string; state:string }
 
 export class FavoriteSyncRepository {
-  constructor(private readonly db: Database.Database, private readonly now: () => string = () => new Date().toISOString()) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly auditRepository?: AuditRepository
+  ) {}
 
-  setFavorite(input: { operationId:string; principalId:string; authorPeerId:string; libraryId:string; assetId:string; favorite:boolean; requestFingerprint:string; createdAt:string }): FavoriteSetResult {
+  setFavorite(input: { operationId:string; principalId:string; authorPeerId:string; libraryId:string; assetId:string; favorite:boolean; requestFingerprint:string; createdAt:string; requestId?:string }): FavoriteSetResult {
     return this.db.transaction(() => {
       const prior = this.db.prepare('SELECT request_fingerprint,result_json FROM favorite_operations WHERE operation_id=?').get(input.operationId) as {request_fingerprint:string;result_json:string}|undefined;
-      if (prior) { if (prior.request_fingerprint!==input.requestFingerprint) throw new FavoriteSyncConflictError('favorite operation ID reused with different request'); return JSON.parse(prior.result_json); }
+      if (prior) {
+        if (prior.request_fingerprint!==input.requestFingerprint) throw new FavoriteSyncConflictError('favorite operation ID reused with different request');
+        appendMetadataAudit(this.auditRepository, {
+          action: 'asset.favorite.set', resourceType: 'asset', libraryId: input.libraryId, resourceId: input.assetId,
+          outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return JSON.parse(prior.result_json);
+      }
       if (!this.visible(input.libraryId,input.assetId)) return 'not_found';
       const current=this.getFavorite(input.libraryId,input.assetId);
       const operationType = current===input.favorite ? (input.favorite?'favorite.add.noop':'favorite.remove.noop') : (input.favorite?'asset.favorite.added':'asset.favorite.removed');
       const result={status:current===input.favorite?'unchanged' as const:'changed' as const,favorite:input.favorite};
       if(current===input.favorite) {
         this.db.prepare(`INSERT INTO favorite_operations VALUES(?,?,?,?,?,?,?,?,?)`).run(input.operationId,input.principalId,input.authorPeerId,input.libraryId,input.assetId,operationType,input.requestFingerprint,JSON.stringify(result),input.createdAt);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'asset.favorite.set', resourceType: 'asset', libraryId: input.libraryId, resourceId: input.assetId,
+          outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
         return result;
       }
       if (!this.registerAuthor(input.libraryId,input.authorPeerId,input.createdAt)) return 'author_limit';
@@ -41,7 +57,12 @@ export class FavoriteSyncRepository {
       this.db.prepare(`INSERT INTO favorite_operations VALUES(?,?,?,?,?,?,?,?,?)`).run(input.operationId,input.principalId,input.authorPeerId,input.libraryId,input.assetId,operationType,input.requestFingerprint,JSON.stringify(result),input.createdAt);
       if(input.favorite)this.db.prepare('INSERT INTO favorite_add_tokens VALUES(?,?,?,?,?)').run(event.eventId,input.libraryId,input.assetId,input.authorPeerId,input.createdAt);
       else this.addRemoveTargets(event.eventId,input.libraryId,input.assetId,parents);
-      this.refresh(input.libraryId,input.assetId); return result;
+      this.refresh(input.libraryId,input.assetId);
+      appendMetadataAudit(this.auditRepository, {
+        action: 'asset.favorite.set', resourceType: 'asset', libraryId: input.libraryId, resourceId: input.assetId,
+        outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
+      return result;
     }).immediate();
   }
   getFavorite(libraryId:string,assetId:string):boolean { return Boolean(this.db.prepare('SELECT 1 FROM asset_favorites WHERE library_id=? AND asset_id=?').get(libraryId,assetId)); }

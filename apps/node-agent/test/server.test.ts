@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { request as rawHttpRequest } from 'node:http';
 import { Readable } from 'node:stream';
-import { createNodeAgentServer, type MediaVersionServerControl, type NodeAgentServerOptions, type PairingServerControl } from '../src/server.js';
+import {
+  createNodeAgentServer, type AssetFavoriteMutationRequest, type AssetRatingMutationRequest,
+  type MediaVersionServerControl, type NodeAgentServerOptions, type PairingServerControl
+} from '../src/server.js';
 import { MediaThumbnailService } from '../src/media/thumbnail-service.js';
 import type { MediaThumbnailTransformer } from '../src/media/image-transformer.js';
 import { RepositoryConflictError, type MediaVersionSourceRecord } from '../src/db/repository.js';
@@ -91,6 +95,105 @@ describe('node-agent health endpoint', () => {
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ error: 'not_found' });
     expect(response.headers.get('x-request-id')).toBeTruthy();
+  });
+
+  it('does not reflect malformed request IDs and uses one ID in header and error body', async () => {
+    const malformed = 'A'.repeat(65);
+    const response = await request('/private', {}, { headers: { 'x-request-id': malformed } });
+    const body = await response.json() as { requestId: string };
+    const responseId = response.headers.get('x-request-id');
+    expect(responseId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+    expect(responseId).not.toBe(malformed);
+    expect(body.requestId).toBe(responseId);
+  });
+
+  it('treats duplicate raw request-ID headers as invalid even when their values match', async () => {
+    const server = createNodeAgentServer();
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected an ephemeral TCP address');
+    const result = await new Promise<{ responseId: string | null; body: string }>((resolve, reject) => {
+      const outgoing = rawHttpRequest({ hostname: '127.0.0.1', port: address.port, path: '/private', method: 'GET',
+        headers: { 'x-request-id': ['duplicate-value', 'duplicate-value'] } }, (incoming) => {
+        let body = '';
+        incoming.setEncoding('utf8');
+        incoming.on('data', (chunk: string) => { body += chunk; });
+        incoming.on('end', () => resolve({ responseId: incoming.headers['x-request-id'] as string | undefined ?? null, body }));
+      });
+      outgoing.on('error', reject);
+      outgoing.end();
+    });
+    const body = JSON.parse(result.body) as { requestId: string };
+    expect(result.responseId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+    expect(result.responseId).not.toBe('duplicate-value');
+    expect(body.requestId).toBe(result.responseId);
+  });
+});
+
+describe('HTTP mutation request ID propagation', () => {
+  it('passes the selected request ID to favorite and rating controls', async () => {
+    let favoriteInput: AssetFavoriteMutationRequest | undefined;
+    let ratingInput: AssetRatingMutationRequest | undefined;
+    const options: NodeAgentServerOptions = {
+      authorizeLibraryRead: (token, libraryId) => token === 'admin' && libraryId === 'family' ? 'local-admin' : undefined,
+      assetFavorites: { setAssetFavorite: (input) => { favoriteInput = input; return { status: 'changed', favorite: input.favorite }; } },
+      assetRatings: { setAssetRating: (input) => {
+        ratingInput = input;
+        return { status: 'changed', rating: input.rating, conflict: false, ratingCandidates: input.rating === null ? [null] : [input.rating] };
+      } }
+    };
+    const malformedFavoriteRequestId = 'invalid request id';
+    const ratingRequestId = 'rating-request';
+    const favorite = await request('/v1/libraries/family/assets/asset-1/favorite', options, {
+      method: 'PUT', headers: { authorization: 'Bearer admin', 'content-type': 'application/json',
+        'idempotency-key': '123e4567-e89b-42d3-a456-426614174001', 'x-request-id': malformedFavoriteRequestId },
+      body: JSON.stringify({ favorite: true })
+    });
+    const rating = await request('/v1/libraries/family/assets/asset-1/rating', options, {
+      method: 'PUT', headers: { authorization: 'Bearer admin', 'content-type': 'application/json',
+        'idempotency-key': '123e4567-e89b-42d3-a456-426614174002', 'x-request-id': ratingRequestId },
+      body: JSON.stringify({ rating: null })
+    });
+    expect(favorite.status).toBe(200);
+    expect(rating.status).toBe(200);
+    const selectedFavoriteRequestId = favorite.headers.get('x-request-id');
+    expect(selectedFavoriteRequestId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+    expect(selectedFavoriteRequestId).not.toBe(malformedFavoriteRequestId);
+    expect(favoriteInput).toMatchObject({ requestId: selectedFavoriteRequestId, assetId: 'asset-1', favorite: true });
+    expect(ratingInput).toMatchObject({ requestId: ratingRequestId, assetId: 'asset-1', rating: null });
+  });
+
+  it('passes request IDs to every authorized virtual-album mutation', async () => {
+    const ids = ['album-create', 'album-delete', 'album-restore', 'member-add', 'member-remove'];
+    const calls: Array<{ requestId: string; operationId: string }> = [];
+    const record = (input: { requestId: string; operationId: string }) => { calls.push(input); };
+    const albums: NonNullable<NodeAgentServerOptions['albums']> = {
+      listAlbums: () => ({ items: [], nextCursor: null }),
+      createAlbum: (input) => {
+        record(input);
+        return { albumId: 'album-1', libraryId: input.libraryId, title: input.title, createdByPeerId: 'node-local', createdAt: input.createdAt };
+      },
+      listMembers: () => ({ items: [], nextCursor: null }),
+      addMember: (input) => { record(input); return { status: 'added' }; },
+      removeMember: (input) => { record(input); return { status: 'removed' }; },
+      deleteAlbum: (input) => { record(input); return 'deleted'; },
+      restoreAlbum: (input) => { record(input); return 'restored'; }
+    };
+    const options: NodeAgentServerOptions = {
+      authorizePairingAdmin: (token) => token === 'admin',
+      authorizeLibraryRead: (token, libraryId) => token === 'admin' && libraryId === 'family' ? 'local-admin' : undefined,
+      gallery: { listLibraries: () => [{ libraryId: 'family', title: 'family' }] } as NonNullable<NodeAgentServerOptions['gallery']>,
+      albums
+    };
+    const headers = (index: number, json = false) => ({ authorization: 'Bearer admin', 'idempotency-key': `123e4567-e89b-42d3-a456-42661417400${index + 3}`,
+      'x-request-id': ids[index]!, ...(json ? { 'content-type': 'application/json' } : {}) });
+    expect((await request('/v1/libraries/family/albums', options, { method: 'POST', headers: headers(0, true), body: JSON.stringify({ title: 'Trip' }) })).status).toBe(201);
+    expect((await request('/v1/libraries/family/albums/album-1/deletion', options, { method: 'POST', headers: headers(1, true), body: JSON.stringify({ scope: 'local' }) })).status).toBe(204);
+    expect((await request('/v1/libraries/family/albums/album-1/restore', options, { method: 'POST', headers: headers(2, true), body: JSON.stringify({ scope: 'local' }) })).status).toBe(204);
+    expect((await request('/v1/libraries/family/albums/album-1/members/asset-1', options, { method: 'PUT', headers: headers(3) })).status).toBe(204);
+    expect((await request('/v1/libraries/family/albums/album-1/members/asset-1', options, { method: 'DELETE', headers: headers(4) })).status).toBe(204);
+    expect(calls.map(({ requestId }) => requestId)).toEqual(ids);
   });
 });
 

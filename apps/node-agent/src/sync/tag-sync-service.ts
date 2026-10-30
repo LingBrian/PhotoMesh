@@ -54,17 +54,17 @@ export class TagSyncService {
     this.repository.recordOfferFailure(peerId, events.map((event) => event.eventId), 'peer_missing_asset_tags_v1');
   }
 
-  async addAssetTag(libraryId: string, assetId: string, tag: string, createdAt = this.now()): Promise<TagMutationResult> {
+  async addAssetTag(libraryId: string, assetId: string, tag: string, createdAt = this.now(), requestId?: string): Promise<TagMutationResult> {
     const result = this.repository.addLocalTag({
-      libraryId, assetId, tag, authorPeerId: this.identity.peerId, createdAt, draftFactory: this.eventDraftFactory()
+      libraryId, assetId, tag, authorPeerId: this.identity.peerId, createdAt, requestId, draftFactory: this.eventDraftFactory()
     });
     await this.signPendingLocalEvents();
     return result;
   }
 
-  async removeAssetTag(libraryId: string, assetId: string, tag: string): Promise<TagMutationResult> {
+  async removeAssetTag(libraryId: string, assetId: string, tag: string, createdAt = this.now(), requestId?: string): Promise<TagMutationResult> {
     const result = this.repository.removeLocalTag({
-      libraryId, assetId, tag, authorPeerId: this.identity.peerId, createdAt: this.now(), draftFactory: this.eventDraftFactory()
+      libraryId, assetId, tag, authorPeerId: this.identity.peerId, createdAt, requestId, draftFactory: this.eventDraftFactory()
     });
     await this.signPendingLocalEvents();
     return result;

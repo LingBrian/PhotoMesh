@@ -1,9 +1,10 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
+import { AuditRepository } from '../src/audit/audit-repository.js';
 import { loadOrCreateLocalIdentity } from '../src/auth/local-identity.js';
 import { migrations } from '../src/db/migrations.js';
 import { SqliteRepository } from '../src/db/repository.js';
-import { makeUnsignedEvent, signEvent } from '../src/sync/event-envelope.js';
+import { makeUnsignedEvent, signEvent, type EventEnvelope } from '../src/sync/event-envelope.js';
 import { SyncRepository } from '../src/sync/sync-repository.js';
 import { TagSyncRepository, type TagEventDraftFactory } from '../src/sync/tag-sync-repository.js';
 
@@ -382,5 +383,33 @@ describe('tag sync migration and local OR-Set persistence', () => {
       createdAt: now, draftFactory: draftFactory('family', identity.peerId) })).toBe('not_found');
     expect(tags.addLocalTag({ libraryId: 'family', assetId: 'missing', tag: 'unknown', authorPeerId: identity.peerId,
       createdAt: now, draftFactory: draftFactory('family', identity.peerId) })).toBe('not_found');
+  });
+
+  it('records tag applied and unchanged outcomes and rolls back the event draft on audit failure', async () => {
+    const db = new Database(':memory:');
+    databases.push(db);
+    const repository = new SqliteRepository(db);
+    await repository.migrate();
+    seedLocalAsset(db);
+    const identity = await createIdentity(repository);
+    await seedIndexedAsset(db, identity);
+    const audit = new AuditRepository(db);
+    const tags = new TagSyncRepository(db, () => now, audit);
+    const factory = draftFactory('family', identity.peerId);
+    const base = { libraryId: 'family', assetId: 'asset-1', tag: 'Private tag', authorPeerId: identity.peerId, createdAt: now, draftFactory: factory };
+
+    expect(tags.addLocalTag({ ...base, requestId: 'tag-add' })).toBe('added');
+    expect(tags.addLocalTag({ ...base, requestId: 'tag-add-noop' })).toBe('already_present');
+    tags.completeLocalDraft({ ...tags.getUnsignedLocalDrafts(identity.peerId)[0]!, signature: 'A'.repeat(86) } as EventEnvelope);
+    expect(tags.removeLocalTag({ ...base, requestId: 'tag-remove' })).toBe('removed');
+    tags.completeLocalDraft({ ...tags.getUnsignedLocalDrafts(identity.peerId)[0]!, signature: 'B'.repeat(86) } as EventEnvelope);
+    expect(tags.removeLocalTag({ ...base, requestId: 'tag-remove-noop' })).toBe('unchanged');
+
+    db.exec(`CREATE TRIGGER fail_metadata_audit BEFORE INSERT ON metadata_audit_events
+      BEGIN SELECT RAISE(ABORT, 'audit insert rejected'); END`);
+    expect(() => tags.addLocalTag({ ...base, tag: 'Blocked tag', requestId: 'tag-failed' })).toThrow('audit insert rejected');
+    expect(tags.getAssetTags('family', 'asset-1')).toEqual([]);
+    expect(db.prepare('SELECT count(*) AS count FROM tag_sync_event_log').get()).toEqual({ count: 2 });
+    expect(db.prepare('SELECT count(*) AS count FROM metadata_audit_events').get()).toEqual({ count: 4 });
   });
 });

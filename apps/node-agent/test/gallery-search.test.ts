@@ -226,7 +226,7 @@ describe('PM-048 gallery search index and cursor', () => {
       const repository = new SqliteRepository(db, { backupBeforeMigration: async () => { backupCalls += 1; } });
       await repository.migrate(migrations.slice(0, 11));
       const previous = db.prepare("SELECT checksum FROM schema_migrations WHERE migration_id='0011_gallery_search_index'").get();
-      await repository.migrate(migrations);
+      await repository.migrate(migrations.slice(0, 12));
       expect(backupCalls).toBe(1);
       expect(db.prepare('SELECT migration_id FROM schema_migrations ORDER BY migration_id DESC LIMIT 1').get())
         .toEqual({ migration_id: '0012_gallery_filter_indexes' });
@@ -317,7 +317,7 @@ describe('PM-048 gallery search index and cursor', () => {
       await expect(pm048Binary.migrate(migrations.slice(0, 11))).rejects.toThrow(/unknown migration 0012_gallery_filter_indexes/i);
       const oldBinary = new SqliteRepository(db);
       await expect(oldBinary.migrate(migrations.slice(0, 10))).rejects.toThrow(/unknown migration 0011_gallery_search_index/i);
-      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 12 });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get()).toEqual({ count: 13 });
     } finally {
       db.close();
     }

@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { appendMetadataAudit, type AuditRepository } from '../audit/audit-repository.js';
 import {
   eventDigest, isRatingSyncEventType, makeUnsignedEvent, parseEventEnvelope,
   type EventEnvelope, type UnsignedEventEnvelope
@@ -29,11 +30,15 @@ interface InboxRow extends EventRow { peer_id: string; accepted_at: string | nul
 interface OperationRow { request_fingerprint: string; result_json: string }
 
 export class RatingSyncRepository {
-  constructor(private readonly db: Database.Database, private readonly now: () => string = () => new Date().toISOString()) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly auditRepository?: AuditRepository
+  ) {}
 
   setRating(input: {
     operationId: string; principalId: string; authorPeerId: string; libraryId: string; assetId: string;
-    rating: number | null; requestFingerprint: string; createdAt: string;
+    rating: number | null; requestFingerprint: string; createdAt: string; requestId?: string;
   }): RatingSetResult {
     if (!(input.rating === null || (Number.isInteger(input.rating) && input.rating >= 1 && input.rating <= 5))) {
       throw new RatingSyncConflictError('rating must be an integer from 1 to 5 or null');
@@ -43,6 +48,11 @@ export class RatingSyncRepository {
         .get(input.operationId) as OperationRow | undefined;
       if (prior) {
         if (prior.request_fingerprint !== input.requestFingerprint) throw new RatingSyncConflictError('rating operation ID reused with different request');
+        appendMetadataAudit(this.auditRepository, {
+          action: input.rating === null ? 'asset.rating.clear' : 'asset.rating.set', resourceType: 'asset',
+          libraryId: input.libraryId, resourceId: input.assetId, outcome: 'replayed',
+          requestId: input.requestId, createdAt: input.createdAt
+        });
         return JSON.parse(prior.result_json) as RatingSetResult;
       }
       if (!this.visible(input.libraryId, input.assetId)) return 'not_found';
@@ -56,6 +66,11 @@ export class RatingSyncRepository {
         this.db.prepare(`INSERT INTO rating_operations(operation_id,principal_id,author_peer_id,library_id,asset_id,operation_type,request_fingerprint,result_json,created_at)
           VALUES(?,?,?,?,?,'rating.noop',?,?,?)`).run(input.operationId, input.principalId, input.authorPeerId, input.libraryId,
           input.assetId, input.requestFingerprint, JSON.stringify(result), input.createdAt);
+        appendMetadataAudit(this.auditRepository, {
+          action: input.rating === null ? 'asset.rating.clear' : 'asset.rating.set', resourceType: 'asset',
+          libraryId: input.libraryId, resourceId: input.assetId, outcome: 'unchanged',
+          requestId: input.requestId, createdAt: input.createdAt
+        });
         return result;
       }
       const head = this.db.prepare('SELECT author_sequence,event_id,ready FROM rating_sync_author_heads WHERE library_id=? AND author_peer_id=?')
@@ -83,6 +98,11 @@ export class RatingSyncRepository {
         input.assetId, input.requestFingerprint, JSON.stringify(result), input.createdAt);
       this.insertRatingValue(event, input.assetId, input.rating, observed);
       this.refreshProjection(input.libraryId, input.assetId);
+      appendMetadataAudit(this.auditRepository, {
+        action: input.rating === null ? 'asset.rating.clear' : 'asset.rating.set', resourceType: 'asset',
+        libraryId: input.libraryId, resourceId: input.assetId, outcome: 'applied',
+        requestId: input.requestId, createdAt: input.createdAt
+      });
       return { ...this.getRating(input.libraryId, input.assetId), status: 'changed' };
     }).immediate();
   }

@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
 import QRCode from 'qrcode';
 import { getDiagnostics, getHealth, type HealthDiagnosticsSource } from './health.js';
+import { resolveRequestId } from './audit/request-id.js';
 import { UploadError, UploadService, type CreateUploadRequest } from './uploads/service.js';
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
@@ -55,6 +56,7 @@ export interface AlbumMutationRequest {
   requestFingerprint: string;
   libraryId: string;
   createdAt: string;
+  requestId: string;
 }
 
 export type AlbumDeleteScope = 'local' | 'global';
@@ -107,13 +109,13 @@ export interface ThumbnailServerControl {
 }
 
 export interface AssetTagServerControl {
-  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
-  removeAssetTag(libraryId: string, assetId: string, tag: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
+  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string, requestId: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
+  removeAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string, requestId: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
 }
 
 export interface AssetFavoriteMutationRequest {
   operationId: string; principalId: string; requestFingerprint: string; libraryId: string; assetId: string;
-  favorite: boolean; createdAt: string;
+  favorite: boolean; createdAt: string; requestId: string;
 }
 export type AssetFavoriteMutationResult = { status: 'changed' | 'unchanged'; favorite: boolean } | 'not_found' | 'author_limit';
 export interface AssetFavoriteServerControl {
@@ -122,7 +124,7 @@ export interface AssetFavoriteServerControl {
 
 export interface AssetRatingMutationRequest {
   operationId: string; principalId: string; requestFingerprint: string; libraryId: string; assetId: string;
-  rating: number | null; createdAt: string;
+  rating: number | null; createdAt: string; requestId: string;
 }
 export interface AssetRatingState { rating: number | null; conflict: boolean; ratingCandidates: Array<number | null> }
 export type AssetRatingMutationResult = (AssetRatingState & { status: 'changed' | 'unchanged' }) |
@@ -181,7 +183,7 @@ export function createNodeAgentServer(options: NodeAgentServerOptions = {}) {
   const allowedWebOrigins = normalizeAllowedWebOrigins(options.allowedWebOrigins ?? []);
   return createServer((request, response) => {
     setCorsHeaders(request, response, allowedWebOrigins);
-    const requestId = headerValue(request, 'x-request-id') ?? randomUUID();
+    const requestId = resolveRequestId(request.rawHeaders);
     response.setHeader('x-request-id', requestId);
     if (request.method === 'OPTIONS') {
       response.writeHead(204, { 'access-control-max-age': '600' });
@@ -456,9 +458,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (!tag) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
     const control = options.assetTags;
     if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const createdAt = new Date().toISOString();
     const result = request.method === 'PUT'
-      ? await control.addAssetTag(libraryId, assetId, tag, new Date().toISOString())
-      : await control.removeAssetTag(libraryId, assetId, tag);
+      ? await control.addAssetTag(libraryId, assetId, tag, createdAt, requestId)
+      : await control.removeAssetTag(libraryId, assetId, tag, createdAt, requestId);
     if (result === 'not_found') { sendJson(response, 404, { error: 'not_found', requestId }); return; }
     if (result === 'limit_reached') { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
     const successful = request.method === 'PUT'
@@ -492,7 +495,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       const result = await control.setAssetFavorite({
         operationId, principalId, libraryId, assetId, favorite: body.favorite,
         requestFingerprint: favoriteRequestFingerprint(principalId, libraryId, assetId, body.favorite),
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(), requestId
       });
       if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
       else if (result === 'author_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
@@ -527,7 +530,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       const result = await control.setAssetRating({
         operationId, principalId, libraryId, assetId, rating: body.rating,
         requestFingerprint: ratingRequestFingerprint(principalId, libraryId, assetId, body.rating),
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(), requestId
       });
       if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
       else if (result === 'author_limit' || result === 'conflict_limit') {
@@ -721,7 +724,7 @@ async function handleAlbumRequest(
     }
     const input = {
       libraryId, albumId: albumId!, scope: body.scope as AlbumDeleteScope, operationId, principalId,
-      requestFingerprint: albumRequestFingerprint(principalId, 'POST', libraryId, albumId, undefined, { scope: body.scope }), createdAt
+      requestFingerprint: albumRequestFingerprint(principalId, 'POST', libraryId, albumId, undefined, { scope: body.scope }), createdAt, requestId
     };
     try {
       if (deletion) {
@@ -760,7 +763,7 @@ async function handleAlbumRequest(
       const created = await control.createAlbum({
         libraryId, title, operationId, principalId,
         requestFingerprint: albumRequestFingerprint(principalId, 'POST', libraryId, undefined, undefined, { title }),
-        createdAt
+        createdAt, requestId
       });
       if (created === 'writer_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
       else if (!created) sendJson(response, 404, { error: 'not_found', requestId });
@@ -782,7 +785,7 @@ async function handleAlbumRequest(
     const input = {
       libraryId, albumId: albumId!, assetId: assetId!, operationId, principalId,
       requestFingerprint: albumRequestFingerprint(principalId, method, libraryId, albumId, assetId, null),
-      createdAt
+      createdAt, requestId
     };
     const result = method === 'PUT' ? await control.addMember(input) : await control.removeMember(input);
     if (result.status === 'not_found') {

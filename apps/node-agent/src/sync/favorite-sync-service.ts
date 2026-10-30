@@ -57,7 +57,7 @@ export class FavoriteSyncService {
   hello(): SyncHello { return this.helloProvider(); }
 
   async setAssetFavorite(input: {
-    operationId: string; principalId: string; libraryId: string; assetId: string; favorite: boolean; requestFingerprint: string; createdAt?: string;
+    operationId: string; principalId: string; libraryId: string; assetId: string; favorite: boolean; requestFingerprint: string; createdAt?: string; requestId?: string;
   }): Promise<FavoriteSetResult> {
     const result = this.repository.setFavorite({
       ...input, authorPeerId: this.identity.peerId, createdAt: input.createdAt ?? this.now()

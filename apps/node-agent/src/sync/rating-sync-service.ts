@@ -58,7 +58,7 @@ export class RatingSyncService {
 
   async setAssetRating(input: {
     operationId: string; principalId: string; libraryId: string; assetId: string;
-    rating: number | null; requestFingerprint: string; createdAt?: string;
+    rating: number | null; requestFingerprint: string; createdAt?: string; requestId?: string;
   }): Promise<RatingSetResult> {
     const result = this.repository.setRating({
       ...input, authorPeerId: this.identity.peerId, createdAt: input.createdAt ?? this.now()

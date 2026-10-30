@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
+import { AuditRepository } from '../src/audit/audit-repository.js';
 import { migrations } from '../src/db/migrations.js';
 import { SqliteRepository } from '../src/db/repository.js';
 import { RatingSyncRepository } from '../src/sync/rating-sync-repository.js';
@@ -150,6 +151,38 @@ describe('PM-047 rating register persistence', () => {
       db.prepare("UPDATE sync_asset_projection SET tombstone_event_id=NULL,restored_by_event_id=? WHERE library_id='family' AND asset_id='asset-restore'").run(uuid(24));
       repo.rebuildRatingProjectionForAsset('family', 'asset-restore');
       expect(repo.getRating('family', 'asset-restore')).toEqual({ rating: 5, conflict: false, ratingCandidates: [5] });
+    } finally { db.close(); }
+  });
+
+  it('atomically audits rating applied, unchanged, replayed, and rejected writes', async () => {
+    const db = new Database(':memory:');
+    try {
+      await new SqliteRepository(db).migrate();
+      db.prepare(`INSERT INTO assets(asset_id,library_id,origin_node_id,kind,created_at) VALUES('asset-audit','family',?,'photo',?)`).run(authorPeerId, now);
+      insertIndexEvent(db, uuid(80), 'asset-audit');
+      const audit = new AuditRepository(db);
+      const repo = new RatingSyncRepository(db, () => now, audit);
+      const input = {
+        operationId: uuid(81), principalId: 'local-admin', authorPeerId, libraryId: 'family', assetId: 'asset-audit',
+        rating: 4, requestFingerprint: 'a'.repeat(64), createdAt: now, requestId: 'rating-applied'
+      };
+      expect(repo.setRating(input)).toMatchObject({ status: 'changed', rating: 4 });
+      expect(repo.setRating({ ...input, requestId: 'rating-replay' })).toMatchObject({ status: 'changed', rating: 4 });
+      expect(repo.setRating({ ...input, operationId: uuid(82), requestFingerprint: 'b'.repeat(64), requestId: 'rating-unchanged' }))
+        .toMatchObject({ status: 'unchanged', rating: 4 });
+      repo.completeLocalDraft({ ...repo.getUnsignedLocalDrafts(authorPeerId)[0]!, signature: 'A'.repeat(86) } as EventEnvelope);
+      db.exec(`CREATE TRIGGER fail_metadata_audit BEFORE INSERT ON metadata_audit_events
+        BEGIN SELECT RAISE(ABORT, 'audit insert rejected'); END`);
+      expect(() => repo.setRating({ ...input, operationId: uuid(83), rating: 2, requestFingerprint: 'c'.repeat(64), requestId: 'rating-failed' }))
+        .toThrow('audit insert rejected');
+      expect(repo.getRating('family', 'asset-audit')).toMatchObject({ rating: 4, conflict: false });
+      expect(db.prepare('SELECT count(*) AS count FROM rating_operations').get()).toEqual({ count: 2 });
+      expect(db.prepare('SELECT count(*) AS count FROM rating_sync_event_log').get()).toEqual({ count: 1 });
+      expect(db.prepare('SELECT action,outcome,request_id FROM metadata_audit_events ORDER BY audit_id').all()).toEqual([
+        { action: 'asset.rating.set', outcome: 'applied', request_id: 'rating-applied' },
+        { action: 'asset.rating.set', outcome: 'replayed', request_id: 'rating-replay' },
+        { action: 'asset.rating.set', outcome: 'unchanged', request_id: 'rating-unchanged' }
+      ]);
     } finally { db.close(); }
   });
 });

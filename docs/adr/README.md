@@ -9,4 +9,4 @@
 - [ADR-022：PM-049 日期/类型/来源/可用性组合筛选](ADR-022-pm049-filter-combinations.md) — 组合筛选、v2 条件绑定 cursor 与 append-only 0012 索引迁移已实现；100k 文件型 HTTP/WAL 与契约测试通过；未执行生产迁移。
 - [ADR-023：PM-050 Web 搜索状态与键盘体验](ADR-023-pm050-search-experience.md) — 双语、能力门控、键盘操作、空态/重试与查询词隐私保护已实现；根级验证和 23 项 Playwright（含 100k）通过；未 push/merge/release。
 - [ADR-024：PM-051 Web 批量选择与可逆元数据操作](ADR-024-pm051-bulk-metadata-operations.md) — 最多 100 项、图库范围清晰、标签/共享收藏逐项可重试，未新增 API/迁移；根级验证与 27 项 Playwright（含 100k 与会话中断处理）通过；未 push/merge/release。
-- [ADR-025：PM-052 关键元数据变更审计事件](ADR-025-pm052-metadata-audit-events.md) — **提案，等待用户明确批准**；建议追加本地 `0013` 审计迁移。尚未修改产品代码或 schema。
+- [ADR-025：PM-052 关键元数据变更审计事件](ADR-025-pm052-metadata-audit-events.md) — 用户已批准；本地 `0013` 审计迁移、SHA-256 标识 digest、scope attribution 与 fail-closed 写入均已实现验证，不授权生产迁移。

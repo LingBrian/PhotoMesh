@@ -203,10 +203,10 @@
 - **验证：** 根级依赖安装、lint、typecheck、test、contracts:check、build 通过；Playwright 全套 27/27（含 100k 分页和会话切换时在途操作状态摘要）通过；界面截图见 [PM-051 批量操作](screenshots/pm051-bulk-operations.png)。
 - **边界：** 仅隔离 worktree 与本地 Conventional Commit；不 push、merge、release、部署或执行生产迁移。
 
-## ADR-025：PM-052 关键元数据变更审计事件（提案）
+## ADR-025：PM-052 关键元数据变更审计事件（已批准）
 
-- **状态：** 等待用户明确批准；提案见 [ADR-025](adr/ADR-025-pm052-metadata-audit-events.md)。未实现产品代码或数据库变更。
-- **建议：** 仅对已授权的标签、收藏、评分与虚拟相册写请求记录 `applied/unchanged/replayed`；排除拒绝/失败请求及配对/授权控制面。`local-admin` 仅是主体类别；request ID 使用严格 1–64 ASCII 校验，缺失/非法/重复时生成 UUID。只存本地不透明资源 ID 与 action/outcome/request/time，不存 token、请求体、路径、文件名、元数据值或照片明文；不新增读取 API/UI/P2P 同步。
-- **完整性/保留：** 推荐无限期保留（接受无界磁盘增长、无自动清理），append-only 仅是应用层保证，本机数据库所有者仍可篡改；ID 仍可关联资产，故仅本地保存、不网络暴露。
-- **兼容/恢复：** 需追加迁移 `0013_metadata_audit_events`，审计写失败必须导致业务写事务回滚；不改写旧迁移，迁移前备份和恢复验证必需。旧版本拒绝未知 schema，回滚需恢复备份；未授权执行生产迁移。
-- **待确认：** 动作与失败范围、`local-admin` actor 语义、request ID 边界、无限期保留/append-only 保证及兼容方案均需明确批准。获批准前不实现任何 schema/API/协议变化。
+- **状态：** 用户已于 2026-10-30 批准推荐范围与迁移方案；隔离 worktree 本地实现/验证已完成，记录于 [ADR-025](adr/ADR-025-pm052-metadata-audit-events.md)；不授权生产迁移。
+- **决定：** 仅对授权成功的标签、收藏、评分与虚拟相册写请求记录 `applied/unchanged/replayed`；排除拒绝/失败请求及配对/授权控制面。`local-admin` 仅是主体类别；request ID 使用严格 1–64 ASCII 校验，缺失/非法/重复时生成 UUID。只存本地 domain-separated SHA-256 库/资源 ID digest 与 action/scope/outcome/request/time，不存原始 ID、token、请求体、路径、文件名、元数据值或照片明文；不新增读取 API/UI/P2P 同步。
+- **完整性/保留：** 无限期保留（接受无界磁盘增长、无自动清理），append-only 仅是应用层保证，本机数据库所有者仍可篡改；ID 仍可关联资产，故仅本地保存、不网络暴露。
+- **兼容/恢复：** 追加迁移 `0013_metadata_audit_events`，审计写失败必须导致业务写事务回滚；不改写旧迁移，迁移前备份和恢复验证必需。旧版本拒绝未知 schema，回滚需恢复备份；未授权执行生产迁移。
+- **权限边界：** 可在隔离分支完成本地源码、测试和 Conventional Commit；生产迁移、push、merge、release、deploy 各自仍需明确授权。

@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { describe, expect, it, vi } from 'vitest';
+import { AuditRepository } from '../src/audit/audit-repository.js';
 import { migrations } from '../src/db/migrations.js';
 import { SqliteRepository } from '../src/db/repository.js';
 import { FavoriteSyncRepository } from '../src/sync/favorite-sync-repository.js';
@@ -184,6 +185,36 @@ describe('PM-046 asset favorite migration and global event IDs', () => {
       repo.rebuildFavoriteProjectionForAsset('family','asset-restore');
       expect(repo.getFavorite('family','asset-restore')).toBe(true);
       expect(new SqliteRepository(db).listGalleryAssets('family', undefined, 10).items.find(({ assetId }) => assetId === 'asset-restore')?.favorite).toBe(true);
+    } finally { db.close(); }
+  });
+
+  it('atomically audits changed and replayed favorite writes and rolls back on audit failure', async () => {
+    const db = new Database(':memory:');
+    try {
+      await new SqliteRepository(db).migrate();
+      db.prepare(`INSERT INTO assets(asset_id,library_id,origin_node_id,kind,created_at) VALUES('asset-audit','family',?,'photo',?)`).run(peerId, now);
+      db.prepare(`INSERT INTO sync_event_log(event_id,library_id,author_peer_id,author_sequence,protocol_version,schema_version,event_type,causal_parents_json,payload_json,created_at,signature,envelope_json,state)
+        VALUES(?,'family',?,1,1,1,'asset.indexed','[]',?,?,'sig','{}','ready')`).run(uuid(80), peerId, JSON.stringify({ assetId: 'asset-audit' }), now);
+      const audit = new AuditRepository(db);
+      const repo = new FavoriteSyncRepository(db, () => now, audit);
+      const input = {
+        operationId: uuid(81), principalId: 'local-admin', authorPeerId: peerId, libraryId: 'family', assetId: 'asset-audit',
+        favorite: true, requestFingerprint: 'a'.repeat(64), createdAt: now, requestId: 'favorite-applied'
+      };
+      expect(repo.setFavorite(input)).toMatchObject({ status: 'changed', favorite: true });
+      expect(repo.setFavorite({ ...input, requestId: 'favorite-replay' })).toMatchObject({ status: 'changed', favorite: true });
+      repo.completeLocalDraft({ ...repo.getUnsignedLocalDrafts(peerId)[0]!, signature: 'A'.repeat(86) } as EventEnvelope);
+      db.exec(`CREATE TRIGGER fail_metadata_audit BEFORE INSERT ON metadata_audit_events
+        BEGIN SELECT RAISE(ABORT, 'audit insert rejected'); END`);
+      expect(() => repo.setFavorite({ ...input, operationId: uuid(82), favorite: false, requestFingerprint: 'b'.repeat(64), requestId: 'favorite-failed' }))
+        .toThrow('audit insert rejected');
+      expect(repo.getFavorite('family', 'asset-audit')).toBe(true);
+      expect(db.prepare('SELECT count(*) AS count FROM favorite_operations').get()).toEqual({ count: 1 });
+      expect(db.prepare('SELECT count(*) AS count FROM favorite_sync_event_log').get()).toEqual({ count: 1 });
+      expect(db.prepare('SELECT action,outcome,request_id FROM metadata_audit_events ORDER BY audit_id').all()).toEqual([
+        { action: 'asset.favorite.set', outcome: 'applied', request_id: 'favorite-applied' },
+        { action: 'asset.favorite.set', outcome: 'replayed', request_id: 'favorite-replay' }
+      ]);
     } finally { db.close(); }
   });
 });

@@ -1769,5 +1769,38 @@ export const migrations: readonly Migration[] = [
       CREATE INDEX gallery_search_content_availability_capture_idx
         ON gallery_search_content(library_id,availability,captured_at DESC,asset_id COLLATE BINARY DESC);
     `
+  },
+  {
+    id: '0013_metadata_audit_events',
+    sql: `
+      CREATE TABLE metadata_audit_events (
+        audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor TEXT NOT NULL CHECK (actor = 'local-admin'),
+        action TEXT NOT NULL CHECK (action IN (
+          'asset.tag.add', 'asset.tag.remove', 'asset.favorite.set', 'asset.rating.set', 'asset.rating.clear',
+          'virtual_album.create', 'virtual_album.member.add', 'virtual_album.member.remove',
+          'virtual_album.delete', 'virtual_album.restore'
+        )),
+        resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'virtual_album', 'virtual_album_member')),
+        library_id TEXT NOT NULL CHECK (length(library_id) = 64 AND library_id NOT GLOB '*[^0-9a-f]*'),
+        resource_id TEXT NOT NULL CHECK (length(resource_id) = 64 AND resource_id NOT GLOB '*[^0-9a-f]*'),
+        related_resource_id TEXT CHECK (
+          related_resource_id IS NULL OR (length(related_resource_id) = 64 AND related_resource_id NOT GLOB '*[^0-9a-f]*')
+        ),
+        scope TEXT CHECK (scope IS NULL OR scope IN ('local','global')),
+        outcome TEXT NOT NULL CHECK (outcome IN ('applied', 'unchanged', 'replayed')),
+        request_id TEXT NOT NULL CHECK (
+          length(request_id) BETWEEN 1 AND 64 AND request_id GLOB '[A-Za-z0-9]*' AND request_id NOT GLOB '*[^A-Za-z0-9._-]*'
+        ),
+        created_at TEXT NOT NULL,
+        CHECK ((resource_type = 'virtual_album_member' AND related_resource_id IS NOT NULL) OR
+          (resource_type <> 'virtual_album_member' AND related_resource_id IS NULL)),
+        CHECK ((action IN ('virtual_album.delete','virtual_album.restore') AND scope IS NOT NULL) OR
+          (action NOT IN ('virtual_album.delete','virtual_album.restore') AND scope IS NULL))
+      );
+      CREATE INDEX metadata_audit_request_idx ON metadata_audit_events(request_id);
+      CREATE INDEX metadata_audit_resource_idx ON metadata_audit_events(library_id, resource_type, resource_id, audit_id);
+      CREATE INDEX metadata_audit_time_idx ON metadata_audit_events(created_at, audit_id);
+    `
   }
 ];

@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { appendMetadataAudit, type AuditRepository } from '../audit/audit-repository.js';
 import { eventDigest, isTagSyncEventType, parseEventEnvelope, type EventContext, type EventEnvelope, type JsonValue, type TagSyncEventType, type UnsignedEventEnvelope } from './event-envelope.js';
 import { maxObservedTagAdds, validateTagOperationPayload } from './tag-orset.js';
 
@@ -44,16 +45,26 @@ interface TagInboxRow { event_id: string; library_id: string; author_peer_id: st
 interface TagSeedRow { library_id: string; asset_id: string; tag: string; created_at: string; state: string; seed_event_id: string | null }
 
 export class TagSyncRepository {
-  constructor(private readonly db: Database.Database, private readonly now: () => string = () => new Date().toISOString()) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly auditRepository?: AuditRepository
+  ) {}
 
   addLocalTag(input: {
-    libraryId: string; assetId: string; tag: string; authorPeerId: string; createdAt: string; draftFactory: TagEventDraftFactory;
+    libraryId: string; assetId: string; tag: string; authorPeerId: string; createdAt: string; draftFactory: TagEventDraftFactory; requestId?: string | undefined;
   }): TagMutationResult {
     const write = this.db.transaction((): TagMutationResult => {
       if (!this.hasKnownAsset(input.libraryId, input.assetId) || !this.hasAssetProjectionHead(input.libraryId, input.assetId) ||
           !this.isVisibleAsset(input.libraryId, input.assetId)) return 'not_found';
       if (this.db.prepare('SELECT 1 FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
-        .get(input.libraryId, input.assetId, input.tag)) return 'already_present';
+        .get(input.libraryId, input.assetId, input.tag)) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'asset.tag.add', resourceType: 'asset', libraryId: input.libraryId, resourceId: input.assetId,
+          outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return 'already_present';
+      }
 
       const count = this.countActiveAddsByAuthor(input.libraryId, input.assetId, input.authorPeerId);
       if (count >= maxActiveTagsPerWriterPerAsset) return 'limit_reached';
@@ -64,19 +75,29 @@ export class TagSyncRepository {
         VALUES (?, ?, ?, ?)`).run(input.libraryId, input.assetId, input.tag, draft.eventId);
       this.db.prepare(`INSERT INTO asset_tags (library_id, asset_id, tag, created_at)
         VALUES (?, ?, ?, ?)`).run(input.libraryId, input.assetId, input.tag, input.createdAt);
+      appendMetadataAudit(this.auditRepository, {
+        action: 'asset.tag.add', resourceType: 'asset', libraryId: input.libraryId, resourceId: input.assetId,
+        outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
       return 'added';
     });
     return write.immediate();
   }
 
   removeLocalTag(input: {
-    libraryId: string; assetId: string; tag: string; authorPeerId: string; createdAt: string; draftFactory: TagEventDraftFactory;
+    libraryId: string; assetId: string; tag: string; authorPeerId: string; createdAt: string; draftFactory: TagEventDraftFactory; requestId?: string | undefined;
   }): TagMutationResult {
     const write = this.db.transaction((): TagMutationResult => {
       if (!this.hasKnownAsset(input.libraryId, input.assetId) || !this.hasAssetProjectionHead(input.libraryId, input.assetId) ||
           !this.isVisibleAsset(input.libraryId, input.assetId)) return 'not_found';
       if (!this.db.prepare('SELECT 1 FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
-        .get(input.libraryId, input.assetId, input.tag)) return 'unchanged';
+        .get(input.libraryId, input.assetId, input.tag)) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'asset.tag.remove', resourceType: 'asset', libraryId: input.libraryId, resourceId: input.assetId,
+          outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return 'unchanged';
+      }
 
       const observedAddEventIds = this.activeAddEventIds(input.libraryId, input.assetId, input.tag);
       if (observedAddEventIds.length === 0) throw new TagSyncConflictError('tag projection has no active OR-Set add operation');
@@ -87,6 +108,10 @@ export class TagSyncRepository {
         (library_id, asset_id, tag, add_event_id, remove_event_id) VALUES (?, ?, ?, ?, ?)`);
       for (const addEventId of observedAddEventIds) remove.run(input.libraryId, input.assetId, input.tag, addEventId, draft.eventId);
       this.refreshTagProjection(input.libraryId, input.assetId, input.tag, input.createdAt);
+      appendMetadataAudit(this.auditRepository, {
+        action: 'asset.tag.remove', resourceType: 'asset', libraryId: input.libraryId, resourceId: input.assetId,
+        outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
       return 'removed';
     });
     return write.immediate();
