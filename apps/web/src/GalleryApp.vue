@@ -12,6 +12,7 @@ import {
   formatCaptureTime as displayCaptureTime
 } from './capture-date-display.js';
 import { isAuthorizationFailure, isRequestAborted, revokeObjectUrls, SessionRequestScope } from './session-security.js';
+import { classifyConnectionFailure } from './connection-diagnostics.js';
 import { defaultGalleryCacheSettings, normalizeGalleryCacheSettings, persistentCacheEvictions, type GalleryCacheSettings, type PersistentCacheEntry } from './gallery-cache.js';
 import BackupStatusCard, { type BackupStatusSnapshot } from './BackupStatusCard.vue';
 import './gallery.css';
@@ -1489,12 +1490,15 @@ function tagMutationErrorText(cause: unknown): string {
 }
 function errorText(cause: unknown): string {
   if (isRequestAborted(cause)) return '';
-  if (cause instanceof NodeApiError) {
-    if (cause.status === 401 || cause.status === 403) return t('gallery.authorizationRequired');
-    if (cause.status === 409) return t('gallery.requestConflict');
-    return t('gallery.requestFailedWithStatus', { status: cause.status });
+  if (cause instanceof NodeApiError && cause.status === 409) return t('gallery.requestConflict');
+  switch (classifyConnectionFailure(cause)) {
+    case 'authorization': return t('gallery.authorizationRequired');
+    case 'forbidden': return t('gallery.forbiddenRequired');
+    case 'offline': return t('gallery.connectionFailed');
+    case 'timeout': return t('gallery.connectionTimeout');
+    case 'certificate': return t('gallery.certificateFailed');
   }
-  if (cause instanceof TypeError) return t('gallery.connectionFailed');
+  if (cause instanceof NodeApiError) return t('gallery.requestFailedWithStatus', { status: cause.status });
   if (cause instanceof Error) return cause.message;
   return t('gallery.unknownError');
 }
