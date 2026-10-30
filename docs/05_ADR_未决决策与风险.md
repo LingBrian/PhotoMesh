@@ -210,3 +210,11 @@
 - **完整性/保留：** 无限期保留（接受无界磁盘增长、无自动清理），append-only 仅是应用层保证，本机数据库所有者仍可篡改；ID 仍可关联资产，故仅本地保存、不网络暴露。
 - **兼容/恢复：** 追加迁移 `0013_metadata_audit_events`，审计写失败必须导致业务写事务回滚；不改写旧迁移，迁移前备份和恢复验证必需。旧版本拒绝未知 schema，回滚需恢复备份；未授权执行生产迁移。
 - **权限边界：** 可在隔离分支完成本地源码、测试和 Conventional Commit；生产迁移、push、merge、release、deploy 各自仍需明确授权。
+
+## ADR-026：PM-053 时间线时区、日期来源置信度与稳定排序（待批准）
+
+- **状态：** [ADR-026 提案](adr/ADR-026-pm053-timeline-date-provenance.md)；本地/远端日期来源的置信度、无时区 EXIF 处理、时区偏好与 cursor 兼容待用户确认。批准前不改 DB schema、P2P 元数据契约或 API 行为。
+- **现状：** 上传/外部只读扫描不写拍摄时间；Gallery 不保存来源/置信度；UI 跟随运行时默认时区，API 日期区间固定 UTC；分页已按时间+asset ID 排序但未专项覆盖大量相同时间戳。
+- **推荐范围：** EXIF 有明确 offset 时保存 UTC instant/high；无 offset 时保留 floating local time/medium 并在独立分段显示，不猜当前节点时区；不将文件 mtime 或 ingest 时间冒充拍摄时间；旧行来源标记 `legacy_unknown`。可选 P2P 字段必须保持旧 event 兼容。
+- **数据/恢复风险：** 可能追加 `0014`；必须备份前置、追加式迁移、旧 checksum 不变与失败原子性验证；不由迁移遍历媒体或改写原图。生产迁移未授权。
+- **批准后验收：** IANA 时区跨日/DST、EXIF offset/无 offset/错误值、源置信度、N/N-1 事件兼容、cursor tie/NULL/分段全遍历无重复遗漏；根级检查及临时 DB 恢复测试。
