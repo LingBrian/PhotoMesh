@@ -82,7 +82,42 @@ New-NetFirewallRule -DisplayName 'PhotoMesh mDNS discovery' -Direction Inbound -
 pnpm --filter @photomesh/node-agent start
 ```
 
-Windows Credential Manager 保存节点私钥。管理员令牌通过 PowerShell 环境变量只提供给当前进程；不要把令牌值贴入工单或命令记录。
+Windows Credential Manager 保存节点私钥。源码运行示例中的管理员令牌只设置在当前 PowerShell 会话；打包版请用 `start.bat` 的安全提示，不要在机器/用户级环境变量或普通配置中持久化令牌。首次/遗失时的显式本机轮换步骤见仓库 README。不要把令牌贴入工单、命令历史或 transcript。
+
+#### Windows Credential Manager 生命周期检查
+
+从仓库根目录运行下列命令，可在当前 Windows 用户下创建随机临时凭据、由独立 Node 进程读取并自动删除；脚本不打印秘密值，也不会覆盖节点身份条目：
+
+```powershell
+pnpm --filter @photomesh/node-agent test:windows-credential-manager
+```
+
+可选地验证同一用户锁屏并解锁后仍可重新读取 Credential Manager 凭据：
+
+```powershell
+pnpm --filter @photomesh/node-agent test:windows-credential-manager -- --pause-for-unlock
+```
+
+按提示使用 `Win+L` 锁定并以同一 Windows 用户解锁，然后回到终端按 Enter。不要结束等待中的进程。该流程检查同一用户的跨进程持久性及解锁后重读，不检验锁屏期间另一个进程的读取行为，也不改写节点身份或数据库。若显示清理失败，请按脚本输出的服务名/条目名从 Windows Credential Manager 删除临时条目。不可用或拒绝访问由自动故障注入测试验证；不要为测试手动删除真实节点身份凭据或改变系统 ACL。任何存储失败都应关闭配对，而不是写入明文文件/数据库。
+
+打包版在另一个 PowerShell 窗口执行管理请求时，令牌不会出现在该窗口的环境变量中。用安全提示读取令牌，不要把令牌字面量写进命令行：
+
+```powershell
+$secureToken = Read-Host 'Node administrator token' -AsSecureString
+$pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+try { $adminToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }
+finally {
+  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+  $secureToken.Dispose()
+}
+$headers = @{ Authorization = "Bearer $adminToken" }
+try {
+  Invoke-RestMethod -Uri 'http://127.0.0.1:8443/v1/pairing/peers' -Headers $headers
+} finally {
+  $headers = $null
+  $adminToken = $null
+}
+```
 
 ## Linux Docker Compose 示例
 

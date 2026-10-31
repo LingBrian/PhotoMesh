@@ -5,6 +5,26 @@ export type OriginalVersion = { sourceVersionId: null; sha256: string; mimeType:
 export type MediaVersion = { versionId: string; assetId: string; sourceVersionId: string | null; sourceSha256: string; outputSha256: string | null; mimeType: string | null; byteSize: number | null; width: number | null; height: number | null; transform: MediaTransform; status: string; createdAt: string; errorCode: string | null };
 export type VersionCollection = { original: OriginalVersion; items: MediaVersion[] };
 export type VersionRequest = { sourceVersionId: string | null; sourceSha256: string; transform: MediaTransform; idempotencyKey: string };
+export type GalleryVersionOperation = 'versions' | 'create-version' | 'version-status' | 'version-content';
+
+export class GalleryVersionError extends Error {
+  constructor(readonly operation: GalleryVersionOperation, readonly status: number) {
+    super(`${operation}:${status}`);
+    this.name = 'GalleryVersionError';
+  }
+}
+
+function withSignal(init: RequestInit, signal?: AbortSignal): RequestInit {
+  return signal ? { ...init, signal } : init;
+}
+
+async function rejectResponse(operation: GalleryVersionOperation, response: Response): Promise<never> {
+  try {
+    const cancellation = response.body?.cancel();
+    if (cancellation) void cancellation.catch(() => undefined);
+  } catch { /* The status is authoritative; cancellation is best-effort. */ }
+  throw new GalleryVersionError(operation, response.status);
+}
 
 export function normalizeCrop(crop: Crop, rotation: MediaTransform['rotation'] = 90): Crop | null {
   const normalized = Object.fromEntries(Object.entries(crop).map(([key, value]) => [key, Math.round(value * 1_000_000)])) as Crop;
@@ -13,27 +33,31 @@ export function normalizeCrop(crop: Crop, rotation: MediaTransform['rotation'] =
   return normalized;
 }
 
-export async function loadMediaVersions(apiBase: string, token: string, libraryId: string, assetId: string, fetcher: typeof fetch = fetch): Promise<VersionCollection> {
-  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions`, { headers: { authorization: `Bearer ${token.trim()}` }, cache: 'no-store' });
-  if (!response.ok) throw new Error(`versions:${response.status}`);
+export async function loadMediaVersions(apiBase: string, token: string, libraryId: string, assetId: string, fetcher: typeof fetch = fetch, signal?: AbortSignal): Promise<VersionCollection> {
+  const init = withSignal({ headers: { authorization: `Bearer ${token.trim()}` }, cache: 'no-store' }, signal);
+  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions`, init);
+  if (!response.ok) await rejectResponse('versions', response);
   return await response.json() as VersionCollection;
 }
 
-export async function createMediaVersion(apiBase: string, token: string, libraryId: string, assetId: string, input: VersionRequest, fetcher: typeof fetch = fetch): Promise<{ operationId: string; versionId: string; status: string }> {
-  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions`, { method: 'POST', headers: { authorization: `Bearer ${token.trim()}`, 'content-type': 'application/json' }, body: JSON.stringify(input) });
-  if (response.status !== 202) throw new Error(`create-version:${response.status}`);
+export async function createMediaVersion(apiBase: string, token: string, libraryId: string, assetId: string, input: VersionRequest, fetcher: typeof fetch = fetch, signal?: AbortSignal): Promise<{ operationId: string; versionId: string; status: string }> {
+  const init = withSignal({ method: 'POST', headers: { authorization: `Bearer ${token.trim()}`, 'content-type': 'application/json' }, body: JSON.stringify(input) }, signal);
+  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions`, init);
+  if (response.status !== 202) await rejectResponse('create-version', response);
   return await response.json() as { operationId: string; versionId: string; status: string };
 }
 
-export async function getMediaVersion(apiBase: string, token: string, libraryId: string, assetId: string, versionId: string, fetcher: typeof fetch = fetch): Promise<MediaVersion> {
-  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions/${encodeURIComponent(versionId)}`, { headers: { authorization: `Bearer ${token.trim()}` }, cache: 'no-store' });
-  if (!response.ok) throw new Error(`version-status:${response.status}`);
+export async function getMediaVersion(apiBase: string, token: string, libraryId: string, assetId: string, versionId: string, fetcher: typeof fetch = fetch, signal?: AbortSignal): Promise<MediaVersion> {
+  const init = withSignal({ headers: { authorization: `Bearer ${token.trim()}` }, cache: 'no-store' }, signal);
+  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions/${encodeURIComponent(versionId)}`, init);
+  if (!response.ok) await rejectResponse('version-status', response);
   return await response.json() as MediaVersion;
 }
 
-export async function loadVersionContent(apiBase: string, token: string, libraryId: string, assetId: string, versionId: string, fetcher: typeof fetch = fetch): Promise<Blob> {
-  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions/${encodeURIComponent(versionId)}/content`, { headers: { authorization: `Bearer ${token.trim()}` }, cache: 'no-store' });
-  if (!response.ok) throw new Error(`version-content:${response.status}`);
+export async function loadVersionContent(apiBase: string, token: string, libraryId: string, assetId: string, versionId: string, fetcher: typeof fetch = fetch, signal?: AbortSignal): Promise<Blob> {
+  const init = withSignal({ headers: { authorization: `Bearer ${token.trim()}` }, cache: 'no-store' }, signal);
+  const response = await fetcher(`${apiBase.replace(/\/+$/, '')}/v1/libraries/${encodeURIComponent(libraryId)}/assets/${encodeURIComponent(assetId)}/versions/${encodeURIComponent(versionId)}/content`, init);
+  if (!response.ok) await rejectResponse('version-content', response);
   return await response.blob();
 }
 

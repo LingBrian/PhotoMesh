@@ -200,7 +200,7 @@ async function aclMatrixEvidence() {
       return host.pairing.canReadLibrary(principal.peerId, libraryId) ? principal.peerId : undefined;
     },
     authorizeLibraryList: (token) => token === 'owner-local' || token === 'admin-local',
-    gallery: { listLibraries: () => host.repository.listGalleryLibraries(), listAssets: (id, cursor, limit, query) => host.repository.listGalleryAssets(id, cursor, limit, query),
+    gallery: { listLibraries: () => host.repository.listGalleryLibraries(), listAssets: (id, cursor, limit, filters) => host.repository.listGalleryAssets(id, cursor, limit, filters),
       getOriginal: async () => undefined, openOriginal: () => undefined, listTombstones: (id) => host.repository.listActiveTombstones(id) }
   });
   await new Promise((resolve) => api.listen(0, '127.0.0.1', resolve));

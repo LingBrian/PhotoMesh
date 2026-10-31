@@ -3,6 +3,7 @@ import { basename as posixBasename, isAbsolute as posixIsAbsolute, join as posix
 import { basename as winBasename, isAbsolute as winIsAbsolute, join as winJoin, relative as winRelative, resolve as winResolve, sep as winSep } from 'node:path/win32';
 import type { AssetKind, ExternalLocationRecord, IndexedExternalLocation } from '../db/repository.js';
 import type { EventDraftFactory } from '../sync/event-envelope.js';
+import { maxCaptureDatePrefixBytes, parseCaptureDatePrefix, unknownCaptureDateMetadata } from '../metadata/capture-date.js';
 
 export type ExternalEntryKind = 'file' | 'directory' | 'symlink' | 'other';
 export type ExternalPathStyle = 'posix' | 'win32';
@@ -51,6 +52,18 @@ export interface ExternalScanResult {
   offline: number;
   directories: string[];
   issues: ExternalScanIssue[];
+}
+
+export interface ExternalScanReview {
+  rootId: string;
+  libraryId: string;
+  complete: boolean;
+  indexed: number;
+  missing: number;
+  offline: number;
+  directories: string[];
+  issues: ExternalScanIssue[];
+  locations: Array<{ locationId: string; originalPath: string | null; availability: ExternalAvailability }>;
 }
 
 export interface ExternalWatcher {
@@ -119,11 +132,28 @@ export class ExternalScanService {
   private debounce: ReturnType<typeof setTimeout> | undefined;
   private running: Promise<ExternalScanResult[]> | undefined;
   private rerun = false;
+  private stopping = false;
   private readonly watches = new Map<string, { close(): void }>();
+  private readonly latestResults = new Map<string, ExternalScanResult>();
 
   constructor(private readonly options: ExternalScanOptions) {}
 
+  /** Returns the latest read-only report; it never starts a scan or mutates indexed state. */
+  getReview(libraryId: string): ExternalScanReview[] {
+    return this.options.roots.filter((root) => root.libraryId === libraryId).flatMap((root) => {
+      const result = this.latestResults.get(root.rootId);
+      if (!result) return [];
+      const ops = pathOps(root.pathStyle);
+      const caseSensitive = root.caseSensitive ?? root.pathStyle !== 'win32';
+      const locations = this.options.repository.listExternalLocations(this.options.nodeId)
+        .filter((location) => isWithin(ops, ops.resolve(root.path), location.originalPath, caseSensitive))
+        .filter((location) => location.availability === 'missing' || location.availability === 'offline');
+      return [{ ...result, libraryId: root.libraryId, locations }];
+    });
+  }
+
   async scanAll(): Promise<ExternalScanResult[]> {
+    if (this.stopping) return [];
     if (this.running) {
       this.rerun = true;
       return this.running;
@@ -135,12 +165,14 @@ export class ExternalScanService {
         results = [];
         const overlappingRoots = await this.findOverlappingRoots();
         for (const root of this.options.roots) {
-          results.push(overlappingRoots.has(root) ? {
-            rootId: root.rootId, complete: false, indexed: 0, missing: 0, offline: 0, directories: [], issues: [{ code: 'invalid_root' }]
-          } : await this.scanRoot(root));
+          const result = overlappingRoots.has(root) ? {
+            rootId: root.rootId, complete: false, indexed: 0, missing: 0, offline: 0, directories: [], issues: [{ code: 'invalid_root' as const }]
+          } : await this.scanRoot(root);
+          this.latestResults.set(root.rootId, result);
+          results.push(result);
         }
-        this.refreshWatches(results.flatMap((result) => result.directories));
-      } while (this.rerun);
+        if (!this.stopping) this.refreshWatches(results.flatMap((result) => result.directories));
+      } while (this.rerun && !this.stopping);
       await this.options.signPendingEvents?.();
       return results;
     })();
@@ -173,18 +205,22 @@ export class ExternalScanService {
   }
 
   async start(): Promise<ExternalScanResult[]> {
+    if (this.stopping) throw new Error('external scan service has stopped');
     const results = await this.scanAll();
-    if (!this.timer) this.timer = setInterval(() => { void this.scanAll().catch(() => undefined); }, this.options.intervalMs ?? 15 * 60_000);
+    if (!this.stopping && !this.timer) this.timer = setInterval(() => { void this.scanAll().catch(() => undefined); }, this.options.intervalMs ?? 15 * 60_000);
     return results;
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     if (this.debounce) clearTimeout(this.debounce);
     this.timer = undefined;
     this.debounce = undefined;
+    this.rerun = false;
     for (const watch of this.watches.values()) watch.close();
     this.watches.clear();
+    await this.running?.catch(() => undefined);
   }
 
   private refreshWatches(directories: string[]): void {
@@ -211,6 +247,7 @@ export class ExternalScanService {
   }
 
   private scheduleScan(): void {
+    if (this.stopping) return;
     if (this.debounce) clearTimeout(this.debounce);
     this.debounce = setTimeout(() => { void this.scanAll().catch(() => undefined); }, this.options.debounceMs ?? 250);
   }
@@ -286,9 +323,16 @@ export class ExternalScanService {
         if (before.kind !== 'file') return;
         const hash = createHash('sha256');
         let byteSize = 0;
+        let capturePrefixSize = 0;
+        const capturePrefixChunks: Uint8Array[] = [];
         for await (const chunk of this.options.fileSystem.readChunks(displayPath)) {
           hash.update(chunk);
           byteSize += chunk.byteLength;
+          const captureBytes = Math.min(chunk.byteLength, maxCaptureDatePrefixBytes - capturePrefixSize);
+          if (captureBytes > 0) {
+            capturePrefixChunks.push(Uint8Array.from(chunk.subarray(0, captureBytes)));
+            capturePrefixSize += captureBytes;
+          }
         }
         const after = await this.options.fileSystem.stat(displayPath);
         if (before.identity !== after.identity || before.size !== after.size || before.modifiedAt !== after.modifiedAt || byteSize !== after.size) {
@@ -297,9 +341,14 @@ export class ExternalScanService {
           return;
         }
         const filename = ops.basename(displayPath);
+        const kind = kindFromPath(filename);
+        const capturePrefix = new Uint8Array(capturePrefixSize);
+        let captureOffset = 0;
+        for (const chunk of capturePrefixChunks) { capturePrefix.set(chunk, captureOffset); captureOffset += chunk.byteLength; }
+        const captureDate = kind === 'video' ? { ...unknownCaptureDateMetadata } : parseCaptureDatePrefix(capturePrefix);
         const record: ExternalLocationRecord = {
           locationId: this.id(), fileId: this.id(), assetId: this.id(), nodeId: this.options.nodeId,
-          libraryId: root.libraryId, kind: kindFromPath(filename), filename, originalPath: displayPath,
+          libraryId: root.libraryId, kind, filename, originalPath: displayPath, captureDate,
           byteSize, sha256: hash.digest('hex'), storageRef: `external:${this.id()}`, now: this.now()
         };
         this.options.repository.recordExternalFile(record, this.options.createEventDraft?.(record));

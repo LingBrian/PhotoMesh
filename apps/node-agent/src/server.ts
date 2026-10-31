@@ -1,16 +1,24 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
 import QRCode from 'qrcode';
-import { getHealth } from './health.js';
+import { getDiagnostics, getHealth, type HealthDiagnosticsSource } from './health.js';
+import { resolveRequestId } from './audit/request-id.js';
 import { UploadError, UploadService, type CreateUploadRequest } from './uploads/service.js';
 import type { PairingQrPayload, PairingApproval } from './auth/pairing-service.js';
 import type { PendingPeerApproval } from './auth/pairing-approval-queue.js';
-import type { TrustedPeerRecord } from './db/repository.js';
+import { RepositoryConflictError, StaleGalleryCursorError, normalizeGallerySearchFilters, type AlbumMemberMutationResult, type AlbumMemberPage, type AlbumPage, type AlbumRecord, type AssetTagMutationResult, type GallerySearchFilters, type TrustedPeerRecord } from './db/repository.js';
+import { maxAssetTagUtf8Bytes } from './asset-tag-limits.js';
+import { decodeAlbumCursor, InvalidAlbumCursorError, normalizeAlbumTitle, type AlbumCursorScope } from './albums/album-utils.js';
 import type { Readable } from 'node:stream';
 import type { CreateMediaVersionRequest, MediaVersionOperation, MediaVersionPage, MediaVersionView } from './media/media-version-service.js';
 import type { ThumbnailContent } from './media/thumbnail-service.js';
+import type { ExternalScanReview } from './media/external-scan.js';
 import { maxThumbnailOutputBytes } from './media/image-transformer.js';
+import { getResourceMetrics, type ResourceMetricsSource } from './resource-metrics.js';
+import { metadataExportLimit, metadataRecordsToCsv, toMetadataExportRecords } from './metadata/export.js';
+import { FavoriteSyncConflictError } from './sync/favorite-sync-repository.js';
+import { RatingSyncConflictError } from './sync/rating-sync-repository.js';
 
 export interface UploadAuthorizationRequest {
   token: string | undefined;
@@ -29,19 +37,65 @@ export interface NodeAgentServerOptions {
   uploadService?: UploadService;
   authorizeUpload?: UploadAuthorizer;
   authorizePairingAdmin?: (token: string | undefined) => boolean;
+  diagnostics?: HealthDiagnosticsSource;
+  resources?: ResourceMetricsSource;
   authorizeLibraryRead?: (token: string | undefined, libraryId: string) => string | undefined | Promise<string | undefined>;
+  authorizeLibraryPathRead?: (token: string | undefined, libraryId: string) => boolean | Promise<boolean>;
   authorizeLibraryList?: (token: string | undefined) => boolean | Promise<boolean>;
   gallery?: GalleryServerControl;
+  albums?: AlbumServerControl;
+  assetTags?: AssetTagServerControl;
+  assetFavorites?: AssetFavoriteServerControl;
+  assetRatings?: AssetRatingServerControl;
+  tagSync?: boolean;
   mediaVersions?: MediaVersionServerControl;
   thumbnails?: ThumbnailServerControl;
+  externalScan?: ExternalScanServerControl;
   pairingControl?: PairingServerControl;
   allowedWebOrigins?: readonly string[];
   maxRequestBytes?: number;
 }
 
+export interface AlbumMutationRequest {
+  operationId: string;
+  principalId: string;
+  requestFingerprint: string;
+  libraryId: string;
+  createdAt: string;
+  requestId: string;
+}
+
+export type AlbumDeleteScope = 'local' | 'global';
+export type AlbumDeletedQueryScope = 'all' | AlbumDeleteScope;
+export interface DeletedAlbumRecord extends AlbumRecord { scopes: AlbumDeleteScope[]; deletedAt: string }
+export interface DeletedAlbumPage { items: DeletedAlbumRecord[]; nextCursor: string | null }
+
+export type AlbumDeletionResult = 'deleted' | 'already_deleted' | 'not_found' | 'writer_limit';
+export type AlbumRestoreResult = 'restored' | 'already_active' | 'not_found' | 'writer_limit';
+
+export interface AlbumServerControl {
+  listAlbums(libraryId: string, cursor: string | undefined, limit: number): AlbumPage | undefined | Promise<AlbumPage | undefined>;
+  createAlbum(input: AlbumMutationRequest & { title: string }): AlbumRecord | 'writer_limit' | undefined | Promise<AlbumRecord | 'writer_limit' | undefined>;
+  listMembers(libraryId: string, albumId: string, cursor: string | undefined, limit: number): AlbumMemberPage | undefined | Promise<AlbumMemberPage | undefined>;
+  addMember(input: AlbumMutationRequest & { albumId: string; assetId: string }): AlbumMemberMutationResult | Promise<AlbumMemberMutationResult>;
+  removeMember(input: AlbumMutationRequest & { albumId: string; assetId: string }): AlbumMemberMutationResult | Promise<AlbumMemberMutationResult>;
+  deleteAlbum?(input: AlbumMutationRequest & { albumId: string; scope: AlbumDeleteScope }): AlbumDeletionResult | Promise<AlbumDeletionResult>;
+  listDeletedAlbums?(libraryId: string, scope: AlbumDeletedQueryScope, cursor: string | undefined, limit: number): DeletedAlbumPage | undefined | Promise<DeletedAlbumPage | undefined>;
+  restoreAlbum?(input: AlbumMutationRequest & { albumId: string; scope: AlbumDeleteScope }): AlbumRestoreResult | Promise<AlbumRestoreResult>;
+}
+
+const unavailableDiagnostics: HealthDiagnosticsSource = {
+  checkDatabase: () => { throw new Error('database check unavailable'); },
+  checkStorage: () => { throw new Error('storage check unavailable'); },
+  apiCapabilities: () => [],
+  storageCapabilities: () => [],
+  identityCapabilities: () => []
+};
+
 export interface GalleryServerControl {
   listLibraries(): Array<{ libraryId: string; title: string }>;
-  listAssets(libraryId: string, cursor: string | undefined, limit: number, query?: string): { items: unknown[]; nextCursor: string | null };
+  listAssets(libraryId: string, cursor: string | undefined, limit: number, filters?: GallerySearchFilters): { items: unknown[]; nextCursor: string | null };
+  listDuplicateCandidateGroups?(libraryId: string, limit: number): unknown[];
   getOriginal(assetId: string): Promise<{ libraryId: string; filename: string; sha256: string; byteSize: number; availability: string; storageRef: string; originalPath: string | null } | undefined>;
   openOriginal(media: { storageRef: string; originalPath: string | null }): Promise<Readable | undefined> | Readable | undefined;
   listTombstones(libraryId?: string): unknown[];
@@ -61,6 +115,50 @@ export interface ThumbnailServerControl {
   readThumbnail(libraryId: string, assetId: string, profile: string): Promise<ThumbnailContent>;
 }
 
+export interface ExternalScanServerControl {
+  getReview(libraryId: string): ExternalScanReview[];
+}
+
+export interface AssetTagServerControl {
+  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string, requestId: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
+  removeAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string, requestId: string): AssetTagMutationResult | Promise<AssetTagMutationResult>;
+}
+
+export interface AssetFavoriteMutationRequest {
+  operationId: string; principalId: string; requestFingerprint: string; libraryId: string; assetId: string;
+  favorite: boolean; createdAt: string; requestId: string;
+}
+export type AssetFavoriteMutationResult = { status: 'changed' | 'unchanged'; favorite: boolean } | 'not_found' | 'author_limit';
+export interface AssetFavoriteServerControl {
+  setAssetFavorite(input: AssetFavoriteMutationRequest): AssetFavoriteMutationResult | Promise<AssetFavoriteMutationResult>;
+}
+
+export interface AssetRatingMutationRequest {
+  operationId: string; principalId: string; requestFingerprint: string; libraryId: string; assetId: string;
+  rating: number | null; createdAt: string; requestId: string;
+}
+export interface AssetRatingState { rating: number | null; conflict: boolean; ratingCandidates: Array<number | null> }
+export type AssetRatingMutationResult = (AssetRatingState & { status: 'changed' | 'unchanged' }) |
+  'not_found' | 'author_limit' | 'conflict_limit';
+export interface AssetRatingServerControl {
+  setAssetRating(input: AssetRatingMutationRequest): AssetRatingMutationResult | Promise<AssetRatingMutationResult>;
+}
+
+export type RatingSyncPermission = 'rating-write';
+export interface RatingSyncGrantStatus { peerId: string; libraryId: string; permission: RatingSyncPermission; granted: boolean }
+export interface RatingSyncGrantList { grants: RatingSyncGrantStatus[] }
+export interface RatingSyncPeerStatus { peerId: string; pendingEvents: number; lastErrorCode: 'unauthorized' | 'unavailable' | 'conflict' | null }
+
+export type FavoriteSyncPermission = 'favorite-write';
+export interface FavoriteSyncGrantStatus { peerId: string; libraryId: string; permission: FavoriteSyncPermission; granted: boolean }
+export interface FavoriteSyncGrantList { grants: FavoriteSyncGrantStatus[] }
+export interface FavoriteSyncPeerStatus { peerId: string; pendingEvents: number; lastErrorCode: 'unauthorized' | 'unavailable' | 'conflict' | null }
+
+export type AlbumSyncPermission = 'album-write' | 'album-delete';
+export interface AlbumSyncGrantStatus { peerId: string; libraryId: string; permission: AlbumSyncPermission; granted: boolean }
+export interface AlbumSyncGrantList { grants: AlbumSyncGrantStatus[] }
+export interface AlbumSyncPeerStatus { peerId: string; pendingEvents: number; lastErrorCode: 'unauthorized' | 'unavailable' | 'conflict' | null }
+
 export interface PairingServerControl {
   createInvite(): PairingQrPayload;
   pairWithInvite(invite: PairingQrPayload, label: string, manualIp?: { host: string; port: number }): Promise<{ hostPeerId: string }>;
@@ -69,6 +167,24 @@ export interface PairingServerControl {
   decide(peerId: string, approval: PairingApproval): boolean;
   revokePeer(peerId: string): Promise<boolean>;
   grantLibraryRead(peerId: string, libraryId: string): void;
+  grantTagWrite?(peerId: string, libraryId: string): boolean;
+  revokeTagWrite?(peerId: string, libraryId: string): boolean;
+  listTagWriters?(libraryId: string): string[];
+  getTagSyncStatus?(peerId: string): { pending: number; lastError: string | null };
+  grantAlbumWrite?(peerId: string, libraryId: string, grantedAt: string): AlbumSyncGrantStatus | undefined;
+  revokeAlbumWrite?(peerId: string, libraryId: string, revokedAt: string): AlbumSyncGrantStatus | undefined;
+  grantAlbumDelete?(peerId: string, libraryId: string, grantedAt: string): AlbumSyncGrantStatus | undefined;
+  revokeAlbumDelete?(peerId: string, libraryId: string, revokedAt: string): AlbumSyncGrantStatus | undefined;
+  listAlbumSyncGrants?(libraryId: string): AlbumSyncGrantList | undefined;
+  getAlbumSyncStatus?(peerId: string): AlbumSyncPeerStatus | undefined;
+  grantFavoriteWrite?(peerId: string, libraryId: string, grantedAt: string): FavoriteSyncGrantStatus | undefined;
+  revokeFavoriteWrite?(peerId: string, libraryId: string, revokedAt: string): FavoriteSyncGrantStatus | undefined;
+  listFavoriteSyncGrants?(libraryId: string): FavoriteSyncGrantList | undefined;
+  getFavoriteSyncStatus?(peerId: string): { pending: number; lastError: string | null } | undefined;
+  grantRatingWrite?(peerId: string, libraryId: string, grantedAt: string): RatingSyncGrantStatus | undefined;
+  revokeRatingWrite?(peerId: string, libraryId: string, revokedAt: string): RatingSyncGrantStatus | undefined;
+  listRatingSyncGrants?(libraryId: string): RatingSyncGrantList | undefined;
+  getRatingSyncStatus?(peerId: string): { pending: number; lastError: string | null } | undefined;
   readLibraryIndex(peerId: string, libraryId: string): unknown[] | undefined;
   listDiscoveredPeers(): Array<{ peerId: string; addresses: string[] }>;
   dialManualIp(host: string, port: number, peerId: string): Promise<{ peerId: string; addresses: string[] }>;
@@ -78,7 +194,7 @@ export function createNodeAgentServer(options: NodeAgentServerOptions = {}) {
   const allowedWebOrigins = normalizeAllowedWebOrigins(options.allowedWebOrigins ?? []);
   return createServer((request, response) => {
     setCorsHeaders(request, response, allowedWebOrigins);
-    const requestId = headerValue(request, 'x-request-id') ?? randomUUID();
+    const requestId = resolveRequestId(request.rawHeaders);
     response.setHeader('x-request-id', requestId);
     if (request.method === 'OPTIONS') {
       response.writeHead(204, { 'access-control-max-age': '600' });
@@ -97,15 +213,89 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (request.method === 'GET' && url.pathname === '/v1/health') {
     const capabilities = [
       ...(options.mediaVersions ? ['mediaVersions'] : []),
-      ...(options.thumbnails ? ['thumbnails'] : [])
+      ...(options.thumbnails ? ['thumbnails'] : []),
+      ...(options.externalScan ? ['externalScanReview'] : []),
+      ...(options.assetTags ? ['assetTags'] : []),
+      ...(options.gallery ? ['gallerySearch', 'galleryFilters', ...(options.gallery.listDuplicateCandidateGroups ? ['duplicateCandidates'] : [])] : []),
+      ...(options.albums ? ['virtualAlbums'] : []),
+      ...(options.tagSync ? ['tagSync'] : [])
     ];
     sendJson(response, 200, getHealth(capabilities));
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/v1/resources') {
+    response.setHeader('cache-control', 'no-store');
+    if (!options.authorizePairingAdmin?.(bearerToken(request))) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    if (!options.resources) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    sendJson(response, 200, await getResourceMetrics(options.resources));
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/v1/diagnostics') {
+    response.setHeader('cache-control', 'no-store');
+    if (!options.authorizePairingAdmin?.(bearerToken(request))) {
+      sendJson(response, 403, { error: 'forbidden', requestId });
+      return;
+    }
+    sendJson(response, 200, await getDiagnostics(options.diagnostics ?? unavailableDiagnostics));
     return;
   }
 
   if (request.method === 'GET' && url.pathname === '/v1/libraries') {
     if (!await options.authorizeLibraryList?.(bearerToken(request))) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
     sendJson(response, 200, { items: options.gallery?.listLibraries() ?? [] });
+    return;
+  }
+
+  if (await handleAlbumRequest(request, response, options, requestId, url)) return;
+
+  const externalScanReviewPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/external-scan-review$/);
+  if (request.method === 'GET' && externalScanReviewPath?.[1]) {
+    const libraryId = decodePathSegment(externalScanReviewPath[1]);
+    if (!libraryId || [...url.searchParams.keys()].length > 0) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    if (!await options.authorizeLibraryRead?.(bearerToken(request), libraryId)) {
+      sendJson(response, 404, { error: 'not_found', requestId }); return;
+    }
+    if (!options.externalScan) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    response.setHeader('cache-control', 'no-store');
+    const review = { roots: options.externalScan.getReview(libraryId) };
+    const canReadPaths = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+    sendJson(response, 200, canReadPaths ? review : redactPathFields(review));
+    return;
+  }
+
+  const metadataExportPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/metadata-export$/);
+  if (request.method === 'GET' && metadataExportPath?.[1]) {
+    const libraryId = decodePathSegment(metadataExportPath[1]);
+    const formats = url.searchParams.getAll('format');
+    if (!libraryId || formats.length !== 1 || !['json', 'csv'].includes(formats[0] ?? '') || [...url.searchParams.keys()].some((key) => key !== 'format')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    if (!await options.authorizeLibraryRead?.(bearerToken(request), libraryId)) {
+      sendJson(response, 403, { error: 'forbidden', requestId }); return;
+    }
+    if (!options.gallery) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const includePath = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+    const items: unknown[] = [];
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    do {
+      const page = options.gallery.listAssets(libraryId, cursor, Math.min(200, metadataExportLimit - items.length));
+      items.push(...page.items);
+      if (!page.nextCursor || items.length >= metadataExportLimit || cursors.has(page.nextCursor)) break;
+      cursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    } while (items.length < metadataExportLimit);
+    const records = toMetadataExportRecords(items, includePath);
+    response.setHeader('cache-control', 'private, no-store');
+    if (formats[0] === 'csv') {
+      const csv = metadataRecordsToCsv(records);
+      response.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="photomesh-metadata.csv"', 'content-length': String(Buffer.byteLength(csv)), 'x-content-type-options': 'nosniff' });
+      response.end(csv);
+    } else {
+      sendJson(response, 200, { items: records });
+    }
     return;
   }
 
@@ -156,6 +346,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (!media) { sendJson(response, 404, { error: 'not_found', requestId }); return; }
     const principal = await options.authorizeLibraryRead?.(bearerToken(request), media.libraryId);
     if (!principal) { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    if (media.availability === 'missing') {
+      sendJson(response, 409, { error: 'source_missing', requestId }); return;
+    }
     if (!['online', 'cached'].includes(media.availability)) {
       sendJson(response, 409, { error: 'source_offline', requestId }); return;
     }
@@ -269,32 +462,185 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
 
-  if (request.method === 'GET' && url.pathname === '/v1/assets') {
+  if (request.method === 'GET' && url.pathname === '/v1/assets/duplicate-candidates') {
+    const allowedParameters = new Set(['libraryId', 'limit']);
+    const parameterNames = [...url.searchParams.keys()];
+    if (parameterNames.some((name) => !allowedParameters.has(name)) || parameterNames.some((name) => url.searchParams.getAll(name).length !== 1)) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
     const libraryId = url.searchParams.get('libraryId');
-    const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;
+    const rawLimit = Number(url.searchParams.get('limit') ?? 50);
+    if (!options.gallery?.listDuplicateCandidateGroups || !libraryId || libraryId.length > 128 || !Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const peerId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!peerId || !options.gallery.listLibraries().some((library) => library.libraryId === libraryId)) {
+      sendJson(response, 403, { error: 'forbidden', requestId }); return;
+    }
+    try {
+      response.setHeader('cache-control', 'private, no-store');
+      const groups = options.gallery.listDuplicateCandidateGroups(libraryId, rawLimit);
+      const canReadPaths = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+      sendJson(response, 200, canReadPaths ? { groups } : redactPathFields({ groups }));
+    } catch {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+    }
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/v1/assets') {
+    const allowedParameters = new Set(['libraryId', 'cursor', 'limit', 'q', 'dateFrom', 'dateTo', 'kind', 'sourceKind', 'availability']);
+    const parameterNames = [...url.searchParams.keys()];
+    if (parameterNames.some((name) => !allowedParameters.has(name)) ||
+      parameterNames.some((name) => url.searchParams.getAll(name).length !== 1)) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const libraryId = url.searchParams.get('libraryId');
     const rawLimit = Number(url.searchParams.get('limit') ?? 50);
     const cursor = url.searchParams.get('cursor');
     const rawOffset = cursor === null ? 0 : Number(cursor);
+    const filters: GallerySearchFilters = {
+      ...(url.searchParams.has('q') ? { q: url.searchParams.get('q') ?? '' } : {}),
+      ...(url.searchParams.has('dateFrom') ? { dateFrom: url.searchParams.get('dateFrom') ?? '' } : {}),
+      ...(url.searchParams.has('dateTo') ? { dateTo: url.searchParams.get('dateTo') ?? '' } : {}),
+      ...(url.searchParams.has('kind') ? { kind: (url.searchParams.get('kind') ?? '') as NonNullable<GallerySearchFilters['kind']> } : {}),
+      ...(url.searchParams.has('sourceKind') ? { sourceKind: (url.searchParams.get('sourceKind') ?? '') as NonNullable<GallerySearchFilters['sourceKind']> } : {}),
+      ...(url.searchParams.has('availability') ? { availability: (url.searchParams.get('availability') ?? '') as NonNullable<GallerySearchFilters['availability']> } : {})
+    };
     if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 200 ||
-      (options.gallery ? cursor !== null && !/^[A-Za-z0-9_-]{1,2048}$/.test(cursor) : !Number.isSafeInteger(rawOffset) || rawOffset < 0)) {
+      (options.gallery ? cursor !== null && !/^[A-Za-z0-9_-]{1,2048}$/.test(cursor) : !Number.isSafeInteger(rawOffset) || rawOffset < 0) ||
+      (libraryId !== null && (libraryId.length < 1 || libraryId.length > 128))) {
       sendJson(response, 400, { error: 'invalid_request', requestId }); return;
     }
     if (options.gallery) {
+      try { normalizeGallerySearchFilters(filters); }
+      catch { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+      const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;
       if (!peerId || !libraryId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+      response.setHeader('cache-control', 'private, no-store');
       try {
-        const query = url.searchParams.get('q') ?? '';
-        if (query.length > 256) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
-        const page = options.gallery.listAssets(libraryId, cursor ?? undefined, rawLimit, query);
-        sendJson(response, 200, page);
-      } catch {
-        sendJson(response, 400, { error: 'invalid_request', requestId });
+        const page = options.gallery.listAssets(libraryId, cursor ?? undefined, rawLimit, filters);
+        const canReadPaths = await options.authorizeLibraryPathRead?.(bearerToken(request), libraryId) ?? false;
+        sendJson(response, 200, canReadPaths ? page : redactPathFields(page));
+      } catch (cause) {
+        if (cause instanceof StaleGalleryCursorError) sendJson(response, 410, { error: 'stale_cursor', requestId });
+        else sendJson(response, 400, { error: 'invalid_request', requestId });
       }
       return;
     }
+    if (filters.q !== undefined || filters.dateFrom !== undefined || filters.dateTo !== undefined ||
+      filters.kind !== undefined || filters.sourceKind !== undefined || filters.availability !== undefined) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const peerId = libraryId ? await options.authorizeLibraryRead?.(bearerToken(request), libraryId) : undefined;
     const items = peerId && libraryId ? options.pairingControl?.readLibraryIndex(peerId, libraryId) : undefined;
     if (!items) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
-    const page = items.slice(rawOffset, rawOffset + rawLimit);
+    const page = items.slice(rawOffset, rawOffset + rawLimit).map((item) =>
+      isPlainRecord(item) ? { ...item, tags: [] } : item
+    );
+    response.setHeader('cache-control', 'private, no-store');
     sendJson(response, 200, { items: page, nextCursor: rawOffset + rawLimit < items.length ? String(rawOffset + rawLimit) : null });
+    return;
+  }
+
+  const assetTagPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/tags\/([^/]+)$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && assetTagPath?.[1] && assetTagPath[2] && assetTagPath[3]) {
+    const libraryId = decodePathSegment(assetTagPath[1]);
+    const assetId = decodePathSegment(assetTagPath[2]);
+    const rawTag = decodeTagSegment(assetTagPath[3]);
+    if (!libraryId || !assetId || rawTag === undefined) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return;
+    }
+    const principalId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!principalId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    const tag = normalizeAssetTag(rawTag);
+    if (!tag) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const control = options.assetTags;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const createdAt = new Date().toISOString();
+    const result = request.method === 'PUT'
+      ? await control.addAssetTag(libraryId, assetId, tag, createdAt, requestId)
+      : await control.removeAssetTag(libraryId, assetId, tag, createdAt, requestId);
+    if (result === 'not_found') { sendJson(response, 404, { error: 'not_found', requestId }); return; }
+    if (result === 'limit_reached') { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const successful = request.method === 'PUT'
+      ? result === 'added' || result === 'already_present'
+      : result === 'removed' || result === 'unchanged';
+    if (!successful) throw new Error('Asset tag operation failed');
+    response.writeHead(204);
+    response.end();
+    return;
+  }
+
+  const favoritePath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/favorite$/);
+  if (request.method === 'PUT' && favoritePath?.[1] && favoritePath[2]) {
+    response.setHeader('cache-control', 'private, no-store');
+    const libraryId = decodePathSegment(favoritePath[1]);
+    const assetId = decodePathSegment(favoritePath[2]);
+    if (!libraryId || !assetId || url.searchParams.size > 0) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const principalId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!principalId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    const control = options.assetFavorites;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const operationId = readFavoriteOperationId(request);
+    if (!operationId || !/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['favorite']) || typeof body.favorite !== 'boolean') {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    try {
+      const result = await control.setAssetFavorite({
+        operationId, principalId, libraryId, assetId, favorite: body.favorite,
+        requestFingerprint: favoriteRequestFingerprint(principalId, libraryId, assetId, body.favorite),
+        createdAt: new Date().toISOString(), requestId
+      });
+      if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+      else if (result === 'author_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+      else sendJson(response, 200, { favorite: result.favorite });
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof FavoriteSyncConflictError) {
+        sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      } else throw error;
+    }
+    return;
+  }
+
+  const ratingPath = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/assets\/([^/]+)\/rating$/);
+  if (request.method === 'PUT' && ratingPath?.[1] && ratingPath[2]) {
+    response.setHeader('cache-control', 'private, no-store');
+    const libraryId = decodePathSegment(ratingPath[1]);
+    const assetId = decodePathSegment(ratingPath[2]);
+    if (!libraryId || !assetId || url.searchParams.size > 0) { sendJson(response, 400, { error: 'invalid_request', requestId }); return; }
+    const principalId = await options.authorizeLibraryRead?.(bearerToken(request), libraryId);
+    if (!principalId) { sendJson(response, 403, { error: 'forbidden', requestId }); return; }
+    const control = options.assetRatings;
+    if (!control) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return; }
+    const operationId = readRatingOperationId(request);
+    if (!operationId || !/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['rating']) || !isValidRating(body.rating)) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return;
+    }
+    try {
+      const result = await control.setAssetRating({
+        operationId, principalId, libraryId, assetId, rating: body.rating,
+        requestFingerprint: ratingRequestFingerprint(principalId, libraryId, assetId, body.rating),
+        createdAt: new Date().toISOString(), requestId
+      });
+      if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+      else if (result === 'author_limit' || result === 'conflict_limit') {
+        sendJson(response, 409, { error: result === 'author_limit' ? 'writer_limit_reached' : 'rating_conflict_limit', requestId });
+      } else sendJson(response, 200, projectAssetRatingResponse(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof RatingSyncConflictError) {
+        sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      } else throw error;
+    }
     return;
   }
 
@@ -317,6 +663,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     });
     if (!principal) {
       sendJson(response, 403, { error: 'forbidden', requestId });
+      return;
+    }
+    if (options.resources && !(await getResourceMetrics(options.resources)).acceptsNewWork) {
+      sendJson(response, 507, { error: 'insufficient_storage', requestId });
       return;
     }
     const idempotencyKey = headerValue(request, 'idempotency-key');
@@ -377,6 +727,407 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   sendJson(response, 404, { error: 'not_found', requestId });
 }
 
+async function handleAlbumRequest(
+  request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string, url: URL
+): Promise<boolean> {
+  const collection = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums$/);
+  const deleted = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/deleted$/);
+  const members = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/members$/);
+  const member = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/members\/([^/]+)$/);
+  const deletion = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/deletion$/);
+  const restore = url.pathname.match(/^\/v1\/libraries\/([^/]+)\/albums\/([^/]+)\/restore$/);
+  const route = collection || deleted || members || member || deletion || restore;
+  if (!route) return false;
+  response.setHeader('cache-control', 'private, no-store');
+  const allowed = collection ? request.method === 'GET' || request.method === 'POST'
+    : deleted || members ? request.method === 'GET'
+      : member ? request.method === 'PUT' || request.method === 'DELETE'
+        : deletion || restore ? request.method === 'POST' : false;
+  if (!allowed) return false;
+
+  const token = bearerToken(request);
+  if (!options.authorizePairingAdmin?.(token)) {
+    sendJson(response, 403, { error: 'forbidden', requestId });
+    return true;
+  }
+  const libraryId = decodePathSegment(route[1]);
+  const albumId = members || member || deletion || restore ? decodePathSegment(route[2]) : undefined;
+  const assetId = member ? decodePathSegment(route[3]) : undefined;
+  if (!libraryId || (members || member || deletion || restore) && !albumId || member && !assetId) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  const principalId = await options.authorizeLibraryRead?.(token, libraryId);
+  if (!principalId || !options.gallery?.listLibraries().some((library) => library.libraryId === libraryId)) {
+    sendJson(response, 404, { error: 'not_found', requestId });
+    return true;
+  }
+  if (request.method !== 'GET' && [...url.searchParams.keys()].length > 0) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  const control = options.albums;
+  if (!control) {
+    sendJson(response, 503, { error: 'capability_unavailable', requestId });
+    return true;
+  }
+
+  if (request.method === 'GET') {
+    if (deleted) {
+      if (!control.listDeletedAlbums) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+      const page = parseDeletedAlbumPageQuery(url.searchParams, libraryId);
+      if (!page) { sendJson(response, 400, { error: 'invalid_request', requestId }); return true; }
+      try {
+        const result = await control.listDeletedAlbums(libraryId, page.scope, page.cursor, page.limit);
+        if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+        else sendJson(response, 200, projectDeletedAlbumPage(result, libraryId, page.scope, page.limit));
+      } catch (error) {
+        if (error instanceof InvalidAlbumCursorError) sendJson(response, 400, { error: 'invalid_request', requestId });
+        else throw error;
+      }
+      return true;
+    }
+    const scope: AlbumCursorScope = albumId === undefined
+      ? { collection: 'albums', libraryId }
+      : { collection: 'members', libraryId, albumId };
+    const page = parseAlbumPageQuery(url.searchParams, scope);
+    if (!page) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    try {
+      const result = albumId === undefined
+        ? await control.listAlbums(libraryId, page.cursor, page.limit)
+        : await control.listMembers(libraryId, albumId, page.cursor, page.limit);
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, albumId === undefined
+        ? projectAlbumPage(result as AlbumPage, libraryId, page.limit)
+        : projectAlbumMemberPage(result as AlbumMemberPage, libraryId, albumId, page.limit));
+    } catch (error) {
+      if (error instanceof InvalidAlbumCursorError) sendJson(response, 400, { error: 'invalid_request', requestId });
+      else throw error;
+    }
+    return true;
+  }
+
+  const operationId = readAlbumOperationId(request);
+  if (!operationId) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  const createdAt = new Date().toISOString();
+  if (deletion || restore) {
+    const controlMethod = deletion ? control.deleteAlbum : control.restoreAlbum;
+    if (!controlMethod) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['scope']) || (body.scope !== 'local' && body.scope !== 'global')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+    }
+    const input = {
+      libraryId, albumId: albumId!, scope: body.scope as AlbumDeleteScope, operationId, principalId,
+      requestFingerprint: albumRequestFingerprint(principalId, 'POST', libraryId, albumId, undefined, { scope: body.scope }), createdAt, requestId
+    };
+    try {
+      if (deletion) {
+        const result = await control.deleteAlbum!(input);
+        if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+        else if (result === 'writer_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+        else { response.writeHead(204); response.end(); }
+      } else {
+        const result = await control.restoreAlbum!(input);
+        if (result === 'not_found') sendJson(response, 404, { error: 'not_found', requestId });
+        else if (result === 'writer_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+        else { response.writeHead(204); response.end(); }
+      }
+    } catch (error) {
+      if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
+  if (request.method === 'POST') {
+    if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    const body = await readJsonBody(request, Math.min(options.maxRequestBytes ?? 16 * 1024, 16 * 1024));
+    if (!isPlainRecord(body) || !hasExactKeys(body, ['title'])) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    const title = normalizeAlbumTitle(body.title);
+    if (!title) {
+      sendJson(response, 400, { error: 'invalid_request', requestId });
+      return true;
+    }
+    try {
+      const created = await control.createAlbum({
+        libraryId, title, operationId, principalId,
+        requestFingerprint: albumRequestFingerprint(principalId, 'POST', libraryId, undefined, undefined, { title }),
+        createdAt, requestId
+      });
+      if (created === 'writer_limit') sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+      else if (!created) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 201, projectAlbumRecord(created, libraryId));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
+
+  const bytes = await readBytes(request, 16 * 1024);
+  if (bytes.byteLength > 0) {
+    sendJson(response, 400, { error: 'invalid_request', requestId });
+    return true;
+  }
+  try {
+    const method = request.method === 'PUT' ? 'PUT' : 'DELETE';
+    const input = {
+      libraryId, albumId: albumId!, assetId: assetId!, operationId, principalId,
+      requestFingerprint: albumRequestFingerprint(principalId, method, libraryId, albumId, assetId, null),
+      createdAt, requestId
+    };
+    const result = method === 'PUT' ? await control.addMember(input) : await control.removeMember(input);
+    if (result.status === 'not_found') {
+      sendJson(response, 404, { error: 'not_found', requestId });
+      return true;
+    }
+    if (result.status === 'writer_limit') {
+      sendJson(response, 409, { error: 'writer_limit_reached', requestId });
+      return true;
+    }
+    if (!['added', 'already_present', 'removed', 'unchanged'].includes(result.status)) throw new Error('invalid album mutation result');
+    response.writeHead(204);
+    response.end();
+  } catch (error) {
+    if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'idempotency_conflict', requestId });
+    else throw error;
+  }
+  return true;
+}
+
+function projectAlbumSyncGrantStatus(value: AlbumSyncGrantStatus): AlbumSyncGrantStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !isValidAlbumIdentifier(value.libraryId) ||
+      (value.permission !== 'album-write' && value.permission !== 'album-delete') || typeof value.granted !== 'boolean') {
+    throw new Error('album sync control returned an invalid grant');
+  }
+  return { peerId: value.peerId, libraryId: value.libraryId, permission: value.permission, granted: value.granted };
+}
+
+function projectAlbumSyncGrantList(value: AlbumSyncGrantList): AlbumSyncGrantList {
+  if (!isPlainRecord(value) || !Array.isArray(value.grants)) throw new Error('album sync control returned an invalid grant list');
+  const grants = value.grants.map((grant) => projectAlbumSyncGrantStatus(grant));
+  const keys = grants.map((grant) => `${grant.peerId}\\0${grant.libraryId}\\0${grant.permission}`);
+  if (new Set(keys).size !== keys.length) throw new Error('album sync control returned duplicate grants');
+  return { grants };
+}
+
+function projectAlbumSyncStatus(value: AlbumSyncPeerStatus): AlbumSyncPeerStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !Number.isSafeInteger(value.pendingEvents) || value.pendingEvents < 0 ||
+      !(value.lastErrorCode === null || ['unauthorized', 'unavailable', 'conflict'].includes(value.lastErrorCode))) {
+    throw new Error('album sync control returned an invalid status');
+  }
+  return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
+}
+
+function projectFavoriteSyncGrantStatus(value: FavoriteSyncGrantStatus): FavoriteSyncGrantStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !isValidAlbumIdentifier(value.libraryId) ||
+      value.permission !== 'favorite-write' || typeof value.granted !== 'boolean') throw new Error('favorite sync control returned an invalid grant');
+  return { peerId: value.peerId, libraryId: value.libraryId, permission: value.permission, granted: value.granted };
+}
+
+function projectFavoriteSyncGrantList(value: FavoriteSyncGrantList): FavoriteSyncGrantList {
+  if (!isPlainRecord(value) || !Array.isArray(value.grants)) throw new Error('favorite sync control returned an invalid grant list');
+  const grants = value.grants.map((grant) => projectFavoriteSyncGrantStatus(grant));
+  const keys = grants.map((grant) => `${grant.peerId}\\0${grant.libraryId}\\0${grant.permission}`);
+  if (new Set(keys).size !== keys.length) throw new Error('favorite sync control returned duplicate grants');
+  return { grants };
+}
+
+function projectFavoriteSyncStatus(value: FavoriteSyncPeerStatus): FavoriteSyncPeerStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !Number.isSafeInteger(value.pendingEvents) || value.pendingEvents < 0 ||
+      !(value.lastErrorCode === null || ['unauthorized', 'unavailable', 'conflict'].includes(value.lastErrorCode))) {
+    throw new Error('favorite sync control returned an invalid status');
+  }
+  return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
+}
+
+function projectAssetRatingResponse(value: AssetRatingState): { rating: number | null; ratingConflict: boolean; ratingCandidates: Array<number | null> } {
+  if (!isPlainRecord(value) || !isValidRating(value.rating) || typeof value.conflict !== 'boolean' ||
+      !Array.isArray(value.ratingCandidates) || value.ratingCandidates.length > 64 ||
+      !value.ratingCandidates.every(isValidRating) || new Set(value.ratingCandidates).size !== value.ratingCandidates.length) {
+    throw new Error('rating control returned an invalid rating state');
+  }
+  return { rating: value.rating, ratingConflict: value.conflict, ratingCandidates: [...value.ratingCandidates] };
+}
+
+function projectRatingSyncGrantStatus(value: RatingSyncGrantStatus): RatingSyncGrantStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !isValidAlbumIdentifier(value.libraryId) ||
+      value.permission !== 'rating-write' || typeof value.granted !== 'boolean') throw new Error('rating sync control returned an invalid grant');
+  return { peerId: value.peerId, libraryId: value.libraryId, permission: value.permission, granted: value.granted };
+}
+
+function projectRatingSyncGrantList(value: RatingSyncGrantList): RatingSyncGrantList {
+  if (!isPlainRecord(value) || !Array.isArray(value.grants)) throw new Error('rating sync control returned an invalid grant list');
+  const grants = value.grants.map((grant) => projectRatingSyncGrantStatus(grant));
+  const keys = grants.map((grant) => `${grant.peerId}\\0${grant.libraryId}\\0${grant.permission}`);
+  if (new Set(keys).size !== keys.length) throw new Error('rating sync control returned duplicate grants');
+  return { grants };
+}
+
+function projectRatingSyncStatus(value: RatingSyncPeerStatus): RatingSyncPeerStatus {
+  if (!isPlainRecord(value) || !isValidAlbumIdentifier(value.peerId) || !Number.isSafeInteger(value.pendingEvents) || value.pendingEvents < 0 ||
+      !(value.lastErrorCode === null || ['unauthorized', 'unavailable', 'conflict'].includes(value.lastErrorCode))) {
+    throw new Error('rating sync control returned an invalid status');
+  }
+  return { peerId: value.peerId, pendingEvents: value.pendingEvents, lastErrorCode: value.lastErrorCode };
+}
+
+function parseAlbumPageQuery(searchParams: URLSearchParams, scope: AlbumCursorScope): { cursor: string | undefined; limit: number } | undefined {
+  if ([...searchParams.keys()].some((key) => key !== 'cursor' && key !== 'limit')) return undefined;
+  const limitValues = searchParams.getAll('limit');
+  const cursorValues = searchParams.getAll('cursor');
+  if (limitValues.length > 1 || cursorValues.length > 1) return undefined;
+  const rawLimit = limitValues[0] ?? '50';
+  if (!/^\d+$/.test(rawLimit)) return undefined;
+  const limit = Number(rawLimit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) return undefined;
+  const cursor = cursorValues[0];
+  if (cursor !== undefined) {
+    if (cursor.length > 2048) return undefined;
+    try { decodeAlbumCursor(cursor, scope); } catch { return undefined; }
+  }
+  return { cursor, limit };
+}
+
+function parseDeletedAlbumPageQuery(searchParams: URLSearchParams, libraryId: string): { scope: AlbumDeletedQueryScope; cursor: string | undefined; limit: number } | undefined {
+  if ([...searchParams.keys()].some((key) => key !== 'scope' && key !== 'cursor' && key !== 'limit')) return undefined;
+  const scopeValues = searchParams.getAll('scope');
+  const cursorValues = searchParams.getAll('cursor');
+  const limitValues = searchParams.getAll('limit');
+  if (scopeValues.length !== 1 || cursorValues.length > 1 || limitValues.length > 1 ||
+      !['all', 'local', 'global'].includes(scopeValues[0] ?? '')) return undefined;
+  const rawLimit = limitValues[0] ?? '50';
+  if (!/^\d+$/.test(rawLimit)) return undefined;
+  const limit = Number(rawLimit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) return undefined;
+  const cursor = cursorValues[0];
+  const scope: AlbumDeletedQueryScope = scopeValues[0] as AlbumDeletedQueryScope;
+  if (cursor !== undefined) {
+    if (cursor.length > 2048) return undefined;
+    try { decodeAlbumCursor(cursor, { collection: 'deleted', libraryId, scope }); } catch { return undefined; }
+  }
+  return { scope, cursor, limit };
+}
+
+function projectDeletedAlbumPage(value: DeletedAlbumPage, libraryId: string, scope: AlbumDeletedQueryScope, limit: number): DeletedAlbumPage {
+  if (!isPlainRecord(value) || !Array.isArray(value.items) || value.items.length > limit ||
+      !(value.nextCursor === null || typeof value.nextCursor === 'string')) throw new Error('album control returned an invalid deleted page');
+  const items = value.items.map((item) => {
+    if (!isPlainRecord(item) || !Array.isArray(item.scopes) || item.scopes.length < 1 || item.scopes.length > 2 ||
+        item.scopes.some((itemScope) => itemScope !== 'local' && itemScope !== 'global') || new Set(item.scopes).size !== item.scopes.length ||
+        scope !== 'all' && !item.scopes.includes(scope) || typeof item.deletedAt !== 'string' || !Number.isFinite(Date.parse(item.deletedAt))) {
+      throw new Error('album control returned an invalid deleted album');
+    }
+    return { ...projectAlbumRecord(item as AlbumRecord, libraryId), scopes: [...item.scopes] as AlbumDeleteScope[], deletedAt: item.deletedAt };
+  });
+  if (new Set(items.map((item) => item.albumId)).size !== items.length) throw new Error('album control returned duplicate deleted albums');
+  const nextCursor = validateAlbumOutputCursor(value.nextCursor, { collection: 'deleted', libraryId, scope }, items.length, limit);
+  return { items, nextCursor };
+}
+
+function projectAlbumRecord(value: AlbumRecord, libraryId: string): AlbumRecord {
+  if (!isPlainRecord(value) || value.libraryId !== libraryId || !isValidAlbumIdentifier(value.albumId) ||
+    typeof value.title !== 'string' || normalizeAlbumTitle(value.title) !== value.title ||
+    !isValidAlbumIdentifier(value.createdByPeerId) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt))) {
+    throw new Error('album control returned an invalid resource');
+  }
+  return {
+    albumId: value.albumId, libraryId: value.libraryId, title: value.title,
+    createdByPeerId: value.createdByPeerId, createdAt: value.createdAt
+  };
+}
+
+function projectAlbumPage(value: AlbumPage, libraryId: string, limit: number): AlbumPage {
+  if (!isPlainRecord(value) || !Array.isArray(value.items) || value.items.length > limit ||
+    !(value.nextCursor === null || typeof value.nextCursor === 'string')) {
+    throw new Error('album control returned an invalid page');
+  }
+  const items = value.items.map((item) => projectAlbumRecord(item as AlbumRecord, libraryId));
+  if (new Set(items.map((item) => item.albumId)).size !== items.length) throw new Error('album control returned duplicate records');
+  const nextCursor = validateAlbumOutputCursor(value.nextCursor, { collection: 'albums', libraryId }, items.length, limit);
+  return { items, nextCursor };
+}
+
+function projectAlbumMemberPage(value: AlbumMemberPage, libraryId: string, albumId: string, limit: number): AlbumMemberPage {
+  if (!isPlainRecord(value) || !Array.isArray(value.items) || value.items.length > limit ||
+    !(value.nextCursor === null || typeof value.nextCursor === 'string')) {
+    throw new Error('album control returned an invalid member page');
+  }
+  const items = value.items.map((item) => {
+    if (!isPlainRecord(item) || !isValidAlbumIdentifier(item.assetId)) throw new Error('album control returned an invalid member');
+    return { assetId: item.assetId };
+  });
+  if (new Set(items.map((item) => item.assetId)).size !== items.length) throw new Error('album control returned duplicate members');
+  const nextCursor = validateAlbumOutputCursor(value.nextCursor, { collection: 'members', libraryId, albumId }, items.length, limit);
+  return { items, nextCursor };
+}
+
+function validateAlbumOutputCursor(
+  cursor: string | null, scope: AlbumCursorScope, itemCount: number, limit: number
+): string | null {
+  if (cursor === null) return null;
+  if (itemCount !== limit) throw new Error('album control returned a cursor for an incomplete page');
+  try { decodeAlbumCursor(cursor, scope); } catch { throw new Error('album control returned an invalid cursor'); }
+  return cursor;
+}
+
+function isValidAlbumIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\\/\0]/.test(value);
+}
+
+function readAlbumOperationId(request: IncomingMessage): string | undefined {
+  const header = request.headers['idempotency-key'];
+  if (typeof header !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(header)) return undefined;
+  return header.toLowerCase();
+}
+
+function albumRequestFingerprint(
+  principalId: string, method: string, libraryId: string, albumId: string | undefined, assetId: string | undefined, body: unknown
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    apiVersion: 1, principalId, method, libraryId, albumId: albumId ?? null, assetId: assetId ?? null, body
+  })).digest('hex');
+}
+
+function readFavoriteOperationId(request: IncomingMessage): string | undefined {
+  const header = request.headers['idempotency-key'];
+  if (typeof header !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(header)) return undefined;
+  return header.toLowerCase();
+}
+
+function favoriteRequestFingerprint(principalId: string, libraryId: string, assetId: string, favorite: boolean): string {
+  return createHash('sha256').update(JSON.stringify({ apiVersion: 1, principalId, method: 'PUT', libraryId, assetId, favorite })).digest('hex');
+}
+
+function readRatingOperationId(request: IncomingMessage): string | undefined {
+  const header = request.headers['idempotency-key'];
+  if (typeof header !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(header)) return undefined;
+  return header.toLowerCase();
+}
+
+function isValidRating(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= 5);
+}
+
+function ratingRequestFingerprint(principalId: string, libraryId: string, assetId: string, rating: number | null): string {
+  return createHash('sha256').update(JSON.stringify({ apiVersion: 1, principalId, method: 'PUT', libraryId, assetId, rating })).digest('hex');
+}
+
 async function handlePairingRequest(
   request: IncomingMessage, response: ServerResponse, options: NodeAgentServerOptions, requestId: string, pathname: string
 ): Promise<boolean> {
@@ -407,6 +1158,149 @@ async function handlePairingRequest(
     sendJson(response, 200, { peers: control.listPeers(), pending: control.listPending() });
     return true;
   }
+  const tagWritersPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/tag-writers$/);
+  if (request.method === 'GET' && tagWritersPath?.[1]) {
+    if (!control.listTagWriters) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    sendJson(response, 200, { writers: control.listTagWriters(decodeURIComponent(tagWritersPath[1])) });
+    return true;
+  }
+  const tagStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/tag-sync-status$/);
+  if (request.method === 'GET' && tagStatusPath?.[1]) {
+    if (!control.getTagSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    sendJson(response, 200, control.getTagSyncStatus(decodeURIComponent(tagStatusPath[1])));
+    return true;
+  }
+  const albumGrantListPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/album-sync-grants$/);
+  if (request.method === 'GET' && albumGrantListPath?.[1]) {
+    if (!control.listAlbumSyncGrants) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.listAlbumSyncGrants(decodeURIComponent(albumGrantListPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectAlbumSyncGrantList(result));
+    return true;
+  }
+  const albumStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/album-sync-status$/);
+  if (request.method === 'GET' && albumStatusPath?.[1]) {
+    if (!control.getAlbumSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.getAlbumSyncStatus(decodeURIComponent(albumStatusPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectAlbumSyncStatus(result));
+    return true;
+  }
+  const favoriteGrantListPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/favorite-sync-grants$/);
+  if (request.method === 'GET' && favoriteGrantListPath?.[1]) {
+    if (!control.listFavoriteSyncGrants) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.listFavoriteSyncGrants(decodeURIComponent(favoriteGrantListPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectFavoriteSyncGrantList(result));
+    return true;
+  }
+  const favoriteStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/favorite-sync-status$/);
+  if (request.method === 'GET' && favoriteStatusPath?.[1]) {
+    if (!control.getFavoriteSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.getFavoriteSyncStatus(decodeURIComponent(favoriteStatusPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectFavoriteSyncStatus({
+      peerId: decodeURIComponent(favoriteStatusPath[1]), pendingEvents: result.pending,
+      lastErrorCode: result.lastError === null ? null : /denied|unauthori[sz]ed|write/i.test(result.lastError)
+        ? 'unauthorized' : /conflict|invalid|sequence/i.test(result.lastError) ? 'conflict' : 'unavailable'
+    }));
+    return true;
+  }
+  const favoriteGrantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/favorite-write$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && favoriteGrantPath?.[1] && favoriteGrantPath[2]) {
+    const update = request.method === 'PUT' ? control.grantFavoriteWrite : control.revokeFavoriteWrite;
+    if (!update) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (request.method === 'PUT') {
+      if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+      const body = await readJsonBody(request, 8 * 1024);
+      if (!isPlainRecord(body) || !hasExactKeys(body, ['enabled']) || body.enabled !== true) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+    }
+    try {
+      const result = update.call(control, decodeURIComponent(favoriteGrantPath[1]), decodeURIComponent(favoriteGrantPath[2]), new Date().toISOString());
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, projectFavoriteSyncGrantStatus(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof FavoriteSyncConflictError) sendJson(response, 409, { error: 'conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
+  const ratingGrantListPath = pathname.match(/^\/v1\/pairing\/libraries\/([^/]+)\/rating-sync-grants$/);
+  if (request.method === 'GET' && ratingGrantListPath?.[1]) {
+    if (!control.listRatingSyncGrants) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const result = control.listRatingSyncGrants(decodeURIComponent(ratingGrantListPath[1]));
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectRatingSyncGrantList(result));
+    return true;
+  }
+  const ratingStatusPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/rating-sync-status$/);
+  if (request.method === 'GET' && ratingStatusPath?.[1]) {
+    if (!control.getRatingSyncStatus) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    const peerId = decodeURIComponent(ratingStatusPath[1]);
+    const result = control.getRatingSyncStatus(peerId);
+    if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+    else sendJson(response, 200, projectRatingSyncStatus({
+      peerId, pendingEvents: result.pending,
+      lastErrorCode: result.lastError === null ? null : /denied|unauthori[sz]ed|write/i.test(result.lastError)
+        ? 'unauthorized' : /conflict|invalid|sequence/i.test(result.lastError) ? 'conflict' : 'unavailable'
+    }));
+    return true;
+  }
+  const ratingGrantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/rating-write$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && ratingGrantPath?.[1] && ratingGrantPath[2]) {
+    const update = request.method === 'PUT' ? control.grantRatingWrite : control.revokeRatingWrite;
+    if (!update) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (request.method === 'PUT') {
+      if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+      const body = await readJsonBody(request, 8 * 1024);
+      if (!isPlainRecord(body) || !hasExactKeys(body, ['enabled']) || body.enabled !== true) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+    }
+    try {
+      const result = update.call(control, decodeURIComponent(ratingGrantPath[1]), decodeURIComponent(ratingGrantPath[2]), new Date().toISOString());
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, projectRatingSyncGrantStatus(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError || error instanceof RatingSyncConflictError) sendJson(response, 409, { error: 'conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
+  const albumGrantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/(album-write|album-delete)$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && albumGrantPath?.[1] && albumGrantPath[2] && albumGrantPath[3]) {
+    const permission = albumGrantPath[3] as AlbumSyncPermission;
+    const update = request.method === 'PUT'
+      ? permission === 'album-write' ? control.grantAlbumWrite : control.grantAlbumDelete
+      : permission === 'album-write' ? control.revokeAlbumWrite : control.revokeAlbumDelete;
+    if (!update) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    if (request.method === 'PUT') {
+      if (!/^application\/json(?:\s*;|$)/i.test(headerValue(request, 'content-type') ?? '')) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+      const body = await readJsonBody(request, 8 * 1024);
+      if (!isPlainRecord(body) || !hasExactKeys(body, ['enabled']) || body.enabled !== true) {
+        sendJson(response, 400, { error: 'invalid_request', requestId }); return true;
+      }
+    }
+    try {
+      const peerId = decodeURIComponent(albumGrantPath[1]);
+      const libraryId = decodeURIComponent(albumGrantPath[2]);
+      const result = update.call(control, peerId, libraryId, new Date().toISOString());
+      if (!result) sendJson(response, 404, { error: 'not_found', requestId });
+      else sendJson(response, 200, projectAlbumSyncGrantStatus(result));
+    } catch (error) {
+      if (error instanceof RepositoryConflictError) sendJson(response, 409, { error: 'conflict', requestId });
+      else throw error;
+    }
+    return true;
+  }
   if (request.method === 'GET' && pathname === '/v1/pairing/discovered') {
     sendJson(response, 200, { peers: control.listDiscoveredPeers() });
     return true;
@@ -428,6 +1322,23 @@ async function handlePairingRequest(
     if (!isPairingApproval(body)) { sendJson(response, 400, { error: 'invalid_request', requestId }); return true; }
     const approved = control.decide(decodeURIComponent(approvalPath[1]), body);
     sendJson(response, approved ? 200 : 404, approved ? { status: 'decided' } : { error: 'pending_request_not_found', requestId });
+    return true;
+  }
+  const tagWritePath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)\/tag-write$/);
+  if ((request.method === 'PUT' || request.method === 'DELETE') && tagWritePath?.[1] && tagWritePath[2]) {
+    const change = request.method === 'PUT' ? control.grantTagWrite : control.revokeTagWrite;
+    if (!change) { sendJson(response, 503, { error: 'capability_unavailable', requestId }); return true; }
+    try {
+      change.call(control, decodeURIComponent(tagWritePath[1]), decodeURIComponent(tagWritePath[2]));
+      if (request.method === 'DELETE') {
+        sendJson(response, 200, { status: 'revoked', replicatedEventsRemain: true });
+      } else {
+        response.writeHead(204, { 'X-Request-ID': requestId });
+        response.end();
+      }
+    } catch {
+      sendJson(response, 409, { error: 'tag_write_grant_rejected', requestId });
+    }
     return true;
   }
   const grantPath = pathname.match(/^\/v1\/pairing\/peers\/([^/]+)\/libraries\/([^/]+)$/);
@@ -479,6 +1390,15 @@ function decodePathSegment(value: string | undefined): string | undefined {
   } catch { return undefined; }
 }
 
+function decodeTagSegment(value: string): string | undefined {
+  try { return decodeURIComponent(value); } catch { return undefined; }
+}
+
+function normalizeAssetTag(value: string): string | undefined {
+  const tag = value.trim();
+  return tag.length > 0 && !tag.includes('\0') && Buffer.byteLength(tag, 'utf8') <= maxAssetTagUtf8Bytes ? tag : undefined;
+}
+
 function isRestoreTombstoneRequest(value: unknown): value is { libraryId: string; eventId: string } {
   return isPlainRecord(value) && hasExactKeys(value, ['libraryId', 'eventId']) &&
     typeof value.libraryId === 'string' && value.libraryId.length > 0 && value.libraryId.length <= 128 && !/[\\/\0]/.test(value.libraryId) &&
@@ -502,6 +1422,13 @@ function isCreateMediaVersionRequest(value: unknown): value is CreateMediaVersio
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function redactPathFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactPathFields(item));
+  if (!isPlainRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+    key === 'sourcePath' || key === 'originalPath' ? [key, null] : [key, redactPathFields(item)]));
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {
@@ -528,6 +1455,7 @@ const thumbnailErrorStatuses: Record<string, number> = {
   NOT_FOUND: 404,
   SOURCE_CHANGED: 409,
   SOURCE_OFFLINE: 409,
+  SOURCE_MISSING: 409,
   TOO_LARGE: 413,
   UNSUPPORTED_MEDIA: 415,
   PROCESSING_FAILED: 500,
@@ -664,7 +1592,8 @@ function isAllowedLocalOrigin(value: string): boolean {
     const origin = new URL(value);
     return origin.protocol === 'tauri:' && origin.hostname === 'localhost' ||
       (origin.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) ||
-      (origin.protocol === 'https:' && origin.hostname === 'tauri.localhost');
+      (origin.protocol === 'http:' && origin.hostname === 'tauri.localhost' && origin.port === '') ||
+      (origin.protocol === 'https:' && origin.hostname === 'tauri.localhost' && origin.port === '');
   } catch { return false; }
 }
 

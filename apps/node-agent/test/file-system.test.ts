@@ -32,8 +32,9 @@ describe('managed upload filesystem', () => {
     await store.writeExclusive('staging/session/chunk.bin', new TextEncoder().encode('part-'));
     await store.writeExclusive('staging/session/chunk-2.bin', new TextEncoder().encode('bytes'));
     await store.flush('staging/session/chunk.bin');
-    const assembled = await store.assembleAndHash(['staging/session/chunk.bin', 'staging/session/chunk-2.bin'], 'staging/session/assembled.tmp');
+    const assembled = await store.assembleAndHash(['staging/session/chunk.bin', 'staging/session/chunk-2.bin'], 'staging/session/assembled.tmp', 5);
     expect(assembled.byteLength).toBe(10);
+    expect(assembled.prefix).toEqual(new TextEncoder().encode('part-'));
     expect((await store.hashFile('staging/session/assembled.tmp')).sha256).toBe(assembled.sha256);
     await store.flush('staging/session/assembled.tmp');
     expect(await store.publishNoReplace('staging/session/assembled.tmp', 'objects/session/original.blob')).toBe('created');
@@ -113,5 +114,16 @@ describe('managed upload filesystem', () => {
     await expect(store.writeExclusive('staging/media-versions/version.part', new TextEncoder().encode('escape')))
       .rejects.toThrow('managed storage parent must be a real directory');
     expect(await readdir(outside)).toEqual([]);
+  });
+
+  it('captures a bounded prefix in the same hash pass without changing the managed original', async () => {
+    const store = await createStore();
+    const bytes = new TextEncoder().encode('immutable-photo-data');
+    await store.writeExclusive('objects/photo.bin', bytes);
+    const digest = await store.hashFile('objects/photo.bin', 7);
+    expect(digest.prefix).toEqual(new TextEncoder().encode('immutab'));
+    expect(digest.byteLength).toBe(bytes.byteLength);
+    expect(await readFile(join(roots.at(-1)!, 'objects/photo.bin'))).toEqual(Buffer.from(bytes));
+    await expect(store.hashFile('objects/photo.bin', 1024 * 1024 + 1)).rejects.toThrow('invalid bounded prefix size');
   });
 });

@@ -1,8 +1,12 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import { appendMetadataAudit, type AuditRepository } from '../audit/audit-repository.js';
 import { migrations, type Migration } from './migrations.js';
+import { maxAssetTagsPerAsset } from '../asset-tag-limits.js';
+import { decodeAlbumCursor, encodeAlbumCursor, type AlbumCursorScope } from '../albums/album-utils.js';
 import { SyncRepository } from '../sync/sync-repository.js';
 import type { EventDraftFactory } from '../sync/event-envelope.js';
+import { isCanonicalCaptureLocalTime, isCaptureDateMetadata, type CaptureDateMetadata, type CaptureDateConfidence, type CaptureDateSource } from '../metadata/capture-date.js';
 
 export type UploadState = 'created' | 'uploading' | 'verifying' | 'completed' | 'failed';
 export type AssetKind = 'photo' | 'video' | 'live_photo';
@@ -54,6 +58,7 @@ export interface CompletedLocationRecord {
 }
 
 export interface ExternalLocationRecord {
+  captureDate: CaptureDateMetadata;
   locationId: string;
   fileId: string;
   assetId: string;
@@ -102,11 +107,111 @@ export interface LibraryIndexAsset {
 export interface GalleryAssetRecord extends LibraryIndexAsset {
   filename: string;
   capturedAt: string | null;
+  captureLocalTime: string | null;
+  captureOffsetMinutes: number | null;
+  captureSource: CaptureDateSource;
+  captureConfidence: CaptureDateConfidence;
   sourcePath: string | null;
   sourceKind: SourceKind;
   byteSize: number;
   version: string;
+  tags: string[];
+  favorite: boolean;
+  rating: number | null;
+  ratingConflict: boolean;
+  ratingCandidates: Array<number | null>;
 }
+
+export interface DuplicateCandidateAsset {
+  assetId: string;
+  originNodeId: string;
+  kind: AssetKind;
+  sha256: string;
+  byteSize: number;
+  filename: string;
+  sourcePath: string | null;
+  sourceKind: SourceKind;
+  availability: 'online' | 'cached' | 'offline' | 'missing';
+}
+
+export interface DuplicateCandidateGroup {
+  sha256: string;
+  byteSize: number;
+  assets: DuplicateCandidateAsset[];
+  truncated: boolean;
+}
+
+export interface GallerySearchFilters {
+  q?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  kind?: AssetKind;
+  sourceKind?: SourceKind;
+  availability?: GalleryAssetRecord['availability'];
+}
+
+export type AssetTagMutationResult = 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'limit_reached';
+
+export interface AlbumRecord {
+  albumId: string;
+  libraryId: string;
+  title: string;
+  createdByPeerId: string;
+  createdAt: string;
+}
+
+export interface AlbumPage {
+  items: AlbumRecord[];
+  nextCursor: string | null;
+}
+
+export interface AlbumMemberPage {
+  items: Array<{ assetId: string }>;
+  nextCursor: string | null;
+}
+
+export interface AlbumOperationContext {
+  operationId: string;
+  principalId: string;
+  authorPeerId: string;
+  libraryId: string;
+  requestFingerprint: string;
+  createdAt: string;
+  requestId?: string;
+}
+
+export interface AlbumOperationEventDraftInput {
+  operationId: string;
+  authorPeerId: string;
+  libraryId: string;
+  albumId: string;
+  assetId: string | null;
+  operationType: 'album.created' | 'member.added' | 'member.removed';
+  createdAt: string;
+  title?: string;
+  observedAddIds?: readonly string[];
+}
+export type AlbumOperationEventDrafter = (input: AlbumOperationEventDraftInput) => void;
+
+export interface AlbumLifecycleEventDraftInput {
+  operationId: string;
+  authorPeerId: string;
+  libraryId: string;
+  albumId: string;
+  operationType: 'album.deleted' | 'album.restored';
+  createdAt: string;
+  observedDeleteIds?: readonly string[];
+}
+export type AlbumLifecycleEventDrafter = (input: AlbumLifecycleEventDraftInput) => void;
+export type AlbumDeleteScope = 'local' | 'global';
+export type AlbumDeletedQueryScope = 'all' | AlbumDeleteScope;
+export interface DeletedAlbumRecord extends AlbumRecord { scopes: AlbumDeleteScope[]; deletedAt: string }
+export interface DeletedAlbumPage { items: DeletedAlbumRecord[]; nextCursor: string | null }
+export type AlbumDeletionResult = 'deleted' | 'already_deleted' | 'not_found' | 'writer_limit';
+export type AlbumRestoreResult = 'restored' | 'already_active' | 'not_found' | 'writer_limit';
+
+export type AlbumMemberMutationResult =
+  | { status: 'added' | 'already_present' | 'removed' | 'unchanged' | 'not_found' | 'writer_limit'; observedAddIds?: string[] };
 
 export interface GalleryMediaRecord {
   libraryId: string;
@@ -172,6 +277,7 @@ export interface CreateMediaVersionRecord {
 
 export interface UploadRepository {
   getUploadSession(sessionId: string): UploadSessionRecord | undefined;
+  listRecoverableUploadSessionIds(now: string): string[];
   getUploadSessionByIdempotency(scope: string, key: string): UploadSessionRecord | undefined;
   createUploadSession(record: CreateUploadSessionRecord): void;
   getUploadChunk(sessionId: string, chunkIndex: number): UploadChunkRecord | undefined;
@@ -179,7 +285,8 @@ export interface UploadRepository {
   recordChunk(record: UploadChunkRecord, expectedOffset: number, now: string): void;
   markVerifying(sessionId: string, now: string): void;
   markFailed(sessionId: string, now: string): void;
-  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string, eventFactory?: EventDraftFactory): void;
+  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string,
+    captureDate: CaptureDateMetadata, eventFactory?: EventDraftFactory): void;
   getLocationForSession(sessionId: string): CompletedLocationRecord | undefined;
 }
 
@@ -197,9 +304,17 @@ export class RepositoryConflictError extends Error {
   }
 }
 
+export class StaleGalleryCursorError extends Error {
+  constructor() {
+    super('legacy null-date cursor must be restarted');
+    this.name = 'StaleGalleryCursorError';
+  }
+}
+
 export interface RepositoryFaults {
   beforeFinalize?: () => void;
   beforeRecordChunk?: () => void;
+  beforeAlbumOperationCommit?: () => void;
   backupBeforeMigration?: () => Promise<void>;
 }
 
@@ -259,11 +374,64 @@ interface MediaVersionSqlRow {
   updated_at: string;
 }
 
+export function assertQuickCheckResults(results: unknown): void {
+  if (!Array.isArray(results) || results.length !== 1) throw new Error('database integrity check failed');
+  const row: unknown = results[0];
+  if (typeof row !== 'object' || row === null || !('quick_check' in row) || row.quick_check !== 'ok') {
+    throw new Error('database integrity check failed');
+  }
+}
+
+export function verifySqliteIntegrity(database: Database.Database): void {
+  try {
+    assertQuickCheckResults(database.prepare('PRAGMA quick_check').all());
+  } catch {
+    throw new Error('database integrity check failed');
+  }
+}
+
 export class SqliteRepository implements UploadRepository {
-  constructor(private readonly db: Database.Database, private readonly faults: RepositoryFaults = {}) {
+  private albumOperationEventDrafter: AlbumOperationEventDrafter | undefined;
+  private albumLifecycleEventDrafter: AlbumLifecycleEventDrafter | undefined;
+
+  constructor(
+    private readonly db: Database.Database,
+    private readonly faults: RepositoryFaults = {},
+    private readonly auditRepository?: AuditRepository
+  ) {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('journal_mode = WAL');
+  }
+
+  setAlbumOperationEventDrafter(drafter: AlbumOperationEventDrafter): void {
+    this.albumOperationEventDrafter = drafter;
+  }
+
+  setAlbumLifecycleEventDrafter(drafter: AlbumLifecycleEventDrafter): void {
+    this.albumLifecycleEventDrafter = drafter;
+  }
+
+  verifyIntegrity(): void {
+    verifySqliteIntegrity(this.db);
+  }
+
+  recoverInterruptedJobs(now: string): number {
+    const recover = this.db.transaction(() => {
+      this.db.prepare(`UPDATE upload_sessions SET state = 'failed', updated_at = ?
+        WHERE state IN ('created', 'uploading', 'verifying') AND expires_at <= ?`).run(now, now);
+      const expired = this.db.prepare(`UPDATE jobs SET state = 'failed', lease_until = NULL, updated_at = ?
+        WHERE job_type = 'upload' AND state IN ('queued', 'running')
+          AND EXISTS (SELECT 1 FROM upload_sessions s
+            WHERE s.session_id = jobs.job_id AND s.state = 'failed' AND s.expires_at <= ?)`).run(now, now);
+      const requeued = this.db.prepare(`UPDATE jobs SET state = 'queued', lease_until = NULL, updated_at = ?
+        WHERE job_type = 'upload' AND state = 'running'
+          AND EXISTS (SELECT 1 FROM upload_sessions s
+            WHERE s.session_id = jobs.job_id AND s.state IN ('created', 'uploading', 'verifying') AND s.expires_at > ?)`)
+        .run(now, now);
+      return expired.changes + requeued.changes;
+    });
+    return recover.immediate();
   }
 
   async migrate(orderedMigrations: readonly Migration[] = migrations): Promise<void> {
@@ -442,51 +610,658 @@ export class SqliteRepository implements UploadRepository {
     return rows.map((row) => ({ libraryId: row.library_id, title: row.library_id }));
   }
 
-  listGalleryAssets(libraryId: string, cursor: string | undefined, limit: number, query = ''): { items: GalleryAssetRecord[]; nextCursor: string | null } {
-    const position = cursor ? decodeGalleryCursor(cursor) : undefined;
-    const localCursorSql = !position ? '' : position.capturedAt === null
-      ? 'AND a.capture_ts IS NULL AND a.asset_id < ?'
-      : 'AND (a.capture_ts < ? OR a.capture_ts IS NULL OR (a.capture_ts = ? AND a.asset_id < ?))';
-    const localCursorArgs = !position ? [] : position.capturedAt === null
-      ? [position.assetId]
-      : [position.capturedAt, position.capturedAt, position.assetId];
-    const localRows = this.db.prepare(`SELECT a.asset_id, a.library_id, a.origin_node_id, a.kind, a.capture_ts AS captured_at,
-        f.sha256, f.byte_size, COALESCE(l.original_filename, a.asset_id) AS filename, l.original_path AS source_path,
-        COALESCE(l.source_kind, 'import') AS source_kind, COALESCE(l.availability, 'missing') AS availability
-      FROM assets a LEFT JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
-      LEFT JOIN file_locations l ON l.location_id = (SELECT candidate.location_id FROM file_locations candidate
-        WHERE candidate.file_id = f.file_id AND candidate.node_id = a.origin_node_id
-        ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END LIMIT 1)
-      WHERE a.library_id = ? AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p
-        WHERE p.library_id = a.library_id AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
-        AND (? = '' OR instr(lower(COALESCE(l.original_filename, a.asset_id)), lower(?)) > 0 OR
-          instr(lower(a.asset_id), lower(?)) > 0 OR instr(lower(a.origin_node_id), lower(?)) > 0 OR
-          instr(lower(COALESCE(l.original_path, '')), lower(?)) > 0)
-        ${localCursorSql}
-      ORDER BY a.capture_ts DESC, a.asset_id DESC LIMIT ?`).all(
-        libraryId, query, query, query, query, query, ...localCursorArgs, limit + 1
-      ) as GalleryAssetSqlRow[];
-    const projectionCursorSql = position?.capturedAt === null ? 'AND p.asset_id < ?' : '';
-    const projectionCursorArgs = position?.capturedAt === null ? [position.assetId] : [];
-    const projectionRows = this.db.prepare(`SELECT p.asset_id, p.library_id, p.origin_node_id, p.kind, NULL AS captured_at,
-        p.sha256, p.byte_length AS byte_size,
-        COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id) AS filename,
-        json_extract(p.metadata_json, '$.sourcePath') AS source_path,
-        COALESCE(json_extract(p.metadata_json, '$.sourceKind'), 'import') AS source_kind, 'missing' AS availability
-      FROM sync_asset_projection p WHERE p.library_id = ? AND p.tombstone_event_id IS NULL
+  createAlbum(input: AlbumOperationContext & { title: string }): AlbumRecord | 'writer_limit' | undefined {
+    const write = this.db.transaction((): AlbumRecord | 'writer_limit' | undefined => {
+      const replay = this.getAlbumOperationReplay<AlbumRecord>(input, ['album.created']);
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.create', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: replay.albumId, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
+      if (!this.hasGalleryLibrary(input.libraryId)) return undefined;
+      if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return 'writer_limit';
+      const album: AlbumRecord = {
+        albumId: randomUUID(), libraryId: input.libraryId, title: input.title,
+        createdByPeerId: input.authorPeerId, createdAt: input.createdAt
+      };
+      this.db.prepare(`INSERT INTO albums (album_id, library_id, title, created_by_peer_id, created_at)
+        VALUES (?, ?, ?, ?, ?)`).run(album.albumId, album.libraryId, album.title, album.createdByPeerId, album.createdAt);
+      this.insertAlbumOperation(input, album.albumId, null, 'album.created', album);
+      this.albumOperationEventDrafter?.({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: album.albumId, assetId: null, operationType: 'album.created', createdAt: input.createdAt, title: album.title
+      });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.create', resourceType: 'virtual_album', libraryId: input.libraryId,
+        resourceId: album.albumId, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
+      this.faults.beforeAlbumOperationCommit?.();
+      return album;
+    });
+    return write.immediate();
+  }
+
+  listAlbums(libraryId: string, cursor: string | undefined, limit: number): AlbumPage | undefined {
+    this.validateAlbumLimit(limit);
+    if (!this.hasGalleryLibrary(libraryId)) return undefined;
+    const scope: AlbumCursorScope = { collection: 'albums', libraryId };
+    const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, scope);
+    const visibilityFilter = this.hasAlbumLifecycleTables() ? `
+        AND NOT EXISTS (SELECT 1 FROM album_local_visibility v WHERE v.library_id = albums.library_id AND v.album_id = albums.album_id)
+        AND NOT EXISTS (SELECT 1 FROM album_global_delete_tokens d WHERE d.library_id = albums.library_id AND d.album_id = albums.album_id
+          AND NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id))` : '';
+    const rows = this.db.prepare(`SELECT album_id, library_id, title, created_by_peer_id, created_at FROM albums
+      WHERE library_id = ? ${visibilityFilter}
+        ${lastId === undefined ? '' : 'AND album_id COLLATE BINARY > ?'}
+      ORDER BY album_id COLLATE BINARY LIMIT ?`).all(
+        libraryId, ...(lastId === undefined ? [] : [lastId]), limit + 1
+      ) as AlbumSqlRow[];
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(toAlbumRecord);
+    return {
+      items,
+      nextCursor: hasMore && items.length > 0 ? encodeAlbumCursor(scope, items[items.length - 1]!.albumId) : null
+    };
+  }
+
+  listDeletedAlbums(libraryId: string, scope: AlbumDeletedQueryScope, cursor: string | undefined, limit: number): DeletedAlbumPage | undefined {
+    this.validateAlbumLimit(limit);
+    if (!this.hasAlbumLifecycleTables() || !this.hasGalleryLibrary(libraryId)) return undefined;
+    const cursorScope: AlbumCursorScope = { collection: 'deleted', libraryId, scope };
+    const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, cursorScope);
+    const filter = scope === 'all' ? '(local_hidden_at IS NOT NULL OR global_deleted_at IS NOT NULL)'
+      : scope === 'local' ? 'local_hidden_at IS NOT NULL' : 'global_deleted_at IS NOT NULL';
+    const rows = this.db.prepare(`WITH active_global AS (
+        SELECT d.library_id, d.album_id, MAX(d.created_at) AS global_deleted_at
+        FROM album_global_delete_tokens d
+        WHERE NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id)
+        GROUP BY d.library_id, d.album_id
+      ), album_state AS (
+        SELECT a.album_id, a.library_id, a.title, a.created_by_peer_id, a.created_at,
+          v.hidden_at AS local_hidden_at, g.global_deleted_at
+        FROM albums a
+        LEFT JOIN album_local_visibility v ON v.library_id = a.library_id AND v.album_id = a.album_id
+        LEFT JOIN active_global g ON g.library_id = a.library_id AND g.album_id = a.album_id
+        WHERE a.library_id = ?
+      )
+      SELECT album_id, library_id, title, created_by_peer_id, created_at, local_hidden_at, global_deleted_at
+      FROM album_state WHERE ${filter} ${lastId === undefined ? '' : 'AND album_id COLLATE BINARY > ?'}
+      ORDER BY album_id COLLATE BINARY LIMIT ?`).all(
+        libraryId, ...(lastId === undefined ? [] : [lastId]), limit + 1
+      ) as DeletedAlbumSqlRow[];
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map((row): DeletedAlbumRecord => {
+      const scopes: AlbumDeleteScope[] = [];
+      if (row.local_hidden_at !== null) scopes.push('local');
+      if (row.global_deleted_at !== null) scopes.push('global');
+      const deletedAt = [row.local_hidden_at, row.global_deleted_at].filter((value): value is string => value !== null).sort()[0]!;
+      return { ...toAlbumRecord(row), scopes, deletedAt };
+    });
+    return {
+      items,
+      nextCursor: hasMore && items.length > 0 ? encodeAlbumCursor(cursorScope, items[items.length - 1]!.albumId) : null
+    };
+  }
+
+  deleteAlbum(input: AlbumOperationContext & { albumId: string; scope: AlbumDeleteScope }): AlbumDeletionResult {
+    const write = this.db.transaction((): AlbumDeletionResult => {
+      const replay = this.getAlbumLifecycleReplay<AlbumDeletionResult>(input, input.scope, ['local.hidden', 'local.hide.noop', 'album.deleted', 'album.delete.noop']);
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
+      if (!this.hasAlbum(input.libraryId, input.albumId)) return 'not_found';
+      if (input.scope === 'local') {
+        const hidden = this.db.prepare('SELECT 1 FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
+          .get(input.libraryId, input.albumId);
+        const result: AlbumDeletionResult = hidden ? 'already_deleted' : 'deleted';
+        const operationType = hidden ? 'local.hide.noop' : 'local.hidden';
+        this.insertAlbumVisibilityOperation(input, input.albumId, operationType, result);
+        if (!hidden) this.db.prepare(`INSERT INTO album_local_visibility(library_id,album_id,operation_id,hidden_at) VALUES(?,?,?,?)`)
+          .run(input.libraryId, input.albumId, input.operationId, input.createdAt);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: hidden ? 'unchanged' : 'applied', requestId: input.requestId, createdAt: input.createdAt
+        });
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      if (!this.canAuthorAlbumLifecycleOperation(input.libraryId, input.authorPeerId)) return 'writer_limit';
+      const active = this.getActiveAlbumDeleteIds(input.libraryId, input.albumId);
+      if (active.length > 0) {
+        const result: AlbumDeletionResult = 'already_deleted';
+        this.insertAlbumLifecycleOperation(input, input.albumId, 'album.delete.noop', [], result);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      if (!this.albumLifecycleEventDrafter) throw new RepositoryConflictError('album lifecycle event drafter is unavailable');
+      const result: AlbumDeletionResult = 'deleted';
+      this.insertAlbumLifecycleOperation(input, input.albumId, 'album.deleted', [], result);
+      this.db.prepare(`INSERT INTO album_global_delete_tokens(delete_event_id,library_id,album_id,author_peer_id,created_at)
+        VALUES(?,?,?,?,?)`).run(input.operationId, input.libraryId, input.albumId, input.authorPeerId, input.createdAt);
+      this.albumLifecycleEventDrafter({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, operationType: 'album.deleted', createdAt: input.createdAt
+      });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.delete', resourceType: 'virtual_album', libraryId: input.libraryId,
+        resourceId: input.albumId, scope: input.scope, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
+  restoreAlbum(input: AlbumOperationContext & { albumId: string; scope: AlbumDeleteScope }): AlbumRestoreResult {
+    const write = this.db.transaction((): AlbumRestoreResult => {
+      const replay = this.getAlbumLifecycleReplay<AlbumRestoreResult>(input, input.scope, ['local.restored', 'local.restore.noop', 'album.restored', 'album.restore.noop']);
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
+      if (!this.hasAlbum(input.libraryId, input.albumId)) return 'not_found';
+      if (input.scope === 'local') {
+        const hidden = this.db.prepare('SELECT 1 FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
+          .get(input.libraryId, input.albumId);
+        const result: AlbumRestoreResult = hidden ? 'restored' : 'already_active';
+        const operationType = hidden ? 'local.restored' : 'local.restore.noop';
+        this.insertAlbumVisibilityOperation(input, input.albumId, operationType, result);
+        if (hidden) this.db.prepare('DELETE FROM album_local_visibility WHERE library_id = ? AND album_id = ?')
+          .run(input.libraryId, input.albumId);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: hidden ? 'applied' : 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      const observedDeleteIds = this.getActiveAlbumDeleteIds(input.libraryId, input.albumId);
+      if (observedDeleteIds.length > 64) return 'writer_limit';
+      if (!this.canAuthorAlbumLifecycleOperation(input.libraryId, input.authorPeerId)) return 'writer_limit';
+      if (observedDeleteIds.length === 0) {
+        const result: AlbumRestoreResult = 'already_active';
+        this.insertAlbumLifecycleOperation(input, input.albumId, 'album.restore.noop', [], result);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+          resourceId: input.albumId, scope: input.scope, outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      if (!this.albumLifecycleEventDrafter) throw new RepositoryConflictError('album lifecycle event drafter is unavailable');
+      const result: AlbumRestoreResult = 'restored';
+      this.insertAlbumLifecycleOperation(input, input.albumId, 'album.restored', observedDeleteIds, result);
+      const insertTarget = this.db.prepare(`INSERT INTO album_global_restore_targets
+        (restore_operation_id,observed_delete_event_id,library_id,album_id) VALUES(?,?,?,?)`);
+      for (const deleteEventId of observedDeleteIds) insertTarget.run(input.operationId, deleteEventId, input.libraryId, input.albumId);
+      this.albumLifecycleEventDrafter({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, operationType: 'album.restored', createdAt: input.createdAt, observedDeleteIds
+      });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.restore', resourceType: 'virtual_album', libraryId: input.libraryId,
+        resourceId: input.albumId, scope: input.scope, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
+  listAlbumMembers(libraryId: string, albumId: string, cursor: string | undefined, limit: number): AlbumMemberPage | undefined {
+    this.validateAlbumLimit(limit);
+    if (!this.hasVisibleAlbum(libraryId, albumId)) return undefined;
+    const scope: AlbumCursorScope = { collection: 'members', libraryId, albumId };
+    const lastId = cursor === undefined ? undefined : decodeAlbumCursor(cursor, scope);
+    const rows = this.db.prepare(`SELECT DISTINCT m.asset_id FROM album_memberships m
+      WHERE m.library_id = ? AND m.album_id = ? ${lastId === undefined ? '' : 'AND m.asset_id COLLATE BINARY > ?'}
+        AND EXISTS (
+          SELECT 1 FROM assets a WHERE a.library_id = m.library_id AND a.asset_id = m.asset_id
+            AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id
+              AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+          UNION ALL
+          SELECT 1 FROM sync_asset_projection p WHERE p.library_id = m.library_id AND p.asset_id = m.asset_id
+            AND p.tombstone_event_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
+        )
+      ORDER BY m.asset_id COLLATE BINARY LIMIT ?`).all(
+        libraryId, albumId, ...(lastId === undefined ? [] : [lastId]), limit + 1
+      ) as Array<{ asset_id: string }>;
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map((row) => ({ assetId: row.asset_id }));
+    return {
+      items,
+      nextCursor: hasMore && items.length > 0 ? encodeAlbumCursor(scope, items[items.length - 1]!.assetId) : null
+    };
+  }
+
+  addAlbumMember(input: AlbumOperationContext & { albumId: string; assetId: string }): AlbumMemberMutationResult {
+    const write = this.db.transaction((): AlbumMemberMutationResult => {
+      const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.added', 'member.add.noop']);
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.member.add', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+          resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
+      if (!this.hasVisibleAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
+        return { status: 'not_found' };
+      }
+      if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return { status: 'writer_limit' };
+      const active = this.db.prepare(`SELECT add_operation_id FROM album_memberships
+        WHERE library_id = ? AND album_id = ? AND asset_id = ? AND author_peer_id = ?`)
+        .get(input.libraryId, input.albumId, input.assetId, input.authorPeerId) as { add_operation_id: string } | undefined;
+      if (active) {
+        const result: AlbumMemberMutationResult = { status: 'already_present' };
+        this.insertAlbumOperation(input, input.albumId, input.assetId, 'member.add.noop', result);
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.member.add', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+          resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+        });
+        this.faults.beforeAlbumOperationCommit?.();
+        return result;
+      }
+      const result: AlbumMemberMutationResult = { status: 'added' };
+      this.insertAlbumOperation(input, input.albumId, input.assetId, 'member.added', result);
+      this.db.prepare(`INSERT INTO album_memberships
+        (library_id, album_id, asset_id, author_peer_id, add_operation_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(input.libraryId, input.albumId, input.assetId,
+          input.authorPeerId, input.operationId, input.createdAt);
+      this.albumOperationEventDrafter?.({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, assetId: input.assetId, operationType: 'member.added', createdAt: input.createdAt
+      });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.member.add', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+        resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'applied', requestId: input.requestId, createdAt: input.createdAt
+      });
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
+  removeAlbumMember(input: AlbumOperationContext & { albumId: string; assetId: string }): AlbumMemberMutationResult {
+    const write = this.db.transaction((): AlbumMemberMutationResult => {
+      const replay = this.getAlbumOperationReplay<AlbumMemberMutationResult>(input, ['member.removed', 'member.remove.noop']);
+      if (replay !== undefined) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'virtual_album.member.remove', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+          resourceId: input.assetId, relatedResourceId: input.albumId, outcome: 'replayed', requestId: input.requestId, createdAt: input.createdAt
+        });
+        return replay;
+      }
+      if (!this.hasVisibleAlbum(input.libraryId, input.albumId) || !this.hasVisibleGalleryAsset(input.libraryId, input.assetId)) {
+        return { status: 'not_found' };
+      }
+      if (!this.canAuthorAlbumOperation(input.libraryId, input.authorPeerId)) return { status: 'writer_limit' };
+      const targets = this.db.prepare(`SELECT add_operation_id FROM album_memberships
+        WHERE library_id = ? AND album_id = ? AND asset_id = ? ORDER BY add_operation_id COLLATE BINARY`)
+        .all(input.libraryId, input.albumId, input.assetId) as Array<{ add_operation_id: string }>;
+      if (targets.length > 64) return { status: 'writer_limit' };
+      const observedAddIds = targets.map((target) => target.add_operation_id);
+      const result: AlbumMemberMutationResult = targets.length > 0
+        ? { status: 'removed', observedAddIds }
+        : { status: 'unchanged', observedAddIds: [] };
+      const operationType = targets.length > 0 ? 'member.removed' : 'member.remove.noop';
+      this.insertAlbumOperation(input, input.albumId, input.assetId, operationType, result);
+      for (const target of targets) {
+        this.db.prepare(`INSERT INTO album_membership_remove_targets
+          (remove_operation_id, observed_add_operation_id, library_id, album_id, asset_id)
+          VALUES (?, ?, ?, ?, ?)`).run(input.operationId, target.add_operation_id,
+            input.libraryId, input.albumId, input.assetId);
+        this.db.prepare(`DELETE FROM album_memberships WHERE library_id = ? AND album_id = ? AND asset_id = ?
+          AND add_operation_id = ?`).run(input.libraryId, input.albumId, input.assetId, target.add_operation_id);
+      }
+      if (targets.length > 0) this.albumOperationEventDrafter?.({
+        operationId: input.operationId, authorPeerId: input.authorPeerId, libraryId: input.libraryId,
+        albumId: input.albumId, assetId: input.assetId, operationType: 'member.removed', createdAt: input.createdAt,
+        observedAddIds
+      });
+      appendMetadataAudit(this.auditRepository, {
+        action: 'virtual_album.member.remove', resourceType: 'virtual_album_member', libraryId: input.libraryId,
+        resourceId: input.assetId, relatedResourceId: input.albumId,
+        outcome: targets.length > 0 ? 'applied' : 'unchanged', requestId: input.requestId, createdAt: input.createdAt
+      });
+      this.faults.beforeAlbumOperationCommit?.();
+      return result;
+    });
+    return write.immediate();
+  }
+
+  addAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string, requestId?: string): AssetTagMutationResult {
+    const write = this.db.transaction((): AssetTagMutationResult => {
+      if (!this.hasVisibleGalleryAsset(libraryId, assetId)) return 'not_found';
+      if (this.db.prepare('SELECT 1 FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
+        .get(libraryId, assetId, tag)) {
+        appendMetadataAudit(this.auditRepository, {
+          action: 'asset.tag.add', resourceType: 'asset', libraryId, resourceId: assetId,
+          outcome: 'unchanged', requestId, createdAt
+        });
+        return 'already_present';
+      }
+      const count = this.db.prepare('SELECT COUNT(*) AS count FROM asset_tags WHERE library_id = ? AND asset_id = ?')
+        .get(libraryId, assetId) as { count: number };
+      if (count.count >= maxAssetTagsPerAsset) return 'limit_reached';
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO asset_tags (library_id, asset_id, tag, created_at)
+        VALUES (?, ?, ?, ?)`).run(libraryId, assetId, tag, createdAt);
+      const result = inserted.changes === 1 ? 'added' : 'already_present';
+      appendMetadataAudit(this.auditRepository, {
+        action: 'asset.tag.add', resourceType: 'asset', libraryId, resourceId: assetId,
+        outcome: inserted.changes === 1 ? 'applied' : 'unchanged', requestId, createdAt
+      });
+      return result;
+    });
+    return write.immediate();
+  }
+
+  removeAssetTag(libraryId: string, assetId: string, tag: string, createdAt: string = new Date().toISOString(), requestId?: string): AssetTagMutationResult {
+    const write = this.db.transaction((): AssetTagMutationResult => {
+      if (!this.hasVisibleGalleryAsset(libraryId, assetId)) return 'not_found';
+      const removed = this.db.prepare('DELETE FROM asset_tags WHERE library_id = ? AND asset_id = ? AND tag = ?')
+        .run(libraryId, assetId, tag);
+      appendMetadataAudit(this.auditRepository, {
+        action: 'asset.tag.remove', resourceType: 'asset', libraryId, resourceId: assetId,
+        outcome: removed.changes === 1 ? 'applied' : 'unchanged', requestId, createdAt
+      });
+      return removed.changes === 1 ? 'removed' : 'unchanged';
+    });
+    return write.immediate();
+  }
+
+  private hasGalleryLibrary(libraryId: string): boolean {
+    const row = this.db.prepare(`SELECT EXISTS (
+      SELECT 1 FROM assets WHERE library_id = ?
+      UNION ALL SELECT 1 FROM sync_asset_projection WHERE library_id = ?
+    ) AS present`).get(libraryId, libraryId) as { present: number };
+    return row.present === 1;
+  }
+
+  private hasAlbum(libraryId: string, albumId: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM albums WHERE library_id = ? AND album_id = ?').get(libraryId, albumId));
+  }
+
+  private hasAlbumLifecycleTables(): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='album_global_delete_tokens'").get());
+  }
+
+  private hasVisibleAlbum(libraryId: string, albumId: string): boolean {
+    if (!this.hasAlbumLifecycleTables()) return this.hasAlbum(libraryId, albumId);
+    return Boolean(this.db.prepare(`SELECT 1 FROM albums a WHERE a.library_id = ? AND a.album_id = ?
+      AND NOT EXISTS (SELECT 1 FROM album_local_visibility v WHERE v.library_id = a.library_id AND v.album_id = a.album_id)
+      AND NOT EXISTS (SELECT 1 FROM album_global_delete_tokens d WHERE d.library_id = a.library_id AND d.album_id = a.album_id
+        AND NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id))`)
+      .get(libraryId, albumId));
+  }
+
+  private canAuthorAlbumLifecycleOperation(libraryId: string, authorPeerId: string): boolean {
+    if (this.db.prepare('SELECT 1 FROM album_sync_author_registry WHERE library_id = ? AND author_peer_id = ?')
+      .get(libraryId, authorPeerId)) return true;
+    const count = this.db.prepare('SELECT count(*) AS count FROM album_sync_author_registry WHERE library_id = ?')
+      .get(libraryId) as { count: number };
+    return count.count < 64;
+  }
+
+  private getActiveAlbumDeleteIds(libraryId: string, albumId: string): string[] {
+    return (this.db.prepare(`SELECT d.delete_event_id FROM album_global_delete_tokens d
+      WHERE d.library_id = ? AND d.album_id = ?
+        AND NOT EXISTS (SELECT 1 FROM album_global_restore_targets r WHERE r.observed_delete_event_id = d.delete_event_id)
+      ORDER BY d.delete_event_id COLLATE BINARY`).all(libraryId, albumId) as Array<{ delete_event_id: string }>)
+      .map((row) => row.delete_event_id);
+  }
+
+  private insertAlbumLifecycleOperation(
+    input: AlbumOperationContext,
+    albumId: string,
+    operationType: 'album.deleted' | 'album.delete.noop' | 'album.restored' | 'album.restore.noop',
+    observedDeleteIds: readonly string[],
+    result: AlbumDeletionResult | AlbumRestoreResult
+  ): void {
+    this.db.prepare(`INSERT INTO album_lifecycle_operations
+      (operation_id,principal_id,author_peer_id,library_id,album_id,operation_type,request_fingerprint,
+       observed_delete_event_ids_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(input.operationId, input.principalId, input.authorPeerId, input.libraryId, albumId, operationType,
+        input.requestFingerprint, JSON.stringify(observedDeleteIds), JSON.stringify(result), input.createdAt);
+  }
+
+  private insertAlbumVisibilityOperation(
+    input: AlbumOperationContext,
+    albumId: string,
+    operationType: 'local.hidden' | 'local.hide.noop' | 'local.restored' | 'local.restore.noop',
+    result: AlbumDeletionResult | AlbumRestoreResult
+  ): void {
+    this.db.prepare(`INSERT INTO album_visibility_operations
+      (operation_id,principal_id,author_peer_id,library_id,album_id,operation_type,request_fingerprint,result_json,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(input.operationId, input.principalId, input.authorPeerId, input.libraryId, albumId, operationType,
+        input.requestFingerprint, JSON.stringify(result), input.createdAt);
+  }
+
+  private getAlbumLifecycleReplay<T>(
+    input: AlbumOperationContext,
+    scope: AlbumDeleteScope,
+    allowedTypes: readonly string[]
+  ): T | undefined {
+    type LifecycleReplayRow = { principal_id: string; request_fingerprint: string; operation_type: string; result_json: string };
+    const local = this.db.prepare(`SELECT principal_id,request_fingerprint,operation_type,result_json FROM album_visibility_operations WHERE operation_id=?`)
+      .get(input.operationId) as LifecycleReplayRow | undefined;
+    const global = this.db.prepare(`SELECT principal_id,request_fingerprint,operation_type,result_json FROM album_lifecycle_operations WHERE operation_id=?`)
+      .get(input.operationId) as LifecycleReplayRow | undefined;
+    const priorAlbumOperation = this.db.prepare('SELECT 1 FROM album_operations WHERE operation_id=?').get(input.operationId);
+    const expected = scope === 'local' ? local : global;
+    const opposite = scope === 'local' ? global : local;
+    if (!expected) {
+      const registered = this.db.prepare('SELECT 1 FROM sync_global_id_registry WHERE global_id=?').get(input.operationId);
+      if (opposite || priorAlbumOperation || registered) {
+        throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+      }
+      return undefined;
+    }
+    if (opposite || priorAlbumOperation || expected.principal_id !== input.principalId ||
+        expected.request_fingerprint !== input.requestFingerprint || !allowedTypes.includes(expected.operation_type)) {
+      throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+    }
+    return JSON.parse(expected.result_json) as T;
+  }
+
+  private canAuthorAlbumOperation(libraryId: string, authorPeerId: string): boolean {
+    const known = this.db.prepare('SELECT 1 FROM album_operations WHERE library_id = ? AND author_peer_id = ? LIMIT 1')
+      .get(libraryId, authorPeerId);
+    if (known) return true;
+    const count = this.db.prepare('SELECT count(DISTINCT author_peer_id) AS count FROM album_operations WHERE library_id = ?')
+      .get(libraryId) as { count: number };
+    return count.count < 64;
+  }
+
+  private validateAlbumLimit(limit: number): void {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new RangeError('invalid album page limit');
+  }
+
+  private insertAlbumOperation(
+    input: AlbumOperationContext,
+    albumId: string,
+    assetId: string | null,
+    operationType: 'album.created' | 'member.added' | 'member.add.noop' | 'member.removed' | 'member.remove.noop',
+    result: unknown
+  ): void {
+    this.db.prepare(`INSERT INTO album_operations
+      (operation_id, principal_id, author_peer_id, library_id, album_id, asset_id, operation_type,
+       request_fingerprint, result_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        input.operationId, input.principalId, input.authorPeerId, input.libraryId, albumId, assetId,
+        operationType, input.requestFingerprint, JSON.stringify(result), input.createdAt
+      );
+  }
+
+  private getAlbumOperationReplay<T>(input: AlbumOperationContext, allowedTypes: readonly string[]): T | undefined {
+    const row = this.db.prepare(`SELECT principal_id, request_fingerprint, operation_type, result_json
+      FROM album_operations WHERE operation_id = ?`).get(input.operationId) as {
+        principal_id: string; request_fingerprint: string; operation_type: string; result_json: string;
+      } | undefined;
+    if (!row) {
+      if (this.hasAlbumLifecycleTables() && this.db.prepare('SELECT 1 FROM sync_global_id_registry WHERE global_id = ?').get(input.operationId)) {
+        throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+      }
+      return undefined;
+    }
+    if (row.principal_id !== input.principalId || row.request_fingerprint !== input.requestFingerprint ||
+      !allowedTypes.includes(row.operation_type)) {
+      throw new RepositoryConflictError('album idempotency key conflicts with an existing operation');
+    }
+    return JSON.parse(row.result_json) as T;
+  }
+
+  private hasVisibleGalleryAsset(libraryId: string, assetId: string): boolean {
+    const row = this.db.prepare(`SELECT EXISTS (
+      SELECT 1 FROM assets a WHERE a.library_id = ? AND a.asset_id = ?
+        AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p WHERE p.library_id = a.library_id
+          AND p.asset_id = a.asset_id AND p.tombstone_event_id IS NOT NULL)
+      UNION ALL
+      SELECT 1 FROM sync_asset_projection p WHERE p.library_id = ? AND p.asset_id = ? AND p.tombstone_event_id IS NULL
         AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id = p.library_id AND a.asset_id = p.asset_id)
-        AND (? = '' OR instr(lower(COALESCE(json_extract(p.metadata_json, '$.filename'), p.asset_id)), lower(?)) > 0 OR
-          instr(lower(p.asset_id), lower(?)) > 0 OR instr(lower(p.origin_node_id), lower(?)) > 0 OR
-          instr(lower(COALESCE(json_extract(p.metadata_json, '$.sourcePath'), '')), lower(?)) > 0)
-        ${projectionCursorSql}
-      ORDER BY p.asset_id DESC LIMIT ?`).all(
-        libraryId, query, query, query, query, query, ...projectionCursorArgs, limit + 1
-      ) as GalleryAssetSqlRow[];
-    const records = [...localRows, ...projectionRows].map(toGalleryAsset).sort(compareGalleryAsset);
-    const hasMore = records.length > limit;
-    const page = records.slice(0, limit);
-    const last = page.at(-1);
-    return { items: page, nextCursor: hasMore && last ? encodeGalleryCursor(last.capturedAt, last.assetId) : null };
+    ) AS visible`).get(libraryId, assetId, libraryId, assetId) as { visible: number };
+    return row.visible === 1;
+  }
+
+  private listAssetTags(libraryId: string, assetIds: string[]): Map<string, string[]> {
+    const result = new Map(assetIds.map((assetId) => [assetId, [] as string[]]));
+    if (assetIds.length === 0) return result;
+    const placeholders = assetIds.map(() => '?').join(', ');
+    const rows = this.db.prepare(`SELECT asset_id, tag FROM asset_tags WHERE library_id = ? AND asset_id IN (${placeholders})
+      ORDER BY asset_id COLLATE BINARY, tag COLLATE BINARY`).all(libraryId, ...assetIds) as Array<{ asset_id: string; tag: string }>;
+    for (const row of rows) result.get(row.asset_id)?.push(row.tag);
+    return result;
+  }
+
+  listGalleryAssets(
+    libraryId: string, cursor: string | undefined, limit: number, search: GallerySearchFilters = {}
+  ): { items: GalleryAssetRecord[]; nextCursor: string | null } {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('invalid gallery limit');
+    const filters = normalizeGallerySearchFilters(search);
+    const position = cursor ? decodeGalleryCursor(cursor, libraryId, filters) : undefined;
+    const captureLocalExpression = "COALESCE(local_capture.capture_local_time,json_extract(remote_capture.metadata_json,'$.capture.localTime'))";
+    const captureOffsetExpression = "COALESCE(local_capture.capture_offset_minutes,json_extract(remote_capture.metadata_json,'$.capture.offsetMinutes'))";
+    const captureSourceExpression = `COALESCE(local_capture.capture_source,json_extract(remote_capture.metadata_json,'$.capture.source'),
+      CASE WHEN c.captured_at IS NULL THEN 'unknown' ELSE 'legacy_unknown' END)`;
+    const captureConfidenceExpression = `COALESCE(local_capture.capture_confidence,json_extract(remote_capture.metadata_json,'$.capture.confidence'),
+      CASE WHEN c.captured_at IS NULL THEN 'unknown' ELSE 'unknown' END)`;
+    const sortRankExpression = `CASE WHEN c.captured_at IS NOT NULL THEN 0 WHEN ${captureLocalExpression} IS NOT NULL THEN 1 ELSE 2 END`;
+    const sortKeyExpression = `CASE WHEN c.captured_at IS NOT NULL THEN c.captured_at ELSE ${captureLocalExpression} END`;
+    const where: string[] = ['c.library_id = ?'];
+    const parameters: Array<string | number> = [libraryId];
+    if (filters.q) {
+      where.push(`c.rowid IN (SELECT rowid FROM gallery_search_fts WHERE gallery_search_fts MATCH ?)`);
+      parameters.push(toFts5Phrase(filters.q));
+    }
+    if (filters.dateFrom) {
+      where.push('c.captured_at >= ?');
+      parameters.push(`${filters.dateFrom}T00:00:00.000Z`);
+    }
+    if (filters.dateTo) {
+      where.push('c.captured_at < ?');
+      parameters.push(`${filters.dateTo}T00:00:00.000Z`);
+    }
+    if (filters.kind) { where.push('c.kind = ?'); parameters.push(filters.kind); }
+    if (filters.sourceKind) { where.push('c.source_kind = ?'); parameters.push(filters.sourceKind); }
+    if (filters.availability) { where.push('c.availability = ?'); parameters.push(filters.availability); }
+    if (position) {
+      if (position.sortRank === 2) {
+        where.push(`(${sortRankExpression} > ? OR (${sortRankExpression} = ? AND c.asset_id COLLATE BINARY < ?))`);
+        parameters.push(position.sortRank, position.sortRank, position.assetId);
+      } else {
+        where.push(`(${sortRankExpression} > ? OR (${sortRankExpression} = ? AND
+          (${sortKeyExpression} < ? OR (${sortKeyExpression} = ? AND c.asset_id COLLATE BINARY < ?))))`);
+        parameters.push(position.sortRank, position.sortRank, position.sortKey!, position.sortKey!, position.assetId);
+      }
+    }
+    const rows = this.db.prepare(`SELECT c.asset_id,c.library_id,c.origin_node_id,c.kind,c.captured_at AS captured_at,
+        ${captureLocalExpression} AS capture_local_time,${captureOffsetExpression} AS capture_offset_minutes,
+        ${captureSourceExpression} AS capture_source,${captureConfidenceExpression} AS capture_confidence,
+        ${sortRankExpression} AS sort_rank,${sortKeyExpression} AS sort_key,
+        c.sha256,c.byte_size,c.filename,NULLIF(c.source_path,'') AS source_path,c.source_kind,c.availability,
+        CASE WHEN fav.asset_id IS NULL THEN 0 ELSE 1 END AS favorite,
+        r.rating AS rating,COALESCE(r.conflict,0) AS rating_conflict,
+        COALESCE(r.candidates_json,'[]') AS rating_candidates_json
+      FROM gallery_search_content c
+      LEFT JOIN assets local_capture ON local_capture.library_id=c.library_id AND local_capture.asset_id=c.asset_id
+      LEFT JOIN sync_asset_projection remote_capture ON remote_capture.library_id=c.library_id AND remote_capture.asset_id=c.asset_id
+      LEFT JOIN asset_favorites fav ON fav.library_id=c.library_id AND fav.asset_id=c.asset_id
+      LEFT JOIN asset_rating_projection r ON r.library_id=c.library_id AND r.asset_id=c.asset_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY sort_rank ASC,sort_key DESC,c.asset_id COLLATE BINARY DESC LIMIT ?`).all(...parameters, limit + 1) as GalleryAssetSqlRow[];
+    const hasMore = rows.length > limit;
+    const pageRows = rows.slice(0, limit);
+    const page = pageRows.map(toGalleryAsset);
+    const last = pageRows.at(-1);
+    const tagsByAsset = this.listAssetTags(libraryId, page.map((asset) => asset.assetId));
+    return {
+      items: page.map((asset) => ({ ...asset, tags: tagsByAsset.get(asset.assetId) ?? [] })),
+      nextCursor: hasMore && last
+        ? encodeGalleryCursor(last.sort_rank as 0 | 1 | 2, last.sort_key, last.asset_id, libraryId, filters)
+        : null
+    };
+  }
+
+  listDuplicateCandidateGroups(libraryId: string, limit = 50): DuplicateCandidateGroup[] {
+    if (typeof libraryId !== 'string' || libraryId.length < 1 || libraryId.length > 128) throw new Error('invalid library id');
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('invalid duplicate candidate limit');
+    const rows = this.db.prepare(`
+      WITH visible_assets AS (
+        SELECT a.asset_id,a.origin_node_id,a.kind,f.sha256,f.byte_size,
+          COALESCE(l.original_filename,a.asset_id) AS filename,NULLIF(l.original_path,'') AS source_path,
+          CASE WHEN l.source_kind='upload' THEN 'upload' ELSE 'import' END AS source_kind,
+          COALESCE(l.availability,'missing') AS availability
+        FROM assets a
+        JOIN asset_files f ON f.asset_id=a.asset_id AND f.media_role='original'
+        LEFT JOIN file_locations l ON l.location_id=(SELECT candidate.location_id FROM file_locations candidate
+          WHERE candidate.file_id=f.file_id AND candidate.node_id=a.origin_node_id
+          ORDER BY CASE candidate.availability WHEN 'online' THEN 0 WHEN 'cached' THEN 1 ELSE 2 END,
+            candidate.location_id COLLATE BINARY LIMIT 1)
+        WHERE a.library_id=? AND NOT EXISTS (SELECT 1 FROM sync_asset_projection p
+          WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id AND p.tombstone_event_id IS NOT NULL)
+        UNION ALL
+        SELECT p.asset_id,p.origin_node_id,p.kind,p.sha256,p.byte_length,
+          CASE WHEN json_type(p.metadata_json,'$.filename')='text' THEN json_extract(p.metadata_json,'$.filename') ELSE p.asset_id END,
+          CASE WHEN json_type(p.metadata_json,'$.sourcePath')='text' THEN NULLIF(json_extract(p.metadata_json,'$.sourcePath'),'') ELSE NULL END,
+          CASE WHEN json_extract(p.metadata_json,'$.sourceKind')='upload' THEN 'upload' ELSE 'import' END,
+          'missing'
+        FROM sync_asset_projection p
+        WHERE p.library_id=? AND p.tombstone_event_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.library_id=p.library_id AND a.asset_id=p.asset_id)
+      ), duplicate_hashes AS (
+        SELECT sha256 FROM visible_assets GROUP BY sha256 HAVING COUNT(*) > 1 ORDER BY sha256 COLLATE BINARY LIMIT ?
+      ), ranked AS (
+        SELECT v.*, COUNT(*) OVER (PARTITION BY v.sha256) AS group_count,
+          ROW_NUMBER() OVER (PARTITION BY v.sha256 ORDER BY v.asset_id COLLATE BINARY DESC) AS member_rank
+        FROM visible_assets v JOIN duplicate_hashes d ON d.sha256=v.sha256
+      )
+      SELECT asset_id,origin_node_id,kind,sha256,byte_size,filename,source_path,source_kind,availability,group_count,member_rank
+      FROM ranked WHERE member_rank <= 32 ORDER BY sha256 COLLATE BINARY, asset_id COLLATE BINARY DESC`).all(libraryId, libraryId, limit) as Array<{
+        asset_id: string; origin_node_id: string; kind: AssetKind; sha256: string; byte_size: number; filename: string;
+        source_path: string | null; source_kind: SourceKind; availability: DuplicateCandidateAsset['availability']; group_count: number; member_rank: number;
+      }>;
+    const groups = new Map<string, DuplicateCandidateGroup>();
+    for (const row of rows) {
+      const group = groups.get(row.sha256) ?? { sha256: row.sha256, byteSize: row.byte_size, assets: [], truncated: row.group_count > 32 };
+      group.assets.push({ assetId: row.asset_id, originNodeId: row.origin_node_id, kind: row.kind, sha256: row.sha256,
+        byteSize: row.byte_size, filename: row.filename, sourcePath: row.source_path, sourceKind: row.source_kind, availability: row.availability });
+      groups.set(row.sha256, group);
+    }
+    return [...groups.values()];
   }
 
   getGalleryMedia(assetId: string): GalleryMediaRecord | undefined {
@@ -617,6 +1392,16 @@ export class SqliteRepository implements UploadRepository {
     return row ? toSessionRecord(row) : undefined;
   }
 
+  listRecoverableUploadSessionIds(now: string): string[] {
+    const rows = this.db.prepare(`SELECT s.session_id FROM upload_sessions s
+      JOIN jobs j ON j.job_id = s.session_id
+      WHERE j.job_type = 'upload' AND j.state IN ('queued', 'running')
+        AND s.state IN ('created', 'uploading', 'verifying')
+        AND s.offset_bytes = s.total_bytes AND s.expires_at > ?
+      ORDER BY s.created_at, s.session_id`).all(now) as Array<{ session_id: string }>;
+    return rows.map((row) => row.session_id);
+  }
+
   getUploadSessionByIdempotency(scope: string, key: string): UploadSessionRecord | undefined {
     const row = this.db.prepare('SELECT * FROM upload_sessions WHERE idempotency_scope = ? AND idempotency_key = ?').get(scope, key) as SessionRow | undefined;
     return row ? toSessionRecord(row) : undefined;
@@ -683,15 +1468,19 @@ export class SqliteRepository implements UploadRepository {
     this.db.prepare(`UPDATE jobs SET state = 'failed', updated_at = ? WHERE job_id = ?`).run(now, sessionId);
   }
 
-  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string, eventFactory?: EventDraftFactory): void {
+  finalizeUpload(sessionId: string, assetId: string, fileId: string, locationId: string, nodeId: string, now: string,
+    captureDate: CaptureDateMetadata, eventFactory?: EventDraftFactory): void {
+    if (!isCaptureDateMetadata(captureDate)) throw new RepositoryConflictError('capture date metadata is invalid');
     const finalize = this.db.transaction(() => {
       const session = this.getUploadSession(sessionId);
       if (!session) throw new RepositoryConflictError('upload session not found');
       if (session.state === 'completed') return;
       if (session.state !== 'verifying' || session.offset !== session.totalBytes) throw new RepositoryConflictError('upload is not ready to finalize');
       this.faults.beforeFinalize?.();
-      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at)
-        VALUES (?, ?, ?, ?, NULL, ?)`).run(assetId, session.libraryId, nodeId, session.kind, now);
+      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, capture_local_time,
+        capture_offset_minutes, capture_source, capture_confidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(assetId, session.libraryId, nodeId, session.kind, captureDate.capturedAt,
+          captureDate.localTime, captureDate.offsetMinutes, captureDate.source, captureDate.confidence, now);
       this.db.prepare(`INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at)
         VALUES (?, ?, ?, ?, 'original', ?, ?)`).run(fileId, assetId, session.expectedSha256, session.totalBytes, session.finalStorageRef, now);
       this.db.prepare(`INSERT INTO file_locations (
@@ -732,18 +1521,30 @@ export class SqliteRepository implements UploadRepository {
   }
 
   recordExternalFile(record: ExternalLocationRecord, eventFactory?: EventDraftFactory): string {
+    if (!isCaptureDateMetadata(record.captureDate)) throw new RepositoryConflictError('capture date metadata is invalid');
     const write = this.db.transaction(() => {
-      const existing = this.db.prepare(`SELECT l.location_id, f.sha256 FROM file_locations l
+      const existing = this.db.prepare(`SELECT l.location_id, f.asset_id, f.sha256 FROM file_locations l
         JOIN asset_files f ON f.file_id = l.file_id
         WHERE l.node_id = ? AND l.storage_class = 'external' AND l.original_path = ?
-        ORDER BY l.created_at DESC LIMIT 1`).get(record.nodeId, record.originalPath) as { location_id: string; sha256: string } | undefined;
+        ORDER BY l.created_at DESC LIMIT 1`).get(record.nodeId, record.originalPath) as {
+          location_id: string; asset_id: string; sha256: string;
+        } | undefined;
       if (existing?.sha256 === record.sha256) {
         this.db.prepare("UPDATE file_locations SET availability = 'online' WHERE location_id = ?").run(existing.location_id);
+        if (record.captureDate.source === 'exif_offset' || record.captureDate.source === 'exif_floating') {
+          this.db.prepare(`UPDATE assets SET capture_ts=?,capture_local_time=?,capture_offset_minutes=?,capture_source=?,capture_confidence=?
+            WHERE asset_id=? AND capture_source IN ('unknown','legacy_unknown')`)
+            .run(record.captureDate.capturedAt, record.captureDate.localTime, record.captureDate.offsetMinutes,
+              record.captureDate.source, record.captureDate.confidence, existing.asset_id);
+        }
         return existing.location_id;
       }
       if (existing) this.db.prepare("UPDATE file_locations SET availability = 'missing' WHERE location_id = ?").run(existing.location_id);
-      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, created_at)
-        VALUES (?, ?, ?, ?, NULL, ?)`).run(record.assetId, record.libraryId, record.nodeId, record.kind, record.now);
+      this.db.prepare(`INSERT INTO assets (asset_id, library_id, origin_node_id, kind, capture_ts, capture_local_time,
+        capture_offset_minutes, capture_source, capture_confidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(record.assetId, record.libraryId, record.nodeId, record.kind,
+          record.captureDate.capturedAt, record.captureDate.localTime, record.captureDate.offsetMinutes,
+          record.captureDate.source, record.captureDate.confidence, record.now);
       this.db.prepare(`INSERT INTO asset_files (file_id, asset_id, sha256, byte_size, media_role, storage_ref, created_at)
         VALUES (?, ?, ?, ?, 'original', ?, ?)`).run(record.fileId, record.assetId, record.sha256, record.byteSize, record.storageRef, record.now);
       this.db.prepare(`INSERT INTO file_locations (location_id, file_id, node_id, original_filename, original_path,
@@ -767,54 +1568,205 @@ function safeHashEquals(left: string, right: string): boolean {
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
 }
 
+interface AlbumSqlRow {
+  album_id: string;
+  library_id: string;
+  title: string;
+  created_by_peer_id: string;
+  created_at: string;
+}
+
+interface DeletedAlbumSqlRow extends AlbumSqlRow {
+  local_hidden_at: string | null;
+  global_deleted_at: string | null;
+}
+
+function toAlbumRecord(row: AlbumSqlRow): AlbumRecord {
+  return {
+    albumId: row.album_id, libraryId: row.library_id, title: row.title,
+    createdByPeerId: row.created_by_peer_id, createdAt: row.created_at
+  };
+}
+
 interface GalleryAssetSqlRow {
   asset_id: string;
   library_id: string;
   origin_node_id: string;
   kind: AssetKind;
   captured_at: unknown;
+  capture_local_time: unknown;
+  capture_offset_minutes: unknown;
+  capture_source: unknown;
+  capture_confidence: unknown;
+  sort_rank: number;
+  sort_key: string | null;
   sha256: string | null;
   byte_size: number | null;
   filename: unknown;
   source_path: unknown;
   source_kind: unknown;
   availability: GalleryAssetRecord['availability'];
+  favorite: number | boolean | null;
+  rating: number | null;
+  rating_conflict: number | boolean | null;
+  rating_candidates_json: string | null;
 }
 
 function toGalleryAsset(row: GalleryAssetSqlRow): GalleryAssetRecord {
   const capturedAt = typeof row.captured_at === 'string' ? row.captured_at : null;
+  const captureDate = normalizeStoredCaptureDate({
+    capturedAt,
+    localTime: typeof row.capture_local_time === 'string' ? row.capture_local_time : null,
+    offsetMinutes: typeof row.capture_offset_minutes === 'number' ? row.capture_offset_minutes : null,
+    source: row.capture_source,
+    confidence: row.capture_confidence
+  });
+  const parsedCandidates = parseRatingCandidates(row.rating_candidates_json);
+  const ratingConflict = Boolean(row.rating_conflict);
   return {
     assetId: row.asset_id, libraryId: row.library_id, originNodeId: row.origin_node_id, kind: row.kind,
     sha256: row.sha256 ?? '', availability: row.availability,
     filename: typeof row.filename === 'string' ? row.filename : row.asset_id,
-    capturedAt, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
+    capturedAt: captureDate.capturedAt, captureLocalTime: captureDate.localTime,
+    captureOffsetMinutes: captureDate.offsetMinutes, captureSource: captureDate.source,
+    captureConfidence: captureDate.confidence, sourcePath: typeof row.source_path === 'string' ? row.source_path : null,
     sourceKind: row.source_kind === 'upload' ? 'upload' : 'import',
-    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id
+    byteSize: row.byte_size ?? 0, version: row.sha256 ?? row.asset_id, tags: [], favorite: Boolean(row.favorite),
+    rating: ratingConflict ? null : row.rating,
+    ratingConflict,
+    ratingCandidates: parsedCandidates
   };
 }
 
-function compareGalleryAsset(left: GalleryAssetRecord, right: GalleryAssetRecord): number {
-  if (left.capturedAt !== right.capturedAt) {
-    if (left.capturedAt === null) return 1;
-    if (right.capturedAt === null) return -1;
-    return right.capturedAt.localeCompare(left.capturedAt);
-  }
-  return left.assetId === right.assetId ? 0 : left.assetId < right.assetId ? 1 : -1;
+function normalizeStoredCaptureDate(value: Record<string, unknown>): CaptureDateMetadata {
+  const candidate = {
+    capturedAt: value.capturedAt ?? null,
+    localTime: value.localTime ?? null,
+    offsetMinutes: value.offsetMinutes ?? null,
+    source: value.source,
+    confidence: value.confidence
+  };
+  if (isCaptureDateMetadata(candidate)) return candidate;
+  const capturedAt = typeof value.capturedAt === 'string' && isCanonicalUtcTimestamp(value.capturedAt) ? value.capturedAt : null;
+  return capturedAt
+    ? { capturedAt, localTime: null, offsetMinutes: null, source: 'legacy_unknown', confidence: 'unknown' }
+    : { capturedAt: null, localTime: null, offsetMinutes: null, source: 'unknown', confidence: 'unknown' };
 }
 
-function encodeGalleryCursor(capturedAt: string | null, assetId: string): string {
-  return Buffer.from(JSON.stringify({ capturedAt, assetId }), 'utf8').toString('base64url');
-}
-
-function decodeGalleryCursor(value: string): { capturedAt: string | null; assetId: string } {
+function parseRatingCandidates(value: string | null): Array<number | null> {
+  if (typeof value !== 'string') return [];
   try {
-    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as { capturedAt?: unknown; assetId?: unknown };
-    if (!(decoded.capturedAt === null || typeof decoded.capturedAt === 'string') || typeof decoded.assetId !== 'string' ||
-      Buffer.from(value, 'base64url').toString('base64url') !== value) throw new Error('invalid cursor');
-    return { capturedAt: decoded.capturedAt, assetId: decoded.assetId };
-  } catch {
-    throw new Error('invalid gallery cursor');
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed) || !parsed.every((item) => item === null || (Number.isInteger(item) && Number(item) >= 1 && Number(item) <= 5))) return [];
+    return [...new Set(parsed as Array<number | null>)].sort((left, right) => left === right ? 0 : left === null ? -1 : right === null ? 1 : left - right);
+  } catch { return []; }
+}
+
+interface NormalizedGallerySearchFilters {
+  q: string;
+  dateFrom: string | null;
+  dateTo: string | null;
+  kind: AssetKind | null;
+  sourceKind: SourceKind | null;
+  availability: GalleryAssetRecord['availability'] | null;
+}
+
+interface GalleryCursorPosition {
+  sortRank: 0 | 1 | 2;
+  sortKey: string | null;
+  assetId: string;
+}
+
+const LEGACY_GALLERY_CURSOR_SORT = 'capture-desc-asset-binary-desc-v1';
+const GALLERY_CURSOR_SORT = 'capture-groups-desc-asset-binary-desc-v2';
+const LEGACY_GALLERY_CURSOR_KEYS = ['assetId', 'capturedAt', 'filterHash', 'libraryId', 'sort', 'version'];
+const GALLERY_CURSOR_KEYS = ['assetId', 'filterHash', 'libraryId', 'sort', 'sortKey', 'sortRank', 'version'];
+
+export function normalizeGallerySearchFilters(filters: GallerySearchFilters): NormalizedGallerySearchFilters {
+  const q = filters.q ?? '';
+  if (typeof q !== 'string' || q.length > 256 || (q !== '' && Array.from(q).length < 3)) {
+    throw new Error('invalid gallery search query');
   }
+  const dateFrom = normalizeGalleryDate(filters.dateFrom);
+  const dateTo = normalizeGalleryDate(filters.dateTo);
+  if (dateFrom && dateTo && dateFrom >= dateTo) throw new Error('invalid gallery date range');
+  const kind = normalizeGalleryEnum(filters.kind, ['photo', 'video', 'live_photo'], 'kind');
+  const sourceKind = normalizeGalleryEnum(filters.sourceKind, ['upload', 'import'], 'source kind');
+  const availability = normalizeGalleryEnum(filters.availability, ['online', 'cached', 'offline', 'missing'], 'availability');
+  return { q, dateFrom, dateTo, kind, sourceKind, availability };
+}
+
+function normalizeGalleryEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !allowed.includes(value as T)) throw new Error(`invalid gallery ${label}`);
+  return value as T;
+}
+
+function normalizeGalleryDate(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('invalid gallery date');
+  const timestamp = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(timestamp.getTime()) || timestamp.toISOString().slice(0, 10) !== value) throw new Error('invalid gallery date');
+  return value;
+}
+
+function toFts5Phrase(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function galleryCursorVersion(filters: NormalizedGallerySearchFilters): 1 | 2 {
+  return filters.kind || filters.sourceKind || filters.availability ? 2 : 1;
+}
+
+function gallerySearchFilterHash(filters: NormalizedGallerySearchFilters, version: 1 | 2 | 3): string {
+  const canonical = version === 1
+    ? { q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo }
+    : { q: filters.q, dateFrom: filters.dateFrom, dateTo: filters.dateTo, kind: filters.kind, sourceKind: filters.sourceKind, availability: filters.availability };
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
+
+function encodeGalleryCursor(
+  sortRank: 0 | 1 | 2, sortKey: string | null, assetId: string, libraryId: string, filters: NormalizedGallerySearchFilters
+): string {
+  return Buffer.from(JSON.stringify({
+    version: 3, libraryId, filterHash: gallerySearchFilterHash(filters, 3), sort: GALLERY_CURSOR_SORT, sortRank, sortKey, assetId
+  }), 'utf8').toString('base64url');
+}
+
+function decodeGalleryCursor(
+  value: string, libraryId: string, filters: NormalizedGallerySearchFilters
+): GalleryCursorPosition {
+  try {
+    if (value.length > 2048 || Buffer.from(value, 'base64url').toString('base64url') !== value) throw new Error('invalid cursor');
+    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>;
+    const version = decoded.version;
+    if (typeof decoded.assetId !== 'string' || decoded.assetId.length < 1 || decoded.assetId.length > 256 || decoded.libraryId !== libraryId) {
+      throw new Error('invalid cursor');
+    }
+    if (version === 3) {
+      if (Object.keys(decoded).sort().join(',') !== GALLERY_CURSOR_KEYS.join(',') || decoded.sort !== GALLERY_CURSOR_SORT ||
+          decoded.filterHash !== gallerySearchFilterHash(filters, 3) ||
+          !(decoded.sortRank === 0 || decoded.sortRank === 1 || decoded.sortRank === 2) ||
+          (decoded.sortRank === 0 && !isCanonicalUtcTimestamp(decoded.sortKey)) ||
+          (decoded.sortRank === 1 && !isCanonicalCaptureLocalTime(decoded.sortKey)) ||
+          (decoded.sortRank === 2 && decoded.sortKey !== null)) throw new Error('invalid cursor');
+      return { sortRank: decoded.sortRank, sortKey: decoded.sortKey as string | null, assetId: decoded.assetId };
+    }
+    if ((version !== 1 && version !== 2) || version !== galleryCursorVersion(filters) ||
+        Object.keys(decoded).sort().join(',') !== LEGACY_GALLERY_CURSOR_KEYS.join(',') ||
+        decoded.filterHash !== gallerySearchFilterHash(filters, version) || decoded.sort !== LEGACY_GALLERY_CURSOR_SORT ||
+        !(decoded.capturedAt === null || isCanonicalUtcTimestamp(decoded.capturedAt))) throw new Error('invalid cursor');
+    if (decoded.capturedAt === null) throw new StaleGalleryCursorError();
+    return { sortRank: 0, sortKey: decoded.capturedAt as string, assetId: decoded.assetId };
+  } catch (cause) {
+    if (cause instanceof StaleGalleryCursorError) throw cause;
+    throw new Error('invalid gallery cursor', { cause });
+  }
+}
+
+function isCanonicalUtcTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  try { return new Date(value).toISOString() === value; } catch { return false; }
 }
 
 function toSessionRecord(row: SessionRow): UploadSessionRecord {

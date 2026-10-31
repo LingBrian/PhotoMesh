@@ -19,13 +19,15 @@ The HTTP service supports:
 
 Chunk writes are ordered and bounded to 8 MiB by default; the default file limit is 100 GiB. Configure limits by constructing `UploadService` with explicit limits. A retry with identical bytes is idempotent. Conflicting keys, offsets, or chunks return a conflict. Insufficient capacity returns `507` and does not advance the session offset. Full-file checksum mismatch returns `422` and cannot mark the session complete.
 
-Every upload route calls `authorizeUpload`. The server denies access when no authorizer is configured. The authorizer must validate the bearer token and the caller's library/session ACL for each action; an opaque session ID is not authorization. The starter executable intentionally has no default user credentials, so upload routes remain denied until an authentication/ACL provider is wired in.
+Every upload route calls `authorizeUpload`. A bare `createNodeAgentServer` denies access when no authorizer is configured. The starter executable wires upload, library, media-version and pairing authorization to the configured local administrator Bearer token; route callbacks still enforce the relevant library/session ACL, and an opaque session ID is not authorization. `/v1/health` is public; other operations require their documented authorization.
 
 ## Crash recovery and tests
 
 Chunk bytes are flushed under a generated staging reference before their manifest and offset are committed in SQLite. Finalization streams chunks to a same-volume temporary object, verifies the complete SHA-256, and uses a no-replace hard-link publication. After restart, retry the same chunk request or call the completion endpoint again; a published object with uncommitted metadata is re-hashed and finalized idempotently. Once metadata is committed, the session's managed staging subtree is removed; a completion replay retries that cleanup if needed.
 
-Unit tests use an in-memory SQLite database and `VirtualFileSystem` with injectable capacity and operation failures. Adapter tests use generated temporary directories only; they do not inspect or modify user photo directories.
+Before migrations or listeners start, the agent runs SQLite `quick_check` and fails closed with a generic error if integrity is not confirmed; it does not repair or rewrite a damaged database. Startup requeues interrupted upload jobs. Unexpired sessions whose accepted offset equals their declared size are retried automatically and still pass the full-file SHA-256 check; partial sessions retain their checkpoint and staging chunks for client-driven resume with the same session ID. On SIGINT/SIGTERM, HTTP, P2P, and external scanning are stopped/drained before media-version and upload-recovery work; SQLite is closed last. Cleanup failures produce only a generic diagnostic. No database schema change is required.
+
+Unit tests use in-memory SQLite and `VirtualFileSystem` with injectable capacity and operation failures. Restart tests reopen a file-backed database and generated temporary object directory, verify the quick check/job checkpoint/object SHA-256, and remove only that temporary fixture; they do not inspect or modify user photo directories.
 
 ## Read-only external directories
 

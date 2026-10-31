@@ -160,14 +160,20 @@ jobs:
           Copy-Item -LiteralPath 'scripts/node-agent/start.ps1' -Destination (Join-Path $stage 'start.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/external-roots.ps1' -Destination (Join-Path $stage 'external-roots.ps1')
           Copy-Item -LiteralPath 'scripts/node-agent/start.bat' -Destination (Join-Path $stage 'start.bat')
+          Copy-Item -LiteralPath 'scripts/node-agent/lifecycle.ps1' -Destination (Join-Path $stage 'lifecycle.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/admin-credential.ps1' -Destination (Join-Path $stage 'admin-credential.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/uninstall.ps1' -Destination (Join-Path $stage 'uninstall.ps1')
+          Copy-Item -LiteralPath 'scripts/node-agent/uninstall.bat' -Destination (Join-Path $stage 'uninstall.bat')
           $out = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath (Join-Path $out "PhotoMesh-$env:VERSION-node-agent-windows-x64.zip")
-          $installer = (Get-Content -Raw 'install.ps1').Replace('__VERSION__', $env:VERSION)
+          $lifecycle = Get-Content -Raw 'scripts/node-agent/lifecycle.ps1'
+          $installer = $lifecycle + [Environment]::NewLine + (Get-Content -Raw 'install.ps1').Replace('__VERSION__', $env:VERSION)
           Set-Content -NoNewline -Encoding utf8 (Join-Path $out 'install.ps1') $installer
           $installerBat = (Get-Content -Raw 'install.bat').Replace('__VERSION__', $env:VERSION)
           Set-Content -NoNewline -Encoding utf8 (Join-Path $out 'install.bat') $installerBat
           if (Select-String -Path (Join-Path $out 'install.ps1'), (Join-Path $out 'install.bat') -Pattern 'api\.github\.com') { throw 'Windows installers must not call the rate-limited GitHub API.' }
+          if ((Get-Content -Raw (Join-Path $out 'install.ps1')) -match '__VERSION__') { throw 'Windows Agent installer was not version-pinned.' }
           if ((Get-Content -Raw (Join-Path $out 'install.bat')) -match '__VERSION__') { throw 'Windows release bootstrap was not version-pinned.' }
       - name: Smoke-test Windows x64 Node Agent ZIP
         if: matrix.platform == 'windows-x64'
@@ -181,6 +187,10 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath $smoke
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-package.ps1' -PackageRoot $smoke
           if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows Node Agent ZIP smoke test failed.' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-lifecycle.ps1' -PackageRoot $smoke -PackageArchive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Node Agent lifecycle tests failed.' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-windows-node-agent-admin-credential.ps1'
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Node Agent admin credential tests failed.' }
       - name: Package Linux x64 Node Agent
         if: matrix.platform == 'linux-x64'
         env:
@@ -198,6 +208,7 @@ jobs:
           tar -C "$stage" -czf "$GITHUB_WORKSPACE/release-assets/PhotoMesh-$VERSION-node-agent-linux-x64.tar.gz" .
           sed "s/__VERSION__/$VERSION/g" install.sh > "$GITHUB_WORKSPACE/release-assets/install.sh"
           chmod +x "$GITHUB_WORKSPACE/release-assets/install.sh"
+          if grep -q '__VERSION__' "$GITHUB_WORKSPACE/release-assets/install.sh"; then echo 'Linux Agent installer was not version-pinned.' >&2; exit 1; fi
       - uses: actions/upload-artifact@v4
         with:
           name: photomesh-${{ needs.validate.outputs.version }}-node-${{ matrix.platform }}
@@ -358,13 +369,24 @@ jobs:
             "release-assets/products/windows/PhotoMesh-$VERSION-windows-x64-unsigned.exe"
             "release-assets/products/node-linux-x64/PhotoMesh-$VERSION-node-agent-linux-x64.tar.gz"
             "release-assets/products/node-windows-x64/PhotoMesh-$VERSION-node-agent-windows-x64.zip"
+            "release-assets/products/node-windows-x64/install.ps1"
+            "release-assets/products/node-windows-x64/install.bat"
           )
           for file in "${files[@]}"; do
             test -s "$file"
             cp "$file" "$published/"
           done
+          (
+            cd "$published"
+            export LC_ALL=C
+            for file in PhotoMesh-* install.*; do
+              test -f "$file" || continue
+              sha256sum "$file"
+            done
+          ) > "$published/SHA256SUMS.txt"
+          (cd "$published" && sha256sum -c SHA256SUMS.txt)
           count="$(find "$published" -maxdepth 1 -type f | wc -l)"
-          test "$count" -eq 6
+          test "$count" -eq 9
           {
             cat "release-assets/review/CHANGELOG.md"
             echo
@@ -382,6 +404,6 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -d '' assets < <(find release-assets/published -maxdepth 1 -type f -print0 | sort -z)
-          test "${#assets[@]}" -eq 6
+          test "${#assets[@]}" -eq 9
           gh release create "v$VERSION" "${assets[@]}" --target "$SOURCE_SHA" --prerelease \
             --title "PhotoMesh $VERSION" --notes-file release-assets/RELEASE_NOTES.md

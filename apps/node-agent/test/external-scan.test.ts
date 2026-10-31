@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ExternalLocationRecord, IndexedExternalLocation } from '../src/db/repository.js';
 import { ExternalScanService, type AuthorizedExternalRoot, type ExternalFileSystem, type ExternalStat, type ExternalWatcher } from '../src/media/external-scan.js';
 import { makeUnsignedEvent } from '../src/sync/event-envelope.js';
+import { jpegWithExifCaptureDate } from './support/capture-date-fixture.js';
 
 type NodeValue = { kind: ExternalStat['kind']; bytes?: Uint8Array; target?: string; denied?: boolean; modifiedAt?: number };
 
@@ -11,6 +12,7 @@ class VirtualExternalFileSystem implements ExternalFileSystem {
   readonly invalidNames = new Map<string, string[]>();
   addDirectory(path: string): void { this.nodes.set(this.key(path), { kind: 'directory' }); }
   addFile(path: string, bytes: string): void { this.nodes.set(this.key(path), { kind: 'file', bytes: new TextEncoder().encode(bytes) }); }
+  addFileBytes(path: string, bytes: Uint8Array): void { this.nodes.set(this.key(path), { kind: 'file', bytes: Uint8Array.from(bytes) }); }
   addSymlink(path: string, target: string): void { this.nodes.set(this.key(path), { kind: 'symlink', target }); }
   setDenied(path: string, denied: boolean): void { const value = this.nodes.get(this.key(path)); if (value) value.denied = denied; }
   setModified(path: string, modifiedAt: number): void { const value = this.nodes.get(this.key(path)); if (value) value.modifiedAt = modifiedAt; }
@@ -86,6 +88,31 @@ function root(path = '/photos', pathStyle: 'posix' | 'win32' = 'posix'): Authori
 }
 
 describe('external read-only directory scanning', () => {
+  it('exposes a read-only review for missing paths without requiring confirmation writes', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addFile('/photos/gone.jpg', 'gone-original');
+    const { service, repository } = setup(root(), fs);
+    await service.scanAll();
+    fs.remove('/photos/gone.jpg');
+    const results = await service.scanAll();
+    expect(results[0]?.complete).toBe(true);
+    const review = service.getReview('library-1');
+    expect(review[0]?.locations).toEqual([{ locationId: expect.any(String), originalPath: '/photos/gone.jpg', availability: 'missing' }]);
+    expect(repository.rows.size).toBe(1);
+  });
+
+  it('does not infer unobserved paths as missing after an incomplete scan', async () => {
+    const fs = new VirtualExternalFileSystem();
+    fs.addDirectory('/photos'); fs.addFile('/photos/kept.jpg', 'kept-original');
+    const { service } = setup(root(), fs);
+    await service.scanAll();
+    fs.setDenied('/photos', true);
+    const results = await service.scanAll();
+    expect(results[0]?.complete).toBe(false);
+    expect(service.getReview('library-1')[0]?.locations).toEqual([{ locationId: expect.any(String), originalPath: '/photos/kept.jpg', availability: 'offline' }]);
+    expect(service.getReview('library-1')[0]?.missing).toBe(0);
+  });
+
   it('resolves original reads only inside an explicitly authorized real root', async () => {
     const fs = new VirtualExternalFileSystem();
     fs.addDirectory('/photos'); fs.addFile('/photos/visible.jpg', 'visible-original');
@@ -119,6 +146,23 @@ describe('external read-only directory scanning', () => {
     expect(drafts).toBe(2);
     expect(signed).toBe(1);
     expect(fs.nodes.get('/photos/a.jpg')?.bytes).toEqual(new TextEncoder().encode('original-a'));
+  });
+
+  it('extracts bounded EXIF capture provenance during a read-only external scan', async () => {
+    const fs = new VirtualExternalFileSystem();
+    const original = jpegWithExifCaptureDate();
+    fs.addDirectory('/photos');
+    fs.addFileBytes('/photos/camera.jpg', original);
+    const { service, repository } = setup(root(), fs);
+
+    await service.scanAll();
+
+    const record = [...repository.rows.values()][0]?.record;
+    expect(record?.captureDate).toEqual({
+      capturedAt: '2024-04-02T09:04:05.000Z', localTime: '2024-04-02T12:04:05.000', offsetMinutes: 180,
+      source: 'exif_offset', confidence: 'high'
+    });
+    expect(fs.nodes.get('/photos/camera.jpg')?.bytes).toEqual(original);
   });
 
   it('rejects traversal and symlink escapes and detects symlink cycles', async () => {
@@ -301,7 +345,7 @@ describe('external read-only directory scanning', () => {
     const [result] = await service.start();
 
     expect(result!.issues.map(({ code }) => code)).toContain('symlink_cycle');
-    service.stop();
+    await service.stop();
   });
 
   it('coalesces concurrent requests and runs one follow-up scan', async () => {
@@ -329,6 +373,34 @@ describe('external read-only directory scanning', () => {
     expect(concurrentResult).toEqual(firstResult);
   });
 
+  it('drains an in-flight scan and prevents watchers from reopening during shutdown', async () => {
+    const fs = new VirtualExternalFileSystem(); fs.addDirectory('/photos'); fs.addFile('/photos/a.jpg', 'a');
+    const originalReaddir = fs.readdir.bind(fs);
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    let blocked = false;
+    fs.readdir = async (path: string) => {
+      if (!blocked) { blocked = true; enter(); await gate; }
+      return originalReaddir(path);
+    };
+    let watchCount = 0;
+    const watcher: ExternalWatcher = { watch: () => { watchCount += 1; return { close: vi.fn() }; } };
+    const { service } = setup(root(), fs, new FakeRepository(), watcher);
+    const starting = service.start();
+    await entered;
+    const stopping = service.stop();
+    let stopped = false;
+    void stopping.then(() => { stopped = true; });
+    expect(stopped).toBe(false);
+    release();
+    await Promise.all([starting, stopping]);
+    expect(stopped).toBe(true);
+    expect(watchCount).toBe(0);
+    await expect(service.scanAll()).resolves.toEqual([]);
+  });
+
   it('refreshes scans from watcher hints and closes handles on stop', async () => {
     vi.useFakeTimers();
     try {
@@ -348,7 +420,7 @@ describe('external read-only directory scanning', () => {
       fs.addFile('/photos/b.jpg', 'two'); changed?.();
       await vi.advanceTimersByTimeAsync(10);
       expect((await service.scanAll())[0]?.indexed).toBe(2);
-      service.stop();
+      await service.stop();
       expect(closed).toBe(2);
     } finally { vi.useRealTimers(); }
   });

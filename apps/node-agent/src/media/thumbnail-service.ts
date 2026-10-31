@@ -19,7 +19,7 @@ export interface ThumbnailContent extends ThumbnailImage {
 }
 
 export type MediaThumbnailErrorCode =
-  | 'INVALID_REQUEST' | 'NOT_FOUND' | 'SOURCE_CHANGED' | 'SOURCE_OFFLINE' | 'TOO_LARGE'
+  | 'INVALID_REQUEST' | 'NOT_FOUND' | 'SOURCE_CHANGED' | 'SOURCE_OFFLINE' | 'SOURCE_MISSING' | 'TOO_LARGE'
   | 'UNSUPPORTED_MEDIA' | 'PROCESSING_FAILED' | 'QUEUE_FULL' | 'STORAGE_FAILED';
 
 export class MediaThumbnailError extends Error {
@@ -200,6 +200,7 @@ export class MediaThumbnailService {
     if (current.sha256 !== source.sha256 || current.byteSize !== source.byteSize) throw new MediaThumbnailError('SOURCE_CHANGED');
     const cached = this.readCache(key);
     if (cached) return cached;
+    if (current.availability === 'missing') throw new MediaThumbnailError('SOURCE_MISSING');
     if (!['online', 'cached'].includes(current.availability)) throw new MediaThumbnailError('SOURCE_OFFLINE');
     if (signal.aborted) throw new MediaThumbnailError('PROCESSING_FAILED');
 

@@ -35,6 +35,40 @@ describe('source contracts', () => {
     });
   });
 
+  it('defines authenticated status-only diagnostics with bounded components', async () => {
+    const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
+    const api = parse(await readFile(apiPath, 'utf8')) as {
+      paths: Record<string, unknown>;
+      components: { schemas: Record<string, object> };
+    };
+    const operation = api.paths['/v1/diagnostics'] as Record<string, unknown> | undefined;
+    expect(operation).toMatchObject({
+      get: {
+        security: [{ nodeAdminBearer: [] }],
+        responses: { '200': { description: expect.any(String) }, '403': { description: expect.any(String) } }
+      }
+    });
+
+    const dereferenced = await SwaggerParser.dereference(apiPath) as {
+      components: { schemas: Record<string, object> };
+    };
+    const validate = new Ajv2020.default({ allErrors: true }).compile(dereferenced.components.schemas.NodeDiagnostics!);
+    const response = {
+      status: 'ok',
+      readiness: 'ready',
+      components: {
+        api: { status: 'ok', capabilities: ['rest'] },
+        database: { status: 'ok', capabilities: ['sqlite'] },
+        storage: { status: 'ok', capabilities: ['managedFiles'] },
+        identity: { status: 'ok', capabilities: ['nodeIdentity', 'eventSigning'] }
+      }
+    };
+    expect(validate(response)).toBe(true);
+    const invalid = structuredClone(response) as typeof response & { components: { database: { path?: string } } };
+    invalid.components.database.path = 'C:\\\\private';
+    expect(validate(invalid)).toBe(false);
+  });
+
   it('validates a JSON Schema component from the OpenAPI source', async () => {
     const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
     const api = parse(await readFile(apiPath, 'utf8')) as {
@@ -123,5 +157,66 @@ describe('source contracts', () => {
     expect(join({ invite: { secret: 'replay' }, label: 'Laptop' })).toBe(false);
     expect(approval({ approved: true, libraryIds: ['private-library'] })).toBe(true);
     expect(approval({ approved: true, libraryIds: ['x'.repeat(129)] })).toBe(false);
+  });
+
+  it('documents persistent asset tags as a bounded additive API', async () => {
+    const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
+    const api = parse(await readFile(apiPath, 'utf8')) as {
+      components: { schemas: Record<string, unknown> };
+      paths: Record<string, unknown>;
+    };
+    expect(api.components.schemas.Asset).toMatchObject({
+      required: expect.arrayContaining(['tags']),
+      properties: { tags: { type: 'array', maxItems: 4096, items: { type: 'string', minLength: 1, maxLength: 128 } } }
+    });
+    expect(api.paths['/v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}']).toMatchObject({
+      put: { responses: { '204': { headers: { 'X-Request-ID': { $ref: '#/components/headers/XRequestId' } } }, '400': {}, '403': {}, '404': {}, '503': {} } },
+      delete: { responses: { '204': { headers: { 'X-Request-ID': { $ref: '#/components/headers/XRequestId' } } }, '400': {}, '403': {}, '404': {}, '503': {} } }
+    });
+    expect(api.paths['/v1/pairing/peers/{peerId}/libraries/{libraryId}/tag-write']).toMatchObject({
+      put: { responses: { '204': {}, '403': {}, '409': {}, '503': {} } },
+      delete: { responses: {
+        '200': { content: { 'application/json': { schema: { required: ['status', 'replicatedEventsRemain'], properties: { replicatedEventsRemain: { const: true } } } } } },
+        '403': {}, '503': {}
+      } }
+    });
+    expect(api.paths['/v1/pairing/libraries/{libraryId}/tag-writers']).toMatchObject({ get: { responses: { '200': {}, '403': {}, '503': {} } } });
+    expect(api.paths['/v1/pairing/peers/{peerId}/tag-sync-status']).toMatchObject({ get: { responses: { '200': {}, '403': {}, '503': {} } } });
+  });
+
+  it('documents the implemented security headers and non-success status codes', async () => {
+    const apiPath = path.join(repoRoot, 'contracts/openapi_draft.yaml');
+    type ContractResponse = { headers?: Record<string, { schema?: Record<string, unknown> }> };
+    type ContractOperation = { responses: Record<string, ContractResponse> };
+    const api = parse(await readFile(apiPath, 'utf8')) as { paths: Record<string, Record<string, ContractOperation>> };
+    const original = api.paths['/v1/assets/{assetId}/original']!.get!.responses;
+    expect(original['200']!.headers).toMatchObject({
+      ETag: { schema: { type: 'string' } },
+      'Content-Disposition': { schema: { type: 'string' } },
+      'Cache-Control': { schema: { type: 'string', const: 'no-store' } },
+      'X-Content-Type-Options': { schema: { type: 'string', const: 'nosniff' } }
+    });
+    expect(original['500']).toBeDefined();
+
+    const thumbnail = api.paths['/v1/libraries/{libraryId}/assets/{assetId}/thumbnail']!.get!.responses;
+    expect(thumbnail['200']!.headers).toMatchObject({
+      'Cache-Control': { schema: { type: 'string', const: 'private, no-store' } },
+      'X-Content-Type-Options': { schema: { type: 'string', const: 'nosniff' } },
+      'Content-Disposition': { schema: { type: 'string', const: 'inline' } },
+      Vary: { schema: { type: 'string', const: 'Authorization' } }
+    });
+    expect(thumbnail['429']!.headers?.['Retry-After']?.schema).toMatchObject({ const: '1' });
+
+    const versionContent = api.paths['/v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}/content']!.get!.responses['200']!.headers;
+    expect(versionContent).toMatchObject({
+      'Cache-Control': { schema: { type: 'string', const: 'no-store' } },
+      'X-Content-Type-Options': { schema: { type: 'string', const: 'nosniff' } },
+      'Content-Disposition': { schema: { type: 'string', const: 'inline' } }
+    });
+
+    expect(api.paths['/v1/diagnostics']!.get!.responses.default!.headers?.['Cache-Control']?.schema).toMatchObject({ const: 'no-store' });
+    expect(api.paths['/v1/pairing/manual-discovery']!.post!.responses['502']).toBeDefined();
+    expect(api.paths['/v1/pairing/peers/{peerId}/approval']!.post!.responses['400']).toBeDefined();
+    expect(api.paths['/v1/libraries']!.get!.responses['401']).toBeUndefined();
   });
 });

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import { eventDigest, type EventEnvelope, type EventDraftFactory, type JsonValue, type SyncEventType, type UnsignedEventEnvelope } from './event-envelope.js';
+import { isCaptureDateMetadata, type CaptureDateMetadata } from '../metadata/capture-date.js';
+import { eventDigest, parseEventEnvelope, type EventEnvelope, type EventDraftFactory, type JsonValue, type SyncEventType, type UnsignedEventEnvelope } from './event-envelope.js';
 
 export interface EventContext { authorSequence: number; causalParents: string[] }
 export interface SyncCursor { libraryId: string; authorPeerId: string; sequence: number }
@@ -10,7 +11,7 @@ export interface SyncProjection {
   metadata: Record<string, JsonValue>; tombstoned: boolean; lastEventId: string;
 }
 export interface LocalAssetIndexRecord {
-  libraryId: string; assetId: string; kind: string; sha256: string; byteLength: number;
+  libraryId: string; assetId: string; kind: string; sha256: string; byteLength: number; captureDate: CaptureDateMetadata;
 }
 
 export class SyncAuthorizationError extends Error {
@@ -31,6 +32,12 @@ export class SyncRepository {
     return this.readLocalEventContext(libraryId, authorPeerId);
   }
 
+  getEventEnvelope(eventId: string): EventEnvelope | undefined {
+    const row = this.db.prepare(`SELECT envelope_json FROM sync_event_log WHERE event_id = ? AND state = 'ready'`)
+      .get(eventId) as { envelope_json: string } | undefined;
+    return row ? parseEventEnvelope(JSON.parse(row.envelope_json)) : undefined;
+  }
+
   getTombstoneState(libraryId: string, eventId: string): 'active' | 'inactive' | 'not_found' {
     const row = this.db.prepare(`SELECT restored_by_event_id FROM sync_tombstones
       WHERE library_id = ? AND event_id = ?`).get(libraryId, eventId) as { restored_by_event_id: string | null } | undefined;
@@ -42,6 +49,12 @@ export class SyncRepository {
     const row = this.db.prepare(`SELECT restored_by_event_id FROM sync_tombstones
       WHERE library_id = ? AND event_id = ?`).get(libraryId, eventId) as { restored_by_event_id: string | null } | undefined;
     return row?.restored_by_event_id ?? null;
+  }
+
+  getActiveTombstoneEventId(libraryId: string, assetId: string): string | null {
+    const row = this.db.prepare(`SELECT tombstone_event_id FROM sync_asset_projection
+      WHERE library_id = ? AND asset_id = ?`).get(libraryId, assetId) as { tombstone_event_id: string | null } | undefined;
+    return row?.tombstone_event_id ?? null;
   }
 
   /** Caller includes this write in the same SQLite transaction as its source mutation. */
@@ -69,16 +82,26 @@ export class SyncRepository {
   /** Idempotently reserve one historical local asset event per SQLite transaction. */
   reserveNextMissingLocalAssetIndex(authorPeerId: string, factory: (record: LocalAssetIndexRecord) => EventDraftFactory): boolean {
     const reserve = this.db.transaction(() => {
-      const row = this.db.prepare(`SELECT a.library_id, a.asset_id, a.kind, f.sha256, f.byte_size
+      const row = this.db.prepare(`SELECT a.library_id, a.asset_id, a.kind, f.sha256, f.byte_size,
+          strftime('%Y-%m-%dT%H:%M:%fZ',a.capture_ts) AS captured_at,a.capture_local_time,a.capture_offset_minutes,
+          a.capture_source,a.capture_confidence
         FROM assets a JOIN asset_files f ON f.asset_id = a.asset_id AND f.media_role = 'original'
         WHERE NOT EXISTS (SELECT 1 FROM sync_event_log e WHERE e.library_id = a.library_id AND e.author_peer_id = ?
           AND e.event_type = 'asset.indexed' AND json_extract(e.payload_json, '$.assetId') = a.asset_id)
         ORDER BY a.library_id, a.asset_id LIMIT 1`).get(authorPeerId) as {
-          library_id: string; asset_id: string; kind: string; sha256: string; byte_size: number;
+          library_id: string; asset_id: string; kind: string; sha256: string; byte_size: number; captured_at: string | null;
+          capture_local_time: string | null; capture_offset_minutes: number | null; capture_source: string; capture_confidence: string;
         } | undefined;
       if (!row) return false;
+      const rawCaptureDate = {
+        capturedAt: row.captured_at, localTime: row.capture_local_time, offsetMinutes: row.capture_offset_minutes,
+        source: row.capture_source, confidence: row.capture_confidence
+      };
+      const captureDate: CaptureDateMetadata = isCaptureDateMetadata(rawCaptureDate) ? rawCaptureDate : row.captured_at
+        ? { capturedAt: row.captured_at, localTime: null, offsetMinutes: null, source: 'legacy_unknown', confidence: 'unknown' }
+        : { capturedAt: null, localTime: null, offsetMinutes: null, source: 'unknown', confidence: 'unknown' };
       this.reserveLocalEventDraft(row.library_id, authorPeerId, factory({
-        libraryId: row.library_id, assetId: row.asset_id, kind: row.kind, sha256: row.sha256, byteLength: row.byte_size
+        libraryId: row.library_id, assetId: row.asset_id, kind: row.kind, sha256: row.sha256, byteLength: row.byte_size, captureDate
       }));
       return true;
     });
@@ -179,6 +202,8 @@ export class SyncRepository {
       const authors = this.db.prepare('SELECT author_peer_id FROM sync_author_heads WHERE library_id = ? AND ready = 1 ORDER BY author_peer_id')
         .all(libraryId) as Array<{ author_peer_id: string }>;
       for (const { author_peer_id: authorPeerId } of authors) {
+        // The target peer is already the origin of its own author stream; never echo its events back.
+        if (authorPeerId === peerId) continue;
         const after = cursorMap.get(`${libraryId}\0${authorPeerId}`) ?? 0;
         const remaining = maxEvents - events.length;
         if (remaining <= 0) return events;
@@ -367,10 +392,13 @@ export class SyncRepository {
       if (exists && (exists.sha256 !== payload.sha256 || exists.originNodeId !== payload.originNodeId)) {
         throw new SyncProtocolConflictError('asset index conflicts with existing immutable content identity');
       }
+      const capture = payload.capture;
+      const metadata = typeof capture === 'object' && capture !== null && !Array.isArray(capture)
+        ? { capture, capturedAt: capture.capturedAt ?? null } : {};
       this.db.prepare(`INSERT INTO sync_asset_projection
         (library_id, asset_id, origin_node_id, kind, sha256, byte_length, metadata_json, last_event_id)
-        VALUES (?, ?, ?, ?, ?, ?, '{}', ?) ON CONFLICT(library_id, asset_id) DO NOTHING`)
-        .run(event.libraryId, assetId, payload.originNodeId, payload.kind, payload.sha256, payload.byteLength, event.eventId);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(library_id, asset_id) DO NOTHING`)
+        .run(event.libraryId, assetId, payload.originNodeId, payload.kind, payload.sha256, payload.byteLength, JSON.stringify(metadata), event.eventId);
       return;
     }
     if (event.eventType === 'asset.metadata.updated') {

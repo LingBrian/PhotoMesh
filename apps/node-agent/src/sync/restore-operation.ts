@@ -26,6 +26,9 @@ export async function restoreTombstoneOperation(
     if (currentState === 'not_found') return 'not_found';
     return 'inactive';
   }
+  // Multiple delete generations may remain active in the event log; only the
+  // projection's current generation may be restored.
+  if (syncService.repository.getActiveTombstoneEventId(libraryId, tombstone.assetId) !== eventId) return 'conflict';
   try {
     const event = await syncService.createLocalEvent({
       libraryId, eventType: 'asset.restored', causalParents: [eventId],

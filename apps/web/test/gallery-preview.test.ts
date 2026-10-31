@@ -33,7 +33,7 @@ describe('loadAssetPreview', () => {
     await expect(loadAssetPreview({ ...input, asset: { ...baseAsset, availability: 'offline' } }))
       .rejects.toMatchObject({ code: 'source-offline' });
     await expect(loadAssetPreview({ ...input, asset: { ...baseAsset, availability: 'missing' } }))
-      .rejects.toMatchObject({ code: 'source-offline' });
+      .rejects.toMatchObject({ code: 'source-missing' });
     await expect(loadAssetPreview({ ...input, asset: { ...baseAsset, kind: 'video' } }))
       .rejects.toMatchObject({ code: 'unsupported-media' });
     expect(fetcher).not.toHaveBeenCalled();
@@ -80,13 +80,28 @@ describe('loadAssetPreview', () => {
     expect(cancelled).toBe(true);
   });
 
-  it('maps offline and missing/denied responses without exposing resource details', async () => {
-    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 409 }));
+  it('maps offline and missing responses without exposing resource details', async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ error: 'source_offline', requestId: 'req' }), {
+      status: 409, headers: { 'content-type': 'application/json' }
+    }));
     const input = { apiBase: 'https://node.example', token: 'test-token', asset: baseAsset, fetcher };
     await expect(loadAssetPreview(input)).rejects.toBeInstanceOf(GalleryPreviewError);
     await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'source-offline' });
 
+    fetcher.mockImplementation(async () => new Response(JSON.stringify({ error: 'source_missing', requestId: 'req' }), {
+      status: 409, headers: { 'content-type': 'application/json' }
+    }));
+    await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'source-missing' });
+
     fetcher.mockImplementation(async () => new Response(null, { status: 404 }));
     await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'asset-unavailable' });
+  });
+
+  it('treats both 401 and 403 as invalid authorization so the session can be cleared', async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 401 }));
+    const input = { apiBase: 'https://node.example', token: 'test-token', asset: baseAsset, fetcher };
+    await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'unauthorized' });
+    fetcher.mockImplementation(async () => new Response(null, { status: 403 }));
+    await expect(loadAssetPreview(input)).rejects.toMatchObject({ code: 'unauthorized' });
   });
 });

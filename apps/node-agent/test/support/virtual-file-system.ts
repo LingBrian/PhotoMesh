@@ -1,4 +1,4 @@
-import type { UploadFileSystem, StorageFailureCode } from '../../src/uploads/file-system.js';
+import type { FileDigest, UploadFileSystem, StorageFailureCode } from '../../src/uploads/file-system.js';
 import { createHash } from 'node:crypto';
 
 export class VirtualFileSystem implements UploadFileSystem {
@@ -70,14 +70,19 @@ export class VirtualFileSystem implements UploadFileSystem {
     return this.read(path);
   }
 
-  async hashFile(path: string): Promise<{ byteLength: number; sha256: string }> {
+  async hashFile(path: string, maxPrefixBytes = 0): Promise<FileDigest> {
     this.raise('hash');
+    validatePrefixLimit(maxPrefixBytes);
     const bytes = this.read(path);
-    return { byteLength: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex') };
+    return {
+      byteLength: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex'),
+      ...(maxPrefixBytes > 0 ? { prefix: bytes.slice(0, maxPrefixBytes) } : {})
+    };
   }
 
-  async assembleAndHash(sourcePaths: readonly string[], destinationPath: string): Promise<{ byteLength: number; sha256: string }> {
+  async assembleAndHash(sourcePaths: readonly string[], destinationPath: string, maxPrefixBytes = 0): Promise<FileDigest> {
     this.raise('assemble');
+    validatePrefixLimit(maxPrefixBytes);
     const parts = sourcePaths.map((path) => this.read(path));
     const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
     this.ensureCapacity(total, destinationPath);
@@ -88,7 +93,10 @@ export class VirtualFileSystem implements UploadFileSystem {
       offset += part.byteLength;
     }
     this.files.set(destinationPath, result);
-    return { byteLength: result.byteLength, sha256: createHash('sha256').update(result).digest('hex') };
+    return {
+      byteLength: result.byteLength, sha256: createHash('sha256').update(result).digest('hex'),
+      ...(maxPrefixBytes > 0 ? { prefix: result.slice(0, maxPrefixBytes) } : {})
+    };
   }
 
   private raise(operation: string): void {
@@ -105,4 +113,8 @@ export class VirtualFileSystem implements UploadFileSystem {
       throw Object.assign(new Error('virtual filesystem is full'), { code: 'ENOSPC' });
     }
   }
+}
+
+function validatePrefixLimit(maxPrefixBytes: number): void {
+  if (!Number.isSafeInteger(maxPrefixBytes) || maxPrefixBytes < 0 || maxPrefixBytes > 1024 * 1024) throw new Error('invalid bounded prefix size');
 }

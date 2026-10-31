@@ -1,14 +1,14 @@
 openapi: 3.1.0
 info:
-  title: PhotoMesh Node API (Design Draft)
+  title: PhotoMesh Node HTTP API
   version: 0.1.0
-  description: |
-    草案：用于最初合约讨论，不可直接作为已实现服务。
-    P2P 内部事件通道、端到端加密流程与会话身份另有协议安全设计。
+  description: |-
+    Contract for HTTP operations currently implemented by the Node Agent. The listener is plain HTTP; this document advertises only its default loopback URL. A private-LAN bind is not TLS: do not expose it off-host or send credentials over direct HTTP; use a separately configured trusted HTTPS-terminating proxy. P2P protocol messages are not HTTP routes. Generic CORS OPTIONS preflight returns 204 and is transport behavior, not a business operation. Every HTTP response includes X-Request-ID; JSON errors also echo it as requestId.
 servers:
-  - url: https://localhost:8443
+  - url: http://127.0.0.1:8443
+    description: Default loopback HTTP listener; do not use direct HTTP for off-host access.
 security:
-  - deviceBearer: []
+  - nodeAdminBearer: []
 paths:
   /v1/health:
     get:
@@ -29,6 +29,66 @@ paths:
                   capabilities:
                     type: array
                     items: {type: string}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/diagnostics:
+    get:
+      summary: 管理员查看节点组件健康状态与能力
+      description: Requires the node administrator bearer token; returns enumerated statuses and capabilities only, never paths or user data.
+      security:
+        - nodeAdminBearer: []
+      responses:
+        '200':
+          description: Component diagnostics
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NodeDiagnostics'}
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403':
+          description: Forbidden
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/resources:
+    get:
+      summary: 管理员查看节点资源与任务队列指标
+      description: Requires the node administrator bearer token. Returns bounded counts and byte totals only; paths, secrets, and user data are excluded. Low space makes new work unavailable.
+      security:
+        - nodeAdminBearer: []
+      responses:
+        '200':
+          description: Resource metrics
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ResourceMetrics'}}}
+        '403': {description: Forbidden, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Resource metrics unavailable, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/libraries:
     get:
       summary: 当前主体有权查看的照片库
@@ -38,33 +98,496 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/LibraryPage'}
-        '401': {description: Unauthorized}
-        '403': {description: Forbidden}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Forbidden, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/libraries/{libraryId}/external-scan-review:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 读取外部目录扫描人工核对报告
+      description: 只读报告；不触发扫描、不删除文件、不写入墓碑。仅返回当前主体有权查看的图库。
+      responses:
+        '200':
+          description: External scan review
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ExternalScanReviewPage'}}}
+        '400': {description: Invalid path or query, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown or unauthorized library, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: External scan capability unavailable, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: no-store}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/metadata-export:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 导出授权图库元数据
+      description: 仅导出元数据，不包含原图、密钥或秘密；CSV 固定列并防止公式注入，最多 5000 条。
+      parameters:
+        - in: query
+          name: format
+          required: true
+          schema: {type: string, enum: [json, csv]}
+      responses:
+        '200':
+          description: Metadata export
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/MetadataExportPage'}}
+            text/csv: {schema: {type: string}}
+        '400': {description: Invalid format, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Unauthorized library, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Gallery capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 管理员分页读取图库中的手动虚拟相册
+      description: 当前 Node HTTP API 仅开放给本机管理员。列表不包含删除状态；按 albumId 二进制顺序 keyset 分页，cursor 不代表 MVCC 快照。
+      parameters:
+        - in: query
+          name: cursor
+          schema: {type: string, maxLength: 2048}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Album page
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumPage'}}}
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: Invalid/repeated/unknown query parameter or cursor, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown/unauthorized library, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    post:
+      summary: 创建手动虚拟相册
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateAlbumRequest'}}}
+      responses:
+        '201':
+          description: Album created; same idempotency key and canonical request replays this original resource.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Album'}}}
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: Invalid body/title/idempotency key, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Body exceeds the album request limit, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown/unauthorized library, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Global idempotency key conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/deletion:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    post:
+      summary: Locally-administered reversible soft deletion of a virtual album
+      description: Requires the local node administrator. local creates a node-local tombstone; global creates a replicated deletion event subject to album-delete grants. Both are reversible; this API never physically purges an album or source asset.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumDeletionRequest'}}}
+      responses:
+        '204':
+          description: Deletion recorded or idempotent no-op replay; no body
+          headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '400': {description: 'Invalid scope, request, or idempotency key', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Album absent or not authorized; no cross-library disclosure, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or required global album-delete grant absent, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error using the common error envelope, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/deleted:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: Page reversible soft-deleted albums visible at this node
+      description: Local-admin only. Keyset cursor is not an MVCC snapshot; scope selects all, local-only, or globally replicated tombstones. No physical purge is performed.
+      parameters:
+        - in: query
+          name: scope
+          required: true
+          schema: {type: string, enum: [all, local, global]}
+        - in: query
+          name: cursor
+          schema: {type: string, maxLength: 2048}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Deleted album page without total count
+          content: {application/json: {schema: {$ref: '#/components/schemas/DeletedAlbumPage'}}}
+          headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '400': {description: Invalid or repeated query parameter or cursor, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Unknown or unauthorized library, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error using the common error envelope, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/restore:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    post:
+      summary: Restore a soft-deleted album locally or globally
+      description: Requires the local node administrator. Restores only the selected tombstone scope; the operation is reversible and never purges data.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumRestoreRequest'}}}
+      responses:
+        '204':
+          description: Album restored or scope was already active; no body
+          headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '400': {description: Invalid scope or request, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Deleted album absent or not authorized, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Global restore grant missing or tombstone state conflicts, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error using the common error envelope, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/members:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    get:
+      summary: 分页读取相册中可见资产 ID
+      description: 仅返回 {assetId} allowlist；过滤 tombstone 后分页。Keyset cursor 非快照，改动后客户端可从第一页刷新。
+      parameters:
+        - in: query
+          name: cursor
+          schema: {type: string, maxLength: 2048}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Member page with no total count
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumMemberPage'}}}
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: Invalid/repeated/unknown query parameter or cursor, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Unauthorized/unknown library, missing/cross-library album', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/albums/{albumId}/members/{assetId}:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: albumId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: 幂等添加虚拟相册成员
+      description: Requires a globally unique Idempotency-Key UUID. Same-author active add is a no-op; a new author contributes an observed add token.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      responses:
+        '204':
+          description: Member is present after the operation.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: 'Invalid/repeated idempotency key, body or query', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Body exceeds the album request limit, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Unauthorized/unknown library, missing/cross-library album or asset, or tombstone', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      summary: 幂等移除已观察的相册成员 add 操作
+      description: Remove operation atomically records every currently observed add ID (maximum 64); an unseen concurrent add remains active.
+      parameters:
+        - $ref: '#/components/parameters/AlbumIdempotencyKey'
+      responses:
+        '204':
+          description: Observed member adds have been removed; replays have no additional effect.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '400': {description: 'Invalid/repeated idempotency key, body or query', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Body exceeds the album request limit, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Invalid or missing node-admin bearer token, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Unauthorized/unknown library, missing/cross-library album or asset, or tombstone', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/assets:
     get:
-      summary: 授权范围内的游标分页时间线
+      summary: 授权范围内的游标分页图库搜索
       parameters:
         - in: query
           name: libraryId
           required: true
-          schema: {type: string}
+          schema: {type: string, minLength: 1, maxLength: 128}
         - in: query
           name: cursor
-          schema: {type: string}
+          schema: {type: string, maxLength: 2048, pattern: '^[A-Za-z0-9_-]+$'}
         - in: query
           name: limit
           schema: {type: integer, minimum: 1, maximum: 200, default: 50}
         - in: query
           name: q
-          schema: {type: string, maxLength: 256}
+          description: Literal substring; if non-empty, requires at least 3 Unicode code points and at most 256 UTF-16 code units. SQLite FTS5 trigram case-folding; no accent folding.
+          schema: {type: string, maxLength: 256, x-maxUtf16CodeUnits: 256}
+        - in: query
+          name: dateFrom
+          description: Inclusive UTC calendar-date boundary.
+          schema: {type: string, format: date}
+        - in: query
+          name: dateTo
+          description: Exclusive UTC calendar-date boundary.
+          schema: {type: string, format: date}
+        - in: query
+          name: kind
+          description: Exact asset kind filter; combine with all other filters using AND.
+          schema: {type: string, enum: [photo, video, live_photo]}
+        - in: query
+          name: sourceKind
+          description: Exact source kind filter; local and synchronized assets use their normalized Gallery value.
+          schema: {type: string, enum: [upload, import]}
+        - in: query
+          name: availability
+          description: Exact availability filter; synchronized assets without local location evidence are missing.
+          schema: {type: string, enum: [online, cached, offline, missing]}
       responses:
         '200':
           description: Assets page
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AssetPage'}
-        '403': {description: Library access denied}
-        '400': {description: Invalid cursor or query}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              schema: {type: string, const: 'private, no-store'}
+        '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: 'Invalid, duplicate, or unknown query parameter; short q; invalid UTC date/enum; or cursor/filter mismatch.', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: 'Legacy null-date cursor is stale after floating-date timeline ordering; restart pagination from the first page.', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/assets/duplicate-candidates:
+    get:
+      summary: 授权图库内的重复内容候选只读报告
+      parameters:
+        - in: query
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+      responses:
+        '200':
+          description: Candidate groups; no merge, delete, or tombstone action is performed.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DuplicateCandidatePage'}
+        '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: 'Invalid, duplicate, or unknown query parameter', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/assets/{assetId}/favorite:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      operationId: setAssetFavorite
+      summary: Set the shared favorite state for an authorized library asset
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AssetFavoriteSetRequest'}
+      responses:
+        '200':
+          description: Resulting library-wide shared favorite state.
+          headers:
+            Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AssetFavoriteState'}
+        '400': {description: Malformed request, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Node administrator or library authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Asset is absent, tombstoned, or not visible in this library', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency conflict or 64-author limit reached, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/assets/{assetId}/rating:
+     parameters:
+       - in: path
+         name: libraryId
+         required: true
+         schema: {type: string, minLength: 1, maxLength: 128}
+       - in: path
+         name: assetId
+         required: true
+         schema: {type: string, minLength: 1, maxLength: 128}
+     put:
+       operationId: setAssetRating
+       summary: Set the shared library-wide rating for an authorized asset
+       parameters:
+         - $ref: '#/components/parameters/RatingIdempotencyKey'
+       requestBody:
+         required: true
+         content:
+           application/json:
+             schema: {$ref: '#/components/schemas/AssetRatingSetRequest'}
+       responses:
+         '200':
+           description: Shared rating and current MV-register conflict candidates; no author or principal identity is disclosed.
+           headers:
+             Cache-Control: {schema: {type: string, const: 'private, no-store'}}
+             X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+           content:
+             application/json:
+               schema: {$ref: '#/components/schemas/AssetRatingState'}
+         '400': {description: Invalid body or Idempotency-Key, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '403': {description: Library authorization denied, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '404': {description: 'Asset absent, hidden, or tombstoned', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '409': {description: 'Idempotency conflict, rating-author limit, or active conflict-candidate limit reached', headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         '503': {description: Rating capability unavailable, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+         default: {description: Unexpected error, headers: {Cache-Control: {schema: {type: string, const: 'private, no-store'}}, X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/libraries/{libraryId}/assets/{assetId}/tags/{tag}:
+    parameters:
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: assetId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: tag
+        required: true
+        description: URL-encoded UTF-8 tag text; leading/trailing whitespace is trimmed; case is preserved; server limit is 128 UTF-8 bytes.
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: Idempotently add a tag to an authorized asset
+      responses:
+        '204':
+          description: Tag is present after the operation; repeating the request has no additional effect.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Empty/oversized tag or 64 active tags for this author and asset reached, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Node administrator or library authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Asset is absent, tombstoned, or not visible in this library', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag persistence capability is unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+    delete:
+      summary: Idempotently remove a tag from an authorized asset
+      responses:
+        '204':
+          description: Tag is absent after the operation; repeating the request has no additional effect.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Empty/oversized tag, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Node administrator or library authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: 'Asset is absent, tombstoned, or not visible in this library', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag persistence capability is unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/assets/{assetId}/original:
     get:
       summary: 在每次请求校验图库 ACL 后流式读取不可变原图
@@ -79,11 +602,25 @@ paths:
           headers:
             ETag: {schema: {type: string}}
             Content-Disposition: {schema: {type: string}}
+            Cache-Control: {schema: {type: string, const: no-store}}
+            X-Content-Type-Options: {schema: {type: string, const: nosniff}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             application/octet-stream:
               schema: {type: string, format: binary}
-        '404': {description: Asset is absent or not authorized}
-        '409': {description: Source location is offline}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Source location is offline, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Original stream failed before response headers were sent, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/thumbnail:
     get:
       summary: 每次请求校验图库 ACL 后读取固定尺寸的 WebP 缩略图
@@ -108,20 +645,39 @@ paths:
             ETag: {schema: {type: string}}
             Cache-Control: {schema: {type: string, const: 'private, no-store'}}
             X-Content-Type-Options: {schema: {type: string, const: nosniff}}
+            Content-Disposition: {schema: {type: string, const: inline}}
+            Vary: {schema: {type: string, const: Authorization}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             image/webp:
               schema: {type: string, format: binary}
-        '400': {description: Invalid path or profile}
-        '404': {description: Asset is absent or not authorized}
-        '409': {description: Source changed or offline and no matching derived cache exists}
-        '413': {description: Source or generated thumbnail exceeds configured byte limit}
-        '415': {description: Unsupported or multi-page source image}
-        '500': {description: Thumbnail processing failed}
+        '400': {description: Invalid path or profile, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Source changed or offline and no matching derived cache exists, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Source or generated thumbnail exceeds configured byte limit, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '415': {description: Unsupported or multi-page source image, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Thumbnail processing failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
         '429':
           description: Bounded thumbnail queue is full
           headers:
             Retry-After: {schema: {type: string, const: '1'}}
-        '503': {description: Thumbnail processing capability unavailable}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503': {description: Thumbnail processing capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/versions:
     parameters:
       - in: path
@@ -140,9 +696,22 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MediaVersionPage'}
-        '403': {description: Admin authorization required}
-        '404': {description: Asset is absent or not authorized}
-        '503': {description: Media-version capability unavailable}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid path parameters, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Media-version capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       summary: 排队创建裁剪/旋转派生版本，不修改原件
       description: Requires the mediaVersions capability and a currently online, hash-matching source.
@@ -157,14 +726,26 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MediaVersionOperation'}
-        '400': {description: Invalid transform or request}
-        '403': {description: Admin authorization required}
-        '404': {description: Asset is absent or not authorized}
-        '409': {description: 'Source changed or idempotency key conflict'}
-        '413': {description: 'Input-size or pixel limit exceeded before the asynchronous operation is accepted'}
-        '415': {description: Unsupported media format}
-        '500': {description: Internal transform or database error}
-        '503': {description: 'Source or storage unavailable, or temporary media-version capacity limit reached; retry later'}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid transform or request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Asset is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: 'Source changed or idempotency key conflict', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: 'Input-size or pixel limit exceeded before the asynchronous operation is accepted', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '415': {description: Unsupported media format, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Media transform processing failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: 'Source or storage unavailable, or temporary media-version capacity limit reached; retry later', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}:
     parameters:
       - in: path
@@ -187,9 +768,22 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MediaVersion'}
-        '403': {description: Admin authorization required}
-        '404': {description: Version is absent or not authorized}
-        '503': {description: Media-version capability unavailable}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid path parameters, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Version is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Media-version capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/libraries/{libraryId}/assets/{assetId}/versions/{versionId}/content:
     parameters:
       - in: path
@@ -212,14 +806,28 @@ paths:
           headers:
             ETag: {schema: {type: string}}
             Cache-Control: {schema: {type: string, const: no-store}}
+            X-Content-Type-Options: {schema: {type: string, const: nosniff}}
+            Content-Disposition: {schema: {type: string, const: inline}}
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             image/jpeg: {schema: {type: string, format: binary}}
             image/png: {schema: {type: string, format: binary}}
             image/webp: {schema: {type: string, format: binary}}
-        '403': {description: Admin authorization required}
-        '404': {description: Version is absent or not authorized}
-        '409': {description: Version is not ready or failed}
-        '503': {description: 'Media-version capability unavailable, storage unavailable, or integrity verification failed'}
+        '400': {description: Invalid path parameters, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization required, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Version is absent or not authorized, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Version is not ready or failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: 'Media-version capability unavailable, storage unavailable, or integrity verification failed', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/recycle-bin:
     get:
       summary: Read visible deletion tombstones without deleting source originals
@@ -238,7 +846,19 @@ paths:
                 required: [items]
                 properties:
                   items: {type: array, items: {$ref: '#/components/schemas/Tombstone'}}
-        '403': {description: Library access denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Library access denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/recycle-bin/restore:
     post:
       summary: Restore an active tombstone by appending a signed asset.restored event
@@ -266,11 +886,23 @@ paths:
                   status: {type: string, const: restored}
                   tombstoneEventId: {type: string, format: uuid, description: Tombstone event ID targeted by this request}
                   restoreEventId: {type: string, format: uuid, description: Newly signed or previously recorded asset.restored event ID}
-        '400': {description: Invalid request}
-        '403': {description: Admin authorization or library read authorization denied}
-        '404': {description: Tombstone not found in the specified library}
-        '409': {description: "Tombstone is inactive without a recorded restore event, or causal frontier cannot be represented"}
-        '503': {description: Sync capability unavailable}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Admin authorization or library read authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Tombstone not found in the specified library, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: "Tombstone is inactive without a recorded restore event, or causal frontier cannot be represented", headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/invitations:
     post:
       summary: 创建短期一次性 LAN 配对邀请（返回供客户端编码为二维码的载荷）
@@ -280,7 +912,19 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/PairingInvite'}
-        '403': {description: Pairing administration denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/join:
     post:
       summary: 扫描邀请二维码后，以本地节点身份通过 Noise 通道加入对端
@@ -299,8 +943,20 @@ paths:
                 required: [hostPeerId]
                 properties:
                   hostPeerId: {type: string}
-        '400': {description: Invalid request}
-        '403': {description: 'Invite expired, replayed, declined, or identity mismatch'}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: 'Administrator authorization denied, or invite expired, replayed, declined, or identity mismatch', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers:
     get:
       summary: 列出可信、已撤销节点和待审批设备
@@ -315,7 +971,19 @@ paths:
                 properties:
                   peers: {type: array, items: {$ref: '#/components/schemas/TrustedPeer'}}
                   pending: {type: array, items: {$ref: '#/components/schemas/PendingPeerApproval'}}
-        '403': {description: Pairing administration denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers/{peerId}/approval:
     post:
       summary: 本地用户确认或拒绝经过 Noise 身份验证的配对请求
@@ -330,9 +998,19 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/PairingApproval'}
       responses:
-        '200': {description: Approval recorded}
-        '403': {description: Pairing administration denied}
-        '404': {description: Pending request not found}
+        '200': {description: Approval recorded, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid approval request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Pending request not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers/{peerId}:
     delete:
       summary: 撤销节点并关闭现存 P2P 连接
@@ -342,9 +1020,18 @@ paths:
           required: true
           schema: {type: string}
       responses:
-        '200': {description: Peer revoked}
-        '403': {description: Pairing administration denied}
-        '404': {description: Peer not found}
+        '200': {description: Peer revoked, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/peers/{peerId}/libraries/{libraryId}:
     put:
       summary: 明确授予可信节点对单个图库的只读权限
@@ -358,9 +1045,322 @@ paths:
           required: true
           schema: {type: string}
       responses:
-        '204': {description: Read grant recorded}
-        '403': {description: Pairing administration denied}
-        '409': {description: Peer is not trusted}
+        '204': {description: Read grant recorded, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/tag-write:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string}
+    put:
+      summary: 显式授予可信作者在此图库写入标签事件的权限
+      responses:
+        '204': {description: Tag-write grant recorded, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is untrusted or the 64-author library limit is reached; revoked author slots are retained, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag sync capability is unavailable on this node, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected HTTP error using the common error envelope, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      summary: 撤销此可信作者的后续标签写入权限，不复用作者槽位
+      responses:
+        '200':
+          description: Tag-write grant revoked; operations already replicated to trusted peers cannot be retracted.
+          headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, replicatedEventsRemain]
+                properties:
+                  status: {type: string, const: revoked}
+                  replicatedEventsRemain: {type: boolean, const: true}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag sync capability is unavailable on this node, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected HTTP error using the common error envelope, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/libraries/{libraryId}/tag-writers:
+    get:
+      summary: 列出此图库当前有标签写入权限的可信节点
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Active tag writers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [writers]
+                properties:
+                  writers: {type: array, maxItems: 64, items: {type: string}}
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag sync capability is unavailable on this node, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/tag-sync-status:
+    get:
+      summary: 获取节点的标签待同步数量和最后错误码
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Per-peer tag sync status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pending, lastError]
+                properties:
+                  pending: {type: integer, minimum: 0}
+                  lastError: {type: [string, 'null']}
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/XRequestId'}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Tag sync capability is unavailable on this node, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/album-write:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: Local-admin grant of album metadata write authority to a trusted peer
+      description: Separate from read access and album-delete authority; default-deny. Does not grant deletion.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      summary: Local-admin revocation of a peer album metadata write grant
+      description: Revocation blocks future authorized writes but cannot retract events already replicated.
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/album-delete:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      summary: Local-admin grant of separately-scoped album deletion authority
+      description: Independent of album-write and read grants; default-deny.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      summary: Local-admin revocation of a peer album deletion grant
+      description: Revocation blocks future authorized deletion events but cannot retract events already replicated.
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/libraries/{libraryId}/album-sync-grants:
+    get:
+      summary: Operator-visible active album write and delete grants for a library
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200':
+          description: Active grants only; no user content or unrelated resource enumeration
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncGrantList'}}}
+          headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/album-sync-status:
+    get:
+      summary: Operator-visible album sync queue and authorization status for a peer
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200':
+          description: Operational counters and enumerated error only
+          content: {application/json: {schema: {$ref: '#/components/schemas/AlbumSyncPeerStatus'}}}
+          headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Album sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/favorite-write:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      operationId: grantFavoriteWrite
+      summary: Grant a trusted peer default-deny favorite-write authority for one library
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Peer is not trusted or the 64-author limit is reached; revoked author slots remain reserved, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      operationId: revokeFavoriteWrite
+      summary: Revoke a peer's future favorite writes without retracting accepted events
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/libraries/{libraryId}/favorite-sync-grants:
+    get:
+      operationId: listFavoriteSyncGrants
+      summary: List active favorite-write grants for a library
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Active grant records only, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncGrantList'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/favorite-sync-status:
+    get:
+      operationId: getFavoriteSyncStatus
+      summary: Get per-peer favorite sync queue count and enumerated last-error code
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Operational counters and fixed error code only, content: {application/json: {schema: {$ref: '#/components/schemas/FavoriteSyncPeerStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Favorite sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/libraries/{libraryId}/rating-write:
+    parameters:
+      - in: path
+        name: peerId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+      - in: path
+        name: libraryId
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 128}
+    put:
+      operationId: grantRatingWrite
+      summary: Grant a trusted peer default-deny rating-write authority for one library
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantRequest'}}}
+      responses:
+        '200': {description: Grant recorded, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid grant request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: 'Peer is not trusted, lacks a library-read grant, or the 64-author limit is reached; revoked author slots remain reserved', headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+    delete:
+      operationId: revokeRatingWrite
+      summary: Revoke a peer's future rating writes without retracting accepted events
+      responses:
+        '200': {description: Grant revoked or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Local node-admin authorization denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer or library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/libraries/{libraryId}/rating-sync-grants:
+    get:
+      operationId: listRatingSyncGrants
+      summary: List active rating-write grants for one library
+      parameters:
+        - in: path
+          name: libraryId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Active grant records only, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncGrantList'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Library not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+  /v1/pairing/peers/{peerId}/rating-sync-status:
+    get:
+      operationId: getRatingSyncStatus
+      summary: Get rating sync queue count and enumerated error status for a peer
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {description: Operational counters and fixed error code only, content: {application/json: {schema: {$ref: '#/components/schemas/RatingSyncPeerStatus'}}}, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Peer not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '503': {description: Rating sync capability unavailable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default: {description: Unexpected error, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
   /v1/pairing/discovered:
     get:
       summary: 获取 mDNS 发现的未信任节点地址（发现不代表信任）
@@ -381,7 +1381,19 @@ paths:
                       properties:
                         peerId: {type: string}
                         addresses: {type: array, items: {type: string}}
-        '403': {description: Pairing administration denied}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/pairing/manual-discovery:
     post:
       summary: 通过明确私有 LAN IP 建立 Noise 身份验证连接
@@ -397,9 +1409,19 @@ paths:
                 port: {type: integer, minimum: 1, maximum: 65535}
                 peerId: {type: string}
       responses:
-        '200': {description: Authenticated peer address}
-        '400': {description: Invalid address}
-        '403': {description: Pairing administration denied}
+        '200': {description: Authenticated peer address, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}}
+        '400': {description: Invalid address, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Pairing administration denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '502': {description: Peer could not be reached, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads:
     post:
       summary: 创建有期限的分块上传会话
@@ -419,10 +1441,24 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
-        '400': {description: Invalid request}
-        '403': {description: Denied}
-        '409': {description: Idempotency key reused for a different request}
-        '413': {description: Upload exceeds configured limits}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400': {description: Invalid request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Idempotency key reused for a different request, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Upload exceeds configured limits, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '507': {description: Low storage; new work is paused, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Upload session creation failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads/{sessionId}:
     get:
       summary: 查询允许续传的偏移位置
@@ -437,9 +1473,22 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
-        '403': {description: Denied}
-        '404': {description: Session not found}
-        '410': {description: Session expired}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Session not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: Session expired, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Upload session lookup failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads/{sessionId}/chunks/{chunkIndex}:
     put:
       summary: Write one immutable, resumable upload chunk
@@ -471,11 +1520,27 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadSession'}
-        '403': {description: Denied}
-        '409': {description: Offset or chunk idempotency conflict}
-        '413': {description: Chunk exceeds configured limits}
-        '422': {description: Chunk checksum mismatch}
-        '507': {description: Managed storage has insufficient capacity}
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '400': {description: Invalid offset or request body, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Upload session not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: Upload session expired, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Offset or chunk idempotency conflict, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Chunk exceeds configured limits, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '422': {description: Chunk checksum mismatch, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Chunk write failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '507': {description: Managed storage has insufficient capacity, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1/uploads/{sessionId}/complete:
     post:
       summary: Verify complete SHA-256 and atomically commit immutable original
@@ -490,44 +1555,313 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UploadComplete'}
-        '403': {description: Denied}
-        '409': {description: Upload incomplete or session not writable}
-        '410': {description: Session expired}
-        '422': {description: Complete file checksum mismatch}
-        '507': {description: Managed storage has insufficient capacity}
-  /v1/sync/hello:
-    post:
-      summary: 受信任节点 P2P 版本协商（仅内部受认证通道）
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [nodeId, protocolMin, protocolMax, nonce]
-              properties:
-                nodeId: {type: string}
-                protocolMin: {type: integer}
-                protocolMax: {type: integer}
-                nonce: {type: string}
-      responses:
-        '200':
-          description: Negotiated
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '403': {description: Denied, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '404': {description: Upload session not found, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '409': {description: Upload incomplete or session not writable, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '410': {description: Session expired, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '413': {description: Upload exceeds configured limits, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '422': {description: Complete file checksum mismatch, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '500': {description: Upload completion failed, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        '507': {description: Managed storage has insufficient capacity, headers: {X-Request-ID: {$ref: '#/components/headers/XRequestId'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApiError'}}}}
+        default:
+          description: Unexpected HTTP error using the common error envelope.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
           content:
             application/json:
               schema:
-                type: object
-                required: [agreedProtocol]
-                properties:
-                  agreedProtocol: {type: integer}
-        '403': {description: Node not paired or invalid signature}
+                $ref: '#/components/schemas/ApiError'
 components:
   securitySchemes:
-    deviceBearer:
+    nodeAdminBearer:
       type: http
       scheme: bearer
-      bearerFormat: device-bound-token
+      bearerFormat: node-admin-token
+  parameters:
+    AlbumIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID operation ID globally unique across libraries, resources and mutation types; retained durably for replay.
+      schema: {type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+    RatingIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID operation ID for idempotent shared rating mutation.
+      schema: {type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
   schemas:
+    Album:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, title, createdByPeerId, createdAt]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        title:
+          type: string
+          minLength: 1
+          description: Leading/trailing ECMAScript WhiteSpace/LineTerminator code points are trimmed; UTF-8 byte length is 1..256. No NFC/NFD or case normalization.
+          x-maxUtf8Bytes: 256
+        createdByPeerId: {type: string, minLength: 1, maxLength: 128}
+        createdAt: {type: string, format: date-time}
+    CreateAlbumRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          description: Leading/trailing ECMAScript WhiteSpace/LineTerminator code points are trimmed; UTF-8 byte length is 1..256. No NFC/NFD or case normalization.
+          x-maxUtf8Bytes: 256
+    AlbumPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/Album'}}
+        nextCursor: {type: [string, 'null'], maxLength: 2048}
+    AlbumMember:
+      type: object
+      additionalProperties: false
+      required: [assetId]
+      properties:
+        assetId: {type: string, minLength: 1, maxLength: 128}
+    AlbumMemberPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AlbumMember'}}
+        nextCursor: {type: [string, 'null'], maxLength: 2048}
+    AlbumDeletionRequest:
+      type: object
+      additionalProperties: false
+      required: [scope]
+      properties:
+        scope: {type: string, enum: [local, global]}
+    AlbumDeletionResult:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, scope, status, deletedAt]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        scope: {type: string, enum: [local, global]}
+        status: {type: string, enum: [deleted, already_deleted]}
+        deletedAt: {type: string, format: date-time}
+    AlbumRestoreRequest:
+      type: object
+      additionalProperties: false
+      required: [scope]
+      properties:
+        scope: {type: string, enum: [local, global]}
+    AlbumRestoreResult:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, scope, status]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        scope: {type: string, enum: [local, global]}
+        status: {type: string, enum: [restored, already_active]}
+    DeletedAlbum:
+      type: object
+      additionalProperties: false
+      required: [albumId, libraryId, title, createdByPeerId, createdAt, scopes, deletedAt]
+      properties:
+        albumId: {type: string, format: uuid}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        title: {type: string}
+        createdByPeerId: {type: string, minLength: 1, maxLength: 128}
+        createdAt: {type: string, format: date-time}
+        scopes: {type: array, minItems: 1, maxItems: 2, uniqueItems: true, items: {type: string, enum: [local, global]}}
+        deletedAt: {type: string, format: date-time}
+    DeletedAlbumPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/DeletedAlbum'}}
+        nextCursor: {type: [string, 'null'], maxLength: 2048}
+    AlbumSyncGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: {type: boolean, const: true, description: Grant enabled; revoke using DELETE.}
+    AlbumSyncGrantStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, libraryId, permission, granted]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        permission: {type: string, enum: [album-write, album-delete]}
+        granted: {type: boolean}
+    AlbumSyncGrantList:
+      type: object
+      additionalProperties: false
+      required: [grants]
+      properties:
+        grants: {type: array, items: {$ref: '#/components/schemas/AlbumSyncGrantStatus'}}
+    AlbumSyncPeerStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, pendingEvents, lastErrorCode]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        pendingEvents: {type: integer, minimum: 0}
+        lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
+    AssetFavoriteSetRequest:
+       type: object
+       additionalProperties: false
+       required: [favorite]
+       properties:
+         favorite: {type: boolean, description: Set the shared state for the entire library, not a personal bookmark}
+    AssetFavoriteState:
+       type: object
+       additionalProperties: false
+       required: [favorite]
+       properties:
+         favorite: {type: boolean}
+    FavoriteSyncGrantRequest:
+       type: object
+       additionalProperties: false
+       required: [enabled]
+       properties:
+         enabled: {type: boolean, const: true}
+    FavoriteSyncGrantStatus:
+       type: object
+       additionalProperties: false
+       required: [peerId, libraryId, permission, granted]
+       properties:
+         peerId: {type: string, minLength: 1, maxLength: 128}
+         libraryId: {type: string, minLength: 1, maxLength: 128}
+         permission: {type: string, const: favorite-write}
+         granted: {type: boolean}
+    FavoriteSyncGrantList:
+       type: object
+       additionalProperties: false
+       required: [grants]
+       properties:
+         grants: {type: array, items: {$ref: '#/components/schemas/FavoriteSyncGrantStatus'}}
+    FavoriteSyncPeerStatus:
+       type: object
+       additionalProperties: false
+       required: [peerId, pendingEvents, lastErrorCode]
+       properties:
+         peerId: {type: string, minLength: 1, maxLength: 128}
+         pendingEvents: {type: integer, minimum: 0}
+         lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
+    NullableRatingValue:
+      anyOf:
+        - type: integer
+          minimum: 1
+          maximum: 5
+        - type: 'null'
+    AssetRatingSetRequest:
+      type: object
+      additionalProperties: false
+      required: [rating]
+      properties:
+        rating: {$ref: '#/components/schemas/NullableRatingValue', description: Integer from 1 to 5, or explicit null to clear.}
+    AssetRatingState:
+      type: object
+      additionalProperties: false
+      required: [rating, ratingConflict, ratingCandidates]
+      properties:
+        rating: {$ref: '#/components/schemas/NullableRatingValue'}
+        ratingConflict: {type: boolean}
+        ratingCandidates:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/NullableRatingValue'}
+    RatingSyncGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: {type: boolean, const: true, description: Grant enabled; revoke using DELETE.}
+    RatingSyncGrantStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, libraryId, permission, granted]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        libraryId: {type: string, minLength: 1, maxLength: 128}
+        permission: {type: string, const: rating-write}
+        granted: {type: boolean}
+    RatingSyncGrantList:
+      type: object
+      additionalProperties: false
+      required: [grants]
+      properties:
+        grants: {type: array, maxItems: 64, items: {$ref: '#/components/schemas/RatingSyncGrantStatus'}}
+    RatingSyncPeerStatus:
+      type: object
+      additionalProperties: false
+      required: [peerId, pendingEvents, lastErrorCode]
+      properties:
+        peerId: {type: string, minLength: 1, maxLength: 128}
+        pendingEvents: {type: integer, minimum: 0}
+        lastErrorCode: {type: [string, 'null'], enum: [unauthorized, unavailable, conflict, null]}
+    ResourceMetrics:
+      type: object
+      required: [status, acceptsNewWork, storage, queue]
+      properties:
+        status: {type: string, enum: [ok, low_space, unavailable]}
+        acceptsNewWork: {type: boolean}
+        storage:
+          type: object
+          required: [totalBytes, availableBytes, usedBytes, lowSpace]
+          properties:
+            totalBytes: {type: integer, minimum: 0}
+            availableBytes: {type: integer, minimum: 0}
+            usedBytes: {type: integer, minimum: 0}
+            lowSpace: {type: boolean}
+        queue:
+          type: object
+          required: [pending, running, failed]
+          properties:
+            pending: {type: integer, minimum: 0}
+            running: {type: integer, minimum: 0}
+            failed: {type: integer, minimum: 0}
+    NodeDiagnostics:
+      type: object
+      additionalProperties: false
+      required: [status, readiness, components]
+      properties:
+        status: {type: string, enum: [ok, degraded, unavailable]}
+        readiness: {type: string, enum: [ready, not_ready]}
+        components:
+          type: object
+          additionalProperties: false
+          required: [api, database, storage, identity]
+          properties:
+            api: {$ref: '#/components/schemas/DiagnosticComponent'}
+            database: {$ref: '#/components/schemas/DiagnosticComponent'}
+            storage: {$ref: '#/components/schemas/DiagnosticComponent'}
+            identity: {$ref: '#/components/schemas/DiagnosticComponent'}
+    DiagnosticComponent:
+      type: object
+      additionalProperties: false
+      required: [status, capabilities]
+      properties:
+        status: {type: string, enum: [ok, degraded, unavailable]}
+        capabilities:
+          type: array
+          uniqueItems: true
+          maxItems: 17
+          items:
+            type: string
+            enum: [rest, mediaVersions, thumbnails, assetTags, gallerySearch, galleryFilters, virtualAlbums, assetFavorites, favoriteSync, tagSync, assetRatings, ratingSync, sqlite, managedFiles, nodeIdentity, eventSigning, lanPairing]
     PairingInvite:
       type: object
       required: [protocol, version, hostPeerId, addresses, inviteId, secret, expiresAt, qrDataUrl]
@@ -536,7 +1870,7 @@ components:
         version: {type: integer, const: 1}
         hostPeerId: {type: string}
         addresses: {type: array, items: {type: string}}
-        inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+        inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
         secret: {type: string, minLength: 43, maxLength: 43}
         expiresAt: {type: string, format: date-time}
         qrDataUrl: {type: string, pattern: '^data:image/png;base64,'}
@@ -552,7 +1886,7 @@ components:
             version: {type: integer, const: 1}
             hostPeerId: {type: string}
             addresses: {type: array, maxItems: 32, items: {type: string, maxLength: 512}}
-            inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
+            inviteId: {type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'}
             secret: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
             expiresAt: {type: string, format: date-time}
         label: {type: string, maxLength: 80}
@@ -599,22 +1933,127 @@ components:
       required: [items]
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Library'}}
+    MetadataExportPage:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, maxItems: 5000, items: {$ref: '#/components/schemas/MetadataExportItem'}}
+    MetadataExportItem:
+      type: object
+      required: [assetId, libraryId, originNodeId, kind, sha256, byteSize, filename, capturedAt, captureLocalTime, captureOffsetMinutes, captureSource, captureConfidence, sourcePath, sourceKind, availability, tags, favorite, rating]
+      properties:
+        assetId: {type: string}
+        libraryId: {type: string}
+        originNodeId: {type: string}
+        kind: {type: string}
+        sha256: {type: string}
+        byteSize: {type: [integer, 'null']}
+        filename: {type: [string, 'null']}
+        capturedAt: {type: [string, 'null'], format: date-time}
+        captureLocalTime: {type: [string, 'null']}
+        captureOffsetMinutes: {type: [integer, 'null']}
+        captureSource: {type: [string, 'null']}
+        captureConfidence: {type: [string, 'null']}
+        sourcePath: {type: [string, 'null']}
+        sourceKind: {type: [string, 'null']}
+        availability: {type: [string, 'null']}
+        tags: {type: array, items: {type: string}}
+        favorite: {type: [boolean, 'null']}
+        rating: {type: [integer, 'null']}
+    ExternalScanReviewPage:
+      type: object
+      required: [roots]
+      properties:
+        roots: {type: array, items: {$ref: '#/components/schemas/ExternalScanReview'}}
+    ExternalScanReview:
+      type: object
+      required: [rootId, libraryId, complete, indexed, missing, offline, directories, issues, locations]
+      properties:
+        rootId: {type: string}
+        libraryId: {type: string}
+        complete: {type: boolean}
+        indexed: {type: integer, minimum: 0}
+        missing: {type: integer, minimum: 0}
+        offline: {type: integer, minimum: 0}
+        directories: {type: array, items: {type: string}}
+        issues: {type: array, items: {type: object, required: [code], properties: {code: {type: string}}}}
+        locations: {type: array, items: {$ref: '#/components/schemas/ExternalScanReviewLocation'}}
+    ExternalScanReviewLocation:
+      type: object
+      required: [locationId, originalPath, availability]
+      properties:
+        locationId: {type: string}
+        originalPath: {type: [string, 'null']}
+        availability: {type: string, enum: [offline, missing]}
     Asset:
       type: object
-      required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version]
+      required: [assetId, libraryId, originNodeId, kind, sha256, availability, filename, capturedAt, sourcePath, sourceKind, byteSize, version, tags, rating, ratingConflict, ratingCandidates]
       properties:
         assetId: {type: string}
         libraryId: {type: string}
         originNodeId: {type: string}
         kind: {type: string, enum: [photo, video, live_photo]}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
-        capturedAt: {type: [string, 'null'], format: date-time}
+        capturedAt: {type: [string, 'null'], format: date-time, description: Absolute capture instant normalized to UTC; null when the source has no verified timezone.}
+        captureLocalTime: {type: [string, 'null'], pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}$', description: Source wall time without a timezone; do not interpret it as UTC.}
+        captureOffsetMinutes: {type: [integer, 'null'], minimum: -840, maximum: 840, description: EXIF original-time offset from UTC in minutes, if verified.}
+        captureSource: {type: string, enum: [exif_offset, exif_floating, legacy_unknown, unknown]}
+        captureConfidence: {type: string, enum: [high, medium, unknown]}
         availability: {type: string, enum: [online, cached, offline, missing]}
         filename: {type: string}
         sourcePath: {type: [string, 'null']}
         sourceKind: {type: string, enum: [upload, import]}
         byteSize: {type: integer, minimum: 0}
         version: {type: string}
+        tags:
+          type: array
+          maxItems: 4096
+          description: Current merged signed OR-set membership on this Node; sorted and synchronized independently of metadata events. A writer may contribute at most 64 active tags per asset; the merged view is capped at 4096.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            description: Trimmed, case-sensitive tag text with a maximum of 128 UTF-8 bytes.
+        favorite:
+          type: boolean
+          description: Library-wide shared favorite state (not a personal bookmark); absent on pre-PM-046 Nodes without the assetFavorites diagnostic capability.
+        rating: {$ref: '#/components/schemas/NullableRatingValue', description: Current shared library-wide rating; null when clear or conflicted.}
+        ratingConflict: {type: boolean, description: True when multiple concurrent rating candidates remain unresolved.}
+        ratingCandidates:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: Current causal MV-register candidates, without author or principal identity.
+          items: {$ref: '#/components/schemas/NullableRatingValue'}
+    DuplicateCandidateAsset:
+      type: object
+      additionalProperties: false
+      required: [assetId, originNodeId, kind, sha256, byteSize, filename, sourcePath, sourceKind, availability]
+      properties:
+        assetId: {type: string}
+        originNodeId: {type: string}
+        kind: {type: string, enum: [photo, video, live_photo]}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        byteSize: {type: integer, minimum: 0}
+        filename: {type: string}
+        sourcePath: {type: [string, 'null']}
+        sourceKind: {type: string, enum: [upload, import]}
+        availability: {type: string, enum: [online, cached, offline, missing]}
+    DuplicateCandidateGroup:
+      type: object
+      additionalProperties: false
+      required: [sha256, byteSize, assets, truncated]
+      properties:
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        byteSize: {type: integer, minimum: 0}
+        assets: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/DuplicateCandidateAsset'}}
+        truncated: {type: boolean}
+    DuplicateCandidatePage:
+      type: object
+      additionalProperties: false
+      required: [groups]
+      properties:
+        groups: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/DuplicateCandidateGroup'}}
     AssetPage:
       type: object
       required: [items]
@@ -732,3 +2171,26 @@ components:
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         byteLength: {type: integer, minimum: 0}
         storageRef: {type: string}
+    ApiError:
+      type: object
+      description: Open error envelope. Clients must tolerate unknown error codes and additional fields.
+      required:
+        - error
+        - requestId
+      properties:
+        error:
+          type: string
+          minLength: 1
+          description: Stable machine-readable error code; unknown values are possible. This example list is not closed.
+          examples: [invalid_request, forbidden, not_found, capability_unavailable, writer_limit_reached, thumbnail_invalid, source_offline, source_missing, media_read_failed, unsupported_media_type, version_failed, version_not_ready, tombstone_not_active, causal_context_conflict, pairing_rejected, peer_unreachable, pending_request_not_found, peer_not_trusted, peer_not_found, idempotency_conflict, conflict, rating_conflict_limit, offset_conflict, chunk_conflict, session_failed, incomplete_upload, session_expired, too_large, checksum_mismatch, capacity_exhausted, storage_io, source_changed, unsupported_media, processing_failed, queue_full, storage_failed, version_unavailable]
+        requestId:
+          type: string
+          minLength: 1
+          description: Matches the X-Request-ID response header.
+  headers:
+    XRequestId:
+      description: Correlation ID echoed from the request X-Request-ID header or generated by the Node Agent.
+      required: true
+      schema:
+        type: string
+        minLength: 1

@@ -42,7 +42,7 @@ test('Windows gallery loads image bytes only after an explicit preview action an
     };
   });
 
-  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: ['mediaVersions', 'thumbnails'] } }));
+  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: ['mediaVersions', 'thumbnails', 'assetTags', 'gallerySearch'] } }));
   await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [
     { libraryId: 'fixture-library', title: 'Fixture library' },
     { libraryId: 'other-library', title: 'Other library' },
@@ -69,7 +69,11 @@ test('Windows gallery loads image bytes only after an explicit preview action an
     }
     await route.fulfill({ status: 200, contentType: 'image/webp', body: previewPng, headers: { 'cache-control': 'private, no-store' } });
   });
-  await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [] } }));
+  await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [], pending: [] } }));
+  await page.route('**/v1/libraries/*/assets/*/tags/**', async (route) => {
+    expect(route.request().headers().authorization).toBe('Bearer fixture-token');
+    await route.fulfill({ status: 204 });
+  });
   await page.route('**/v1/assets/*/original', async (route) => {
     originalReads += 1;
     expect(route.request().headers().authorization).toBe('Bearer fixture-token');
@@ -134,6 +138,11 @@ test('Windows gallery loads image bytes only after an explicit preview action an
   await expect(page.getByText('Work', { exact: true }).first()).toBeVisible();
 
   await page.locator('#library-choice').selectOption('other-library');
+  await expect(page.getByRole('alert')).toContainText('The library changed, so the session and its requests were cleared');
+  await page.getByLabel('Admin access token').fill('fixture-token');
+  await page.getByRole('button', { name: 'Connect node' }).click();
+  await expect(page.getByRole('banner').getByText('Online', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: /Timeline/ }).click();
   await expect(page.getByRole('button', { name: 'Preview other-photo.png' })).toBeVisible();
   await expect(page.getByText('Work', { exact: true })).toHaveCount(0);
   await expect(page.locator('.asset-preview img')).toHaveCount(0);
@@ -145,7 +154,7 @@ test('keeps placeholders and sends no thumbnail request to an older node without
   await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1 } }));
   await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [{ libraryId: 'fixture-library', title: 'Fixture library' }] } }));
   await page.route('**/v1/assets?*', (route) => route.fulfill({ status: 200, json: { items: [fixtureAsset], nextCursor: null } }));
-  await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [] } }));
+  await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [], pending: [] } }));
   await page.route('**/v1/libraries/*/assets/*/thumbnail*', async (route) => {
     thumbnailRequests += 1;
     await route.fulfill({ status: 500, json: { error: 'unexpected_thumbnail_request' } });
