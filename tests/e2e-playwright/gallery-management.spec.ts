@@ -9,6 +9,11 @@ async function setUpNode(page: Page, options: { capabilities?: string[]; assets?
 }
 
 async function reconnectNode(page: Page): Promise<void> {
+  // A same-tab reload restores the stored node session, so the connect form may be absent.
+  if (await page.getByLabel('Admin access token').count() === 0) {
+    await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
+    return;
+  }
   await page.getByLabel('Node address').fill('http://127.0.0.1:8443');
   await page.getByLabel('Admin access token').fill('fixture-token');
   await page.getByRole('button', { name: 'Connect node' }).click();
@@ -271,9 +276,10 @@ test('clears in-memory credentials on explicit disconnect', async ({ page }) => 
   await expect(page.getByLabel('Admin access token')).toHaveValue('');
   await expect(page.getByRole('button', { name: 'Connect node' })).toBeVisible();
   await expect.poll(() => page.evaluate(() => Object.keys(localStorage).some((key) => key.toLowerCase().includes('token')))).toBe(false);
+  expect(await page.evaluate(() => sessionStorage.getItem('photomesh-node-session'))).toBeNull();
 });
 
-test('persists Chinese locale preference without persisting credentials', async ({ page }) => {
+test('persists the Chinese locale and a tab-scoped node session without disk credentials', async ({ page }) => {
   await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [], pending: [] } }));
   await setUpNode(page);
   await page.locator('#locale-choice').selectOption('zh-CN');
@@ -283,8 +289,12 @@ test('persists Chinese locale preference without persisting credentials', async 
   await page.reload();
   await expect(page.locator('#locale-choice')).toHaveValue('zh-CN');
   await expect.poll(() => page.evaluate(() => document.documentElement.lang)).toBe('zh-CN');
-  await expect(page.getByLabel('节点地址')).toBeVisible();
-  await expect(page.getByLabel('管理员访问令牌')).toHaveValue('');
+  // The refreshed tab reconnects from sessionStorage; the token never reaches
+  // localStorage, the URL, or any other durable store.
+  await expect(page.getByRole('region', { name: '时间线' })).toBeVisible();
+  expect(new URL(page.url()).search).toBe('');
+  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('fixture-token');
+  expect(await page.evaluate(() => sessionStorage.getItem('photomesh-node-session') ?? '')).toContain('fixture-token');
 });
 
 test('merges legacy browser tags into Node storage and reloads server-authoritative tags', async ({ page }, testInfo) => {
@@ -322,10 +332,7 @@ test('merges legacy browser tags into Node storage and reloads server-authoritat
   await appendLegacyTag(page, 'asset-1', 'late-local-tag');
 
   await page.reload();
-  await page.getByLabel('Node address').fill('http://127.0.0.1:8443');
-  await page.getByLabel('Admin access token').fill('fixture-token');
-  await page.getByRole('button', { name: 'Connect node' }).click();
-  await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
+  await reconnectNode(page);
   await expect(page.locator('.tag-list').getByText('legacy-tag', { exact: true })).toBeVisible();
   await expect(page.locator('.tag-list').getByText('new-server-tag', { exact: true })).toBeVisible();
   await expect(page.locator('.tag-list').getByText('late-local-tag', { exact: true })).toBeVisible();

@@ -45,6 +45,21 @@ class NodeApiError extends Error {
 }
 function readPreference(key: string): string | null { try { return localStorage.getItem(key); } catch { return null; } }
 function writePreference(key: string, value: string): void { try { localStorage.setItem(key, value); } catch { /* Preferences are optional and never block the gallery. */ } }
+// The node session is kept in sessionStorage so a page refresh reconnects to the
+// same node, while closing the tab (or "断开并清除会话内存") drops the admin token.
+// Trade-off accepted by the operator: any same-origin script can read this value,
+// so it is never mirrored into localStorage, logs, telemetry, or the repository.
+type StoredNodeSession = { endpoint: string; token: string; remoteEndpointAcknowledged: boolean };
+const nodeSessionKey = 'photomesh-node-session';
+function readNodeSession(): StoredNodeSession | null {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(nodeSessionKey) ?? 'null') as Partial<StoredNodeSession> | null;
+    if (!parsed || typeof parsed.endpoint !== 'string' || typeof parsed.token !== 'string' || !parsed.token.trim()) return null;
+    return { endpoint: parsed.endpoint, token: parsed.token, remoteEndpointAcknowledged: parsed.remoteEndpointAcknowledged === true };
+  } catch { return null; }
+}
+function writeNodeSession(session: StoredNodeSession): void { try { sessionStorage.setItem(nodeSessionKey, JSON.stringify(session)); } catch { /* Session restore is optional and never blocks the gallery. */ } }
+function clearNodeSession(): void { try { sessionStorage.removeItem(nodeSessionKey); } catch { /* Nothing to clear when storage is unavailable. */ } }
 function loadCacheSettings(): GalleryCacheSettings {
   try {
     const parsed = JSON.parse(localStorage.getItem('photomesh-gallery-cache-settings') ?? 'null') as Partial<GalleryCacheSettings> | null;
@@ -69,11 +84,12 @@ async function rememberPersistentThumbnail(key: string, byteSize: number): Promi
 const { t, locale } = useI18n();
 const savedLocale = readPreference('photomesh-ui-locale');
 if (savedLocale === 'zh-CN' || savedLocale === 'en') locale.value = savedLocale;
-const endpoint = ref('http://127.0.0.1:8443');
+const restoredNodeSession = readNodeSession();
+const endpoint = ref(restoredNodeSession?.endpoint ?? 'http://127.0.0.1:8443');
 const endpointInput = ref(endpoint.value);
 const token = ref('');
-const tokenInput = ref('');
-const remoteEndpointAcknowledged = ref(false);
+const tokenInput = ref(restoredNodeSession?.token ?? '');
+const remoteEndpointAcknowledged = ref(restoredNodeSession?.remoteEndpointAcknowledged === true);
 const connected = ref(false);
 const hasSession = ref(false);
 const lastHealthCheck = ref<Date | null>(null);
@@ -353,7 +369,7 @@ function clearAuthorizedSession(clearCredentials = false): void {
   tagInput.value = ''; tagDialogError.value = ''; tagWriteBusy.value = false; pendingIdempotencyKeys.clear();
   mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
   closePreview(); clearThumbnailUrls();
-  if (clearCredentials) { token.value = ''; tokenInput.value = ''; }
+  if (clearCredentials) { token.value = ''; tokenInput.value = ''; clearNodeSession(); }
 }
 function invalidateAuthorizationSession(): void {
   if (libraryId.value) requestedLibraryAfterReconnect = libraryId.value;
@@ -436,6 +452,7 @@ async function connect(preserveSession = false): Promise<void> {
     requestedLibraryAfterReconnect = undefined;
     suppressLibraryReload = false;
     connected.value = true; hasSession.value = true;
+    writeNodeSession({ endpoint: requestedEndpoint, token: requestedToken, remoteEndpointAcknowledged: remoteEndpointAcknowledged.value });
     await loadLocalMetadata();
     if (libraryId.value) await loadPage(true, sameSession);
     if (!hasSession.value || generation !== connectionGeneration) return;
@@ -1551,12 +1568,15 @@ onMounted(() => {
   void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value;
   document.addEventListener('keydown', onPreviewKeydown);
   document.addEventListener('keydown', onSearchShortcut);
+  if (restoredNodeSession) void connect(true);
 });
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', onPreviewKeydown);
   document.removeEventListener('keydown', onSearchShortcut);
   requestedLibraryAfterReconnect = undefined;
-  clearAuthorizedSession(true);
+  // Teardown drops in-memory credentials only; the stored session survives so a
+  // remount (hot reload) does not force the operator to paste the token again.
+  clearAuthorizedSession(false);
   imageObserver?.disconnect();
 });
 
@@ -2706,20 +2726,22 @@ async function idbClear(store: string): Promise<void> {
               v-else-if="previewUrl"
               class="preview-content"
             >
-              <p
-                v-if="isCachedPreview"
-                class="muted cached-preview-note"
-                role="status"
-              >
-                {{ t('gallery.cachedPreviewNote') }}
-              </p>
-              <p
-                v-if="!cacheAvailable"
-                class="muted cached-preview-note"
-                role="status"
-              >
-                {{ t('gallery.cacheUnavailable') }}
-              </p>
+              <div class="preview-notices">
+                <p
+                  v-if="isCachedPreview"
+                  class="muted cached-preview-note"
+                  role="status"
+                >
+                  {{ t('gallery.cachedPreviewNote') }}
+                </p>
+                <p
+                  v-if="!cacheAvailable"
+                  class="muted cached-preview-note"
+                  role="status"
+                >
+                  {{ t('gallery.cacheUnavailable') }}
+                </p>
+              </div>
               <img
                 class="preview-image"
                 :src="previewUrl"

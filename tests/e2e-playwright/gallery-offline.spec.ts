@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const previewPng = readFileSync(new URL('../../docs/diagrams/assets/ER_元数据模型.png', import.meta.url));
 const fixtureAsset = {
@@ -22,6 +22,12 @@ async function connectFixture(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Connect node' }).click();
   await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Preview offline-fixture.png' })).toBeVisible();
+}
+
+async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: number; height: number }> {
+  const box = await locator.boundingBox();
+  expect(box).not.toBeNull();
+  return box!;
 }
 
 test('places preview metadata and version controls in a responsive sidebar', async ({ page }) => {
@@ -52,6 +58,59 @@ test('places preview metadata and version controls in a responsive sidebar', asy
   expect(narrowMain).not.toBeNull();
   expect(narrowSidebar).not.toBeNull();
   expect(narrowSidebar!.y).toBeGreaterThanOrEqual(narrowMain!.y + narrowMain!.height - 1);
+});
+
+test('keeps preview media inside its stage and the close action reachable at every size', async ({ page }) => {
+  await connectFixture(page);
+  for (const viewport of [{ width: 1280, height: 800 }, { width: 760, height: 844 }, { width: 390, height: 844 }, { width: 760, height: 320 }]) {
+    await page.setViewportSize(viewport);
+    await page.getByRole('button', { name: 'Preview offline-fixture.png' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Preview offline-fixture.png' });
+    const image = dialog.locator('img.preview-image');
+    await expect(image).toBeVisible();
+
+    const dialogBox = await boxOf(dialog);
+    expect(dialogBox.x).toBeGreaterThanOrEqual(0);
+    expect(dialogBox.y).toBeGreaterThanOrEqual(0);
+    expect(dialogBox.x + dialogBox.width).toBeLessThanOrEqual(viewport.width + 1);
+    expect(dialogBox.y + dialogBox.height).toBeLessThanOrEqual(viewport.height + 1);
+
+    const contentBox = await boxOf(dialog.locator('.preview-content'));
+    const imageBox = await boxOf(image);
+    expect(imageBox.width).toBeGreaterThan(0);
+    expect(imageBox.height).toBeGreaterThan(0);
+    expect(imageBox.x).toBeGreaterThanOrEqual(contentBox.x - 1);
+    expect(imageBox.y).toBeGreaterThanOrEqual(contentBox.y - 1);
+    expect(imageBox.x + imageBox.width).toBeLessThanOrEqual(contentBox.x + contentBox.width + 1);
+    expect(imageBox.y + imageBox.height).toBeLessThanOrEqual(contentBox.y + contentBox.height + 1);
+
+    const natural = await image.evaluate((element: HTMLImageElement) => ({ width: element.naturalWidth, height: element.naturalHeight }));
+    expect(natural.width).toBeGreaterThan(0);
+    expect(natural.height).toBeGreaterThan(0);
+    expect(Math.abs(imageBox.width / imageBox.height - natural.width / natural.height)).toBeLessThan(0.02);
+
+    const sidebar = dialog.locator('.preview-sidebar');
+    await sidebar.evaluate((element) => element.scrollTo(0, element.scrollHeight));
+    const closeButton = dialog.getByRole('button', { name: 'Close' });
+    await expect(closeButton).toBeInViewport({ ratio: 1 });
+    await closeButton.click();
+    await expect(dialog).toHaveCount(0);
+  }
+});
+
+test('restores the node session after a reload and forgets it on disconnect', async ({ page }) => {
+  await connectFixture(page);
+  await expect(page.getByLabel('Admin access token')).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
+  await expect(page.getByLabel('Admin access token')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Node settings' }).click();
+  await page.getByRole('button', { name: 'Disconnect and clear session memory' }).click();
+  await expect(page.getByLabel('Admin access token')).toBeVisible();
+  await page.reload();
+  await expect(page.getByLabel('Admin access token')).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Timeline' })).toHaveCount(0);
 });
 
 test('keeps the authorized session timeline available offline and previews only cached thumbnails', async ({ page }) => {
@@ -88,6 +147,9 @@ test('keeps the authorized session timeline available offline and previews only 
   await page.getByRole('button', { name: 'Preview offline-fixture.png' }).click();
   const dialog = page.getByRole('dialog', { name: 'Preview offline-fixture.png' });
   await expect(dialog.getByText('Showing the cached thumbnail only; the original is unavailable while this node is offline.')).toBeVisible();
+  // Cached/offline notices float over the stage so they never shrink the image.
+  const noticePosition = await dialog.locator('.preview-notices').evaluate((element) => getComputedStyle(element).position);
+  expect(noticePosition).toBe('absolute');
   await expect(dialog.locator('img')).toBeVisible();
   expect(originalReads).toBe(1);
   await page.keyboard.press('Escape');
