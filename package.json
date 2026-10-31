@@ -11,7 +11,7 @@
   "scripts": {
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
-    "test": "turbo run test",
+    "test": "turbo run test && node --experimental-test-coverage --test --test-coverage-include=scripts/release-gate-validation.mjs --test-coverage-lines=81 --test-coverage-branches=81 scripts/release-gate-validation.test.mjs",
     "test:e2e": "playwright test",
     "test:mobile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/flutter-test.ps1",
     "test:mobile-compose": "node scripts/mobile-compose-smoke.mjs",
