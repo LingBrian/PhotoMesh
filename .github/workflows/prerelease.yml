@@ -19,7 +19,7 @@ jobs:
   validate:
     name: Validate prerelease request
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.validate.outputs.version }}
       sha: ${{ steps.validate.outputs.sha }}
@@ -53,7 +53,7 @@ jobs:
   gate:
     name: Release acceptance gate
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 190
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +89,7 @@ jobs:
   build-web-and-nas:
     name: Build Web and NAS image
     needs: [validate, gate]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,7 +127,7 @@ jobs:
       matrix:
         include:
           - platform: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - platform: windows-x64
             runner: windows-latest
     runs-on: ${{ matrix.runner }}
@@ -208,7 +208,7 @@ jobs:
   build-android:
     name: Build signed Android APK
     needs: [validate, gate]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -315,7 +315,7 @@ jobs:
   publish:
     name: Publish prerelease
     needs: [validate, gate, build-web-and-nas, build-node-agent, build-android, build-windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
