@@ -1976,20 +1976,22 @@ async function idbClear(store: string): Promise<void> {
               v-else-if="previewUrl"
               class="preview-content"
             >
-              <p
-                v-if="isCachedPreview"
-                class="muted cached-preview-note"
-                role="status"
-              >
-                {{ t('gallery.cachedPreviewNote') }}
-              </p>
-              <p
-                v-if="!cacheAvailable"
-                class="muted cached-preview-note"
-                role="status"
-              >
-                {{ t('gallery.cacheUnavailable') }}
-              </p>
+              <div class="preview-notices">
+                <p
+                  v-if="isCachedPreview"
+                  class="muted cached-preview-note"
+                  role="status"
+                >
+                  {{ t('gallery.cachedPreviewNote') }}
+                </p>
+                <p
+                  v-if="!cacheAvailable"
+                  class="muted cached-preview-note"
+                  role="status"
+                >
+                  {{ t('gallery.cacheUnavailable') }}
+                </p>
+              </div>
               <img
                 class="preview-image"
                 :src="previewUrl"
