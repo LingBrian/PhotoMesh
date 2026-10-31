@@ -168,6 +168,10 @@ test('virtual timeline pages through 100k records and search stays server pagina
   const sortedDateSamples = [...datePerformanceSamplesMs].sort((a, b) => a - b);
   const sortedFilterSamples = [...filterCombinationSamplesMs].sort((a, b) => a - b);
   const percentile = (samples: number[], p: number): number => samples[Math.ceil(p * samples.length) - 1] ?? 0;
+  const detectedCpuCount = process.availableParallelism?.();
+  const cpuCount = typeof detectedCpuCount === 'number' && Number.isSafeInteger(detectedCpuCount) && detectedCpuCount > 0
+    ? detectedCpuCount
+    : Math.max(1, os.cpus().length);
   const sqliteVersion = (database.prepare('SELECT sqlite_version() AS version').get() as { version: string }).version;
   const sqlitePageCount = database.pragma('page_count', { simple: true }) as number;
   const databaseFileBytes = await fileSizeOrZero(databasePath);
@@ -204,13 +208,15 @@ test('virtual timeline pages through 100k records and search stays server pagina
     validation: { twoCodePointQueryStatus: shortQueryResponse.status(), expectedStatus: 400 },
     environment: {
       platform: process.platform, os: `${os.type()} ${os.release()}`, arch: process.arch, node: process.version, sqlite: sqliteVersion,
-      cpuModel: os.cpus()[0]?.model ?? 'unknown', cpuCount: os.availableParallelism?.() ?? os.cpus().length,
+      cpuModel: os.cpus()[0]?.model ?? 'unknown', cpuCount,
       totalRamMiB: Math.round(os.totalmem() / 1024 / 1024), peakRssMiB: Math.round(process.memoryUsage().rss / 1024 / 1024)
     },
     thresholdMs: 1_000,
     passed: percentile(sortedSamples, 0.95) < 1_000 && percentile(sortedDateSamples, 0.95) < 1_000 &&
       percentile(sortedFilterSamples, 0.95) < 1_000 && shortQueryResponse.status() === 400
   };
+  expect(report.environment.cpuCount, 'performance evidence must record a usable CPU count').toEqual(expect.any(Number));
+  expect(report.environment.cpuCount).toBeGreaterThan(0);
   const output = process.env.PHOTOMESH_PERF_REPORT ?? 'artifacts/performance/gallery-100k-pm049.json';
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
