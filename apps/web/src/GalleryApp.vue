@@ -35,6 +35,7 @@ type ExternalScanReview = { rootId: string; libraryId: string; complete: boolean
 type Tombstone = { assetId: string; libraryId: string; eventId: string };
 type PendingPeerApproval = { peerId: string; publicKey: string; proposedLabel: string; requestedAt: string };
 type Album = { id: string; name: string; tag: string };
+type TimelineFilterKey = 'kind' | 'sourceKind' | 'availability' | 'dateFrom' | 'dateTo';
 type BulkActionDraft = { kind: 'tag'; add: boolean } | { kind: 'favorite'; favorite: boolean };
 type BulkAction = { kind: 'tag'; add: boolean; tag: string } | { kind: 'favorite'; favorite: boolean };
 type BulkOperationEntry = { assetId: string; filename: string; status: 'queued' | 'pending' | 'success' | 'failed'; operationId?: string; error?: string };
@@ -107,6 +108,13 @@ const cursor = ref<string | null>(null);
 const search = ref('');
 const searchInput = ref<HTMLInputElement>();
 const gallerySearchEnabled = ref(false);
+const galleryFiltersEnabled = ref(false);
+const kindFilter = ref('');
+const timelineFiltersCollapsed = ref(readPreference('photomesh-ui-timeline-filters-collapsed') === 'true');
+const sourceKindFilter = ref('');
+const availabilityFilter = ref('');
+const dateFromFilter = ref('');
+const dateToFilter = ref('');
 const duplicateCandidatesEnabled = ref(false);
 const externalScanReviewEnabled = ref(false);
 const scanReviews = ref<ExternalScanReview[]>([]);
@@ -134,8 +142,16 @@ const tagWriteNotice = ref('');
 const invitation = ref<{ qrDataUrl: string; invite: unknown } | null>(null);
 const scannedInvite = ref('');
 const savedTheme = readPreference('photomesh-ui-theme');
-const theme = ref<'light' | 'dark'>(savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+const systemThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
+const theme = ref<'light' | 'dark' | 'system'>(savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'system' ? savedTheme : 'system');
+function resolveThemeColor(preference: 'light' | 'dark' | 'system'): 'light' | 'dark' {
+  return preference === 'system' ? systemThemeQuery.matches ? 'dark' : 'light' : preference;
+}
+function onSystemThemeChange(event: MediaQueryListEvent): void {
+  if (theme.value === 'system') document.documentElement.dataset.theme = event.matches ? 'dark' : 'light';
+}
 const scrollElement = ref<HTMLElement>();
+const activeFilterSummary = ref<HTMLElement>();
 const scrollTop = ref(0);
 const tags = ref<Record<string, string[]>>({});
 const serverTags = ref<Record<string, string[]>>({});
@@ -149,6 +165,7 @@ const legacyTagImportFailedKeys = new Set<string>();
 const albums = ref<Album[]>([]);
 const activeAlbum = ref('');
 const selectedAsset = ref<Asset | null>(null);
+const tagInputElement = ref<HTMLInputElement | null>(null);
 const selectedAssetIds = ref<Set<string>>(new Set());
 const selectionError = ref('');
 const bulkActionDraft = ref<BulkActionDraft | null>(null);
@@ -164,6 +181,8 @@ const previewAsset = ref<Asset | null>(null);
 const previewUrl = ref('');
 const previewBusy = ref(false);
 const previewErrorCode = ref<GalleryPreviewErrorCode | null>(null);
+const previewCopyStatus = ref<'copied' | 'failed' | ''>('');
+const previewSwipeStart = ref<{ pointerId: number; x: number; y: number } | null>(null);
 const mediaVersionsEnabled = ref(false);
 const thumbnailsEnabled = ref(false);
 const assetTagsEnabled = ref(false);
@@ -182,12 +201,15 @@ const versionPreviewUrl = ref('');
 const activeVersionId = ref('');
 const tagInput = ref('');
 const thumbnailUrls = ref<Record<string, string>>({});
+const failedThumbnailKeys = ref(new Set<string>());
 const thumbnailUrlCache = new Map<string, { url: string; byteSize: number }>();
 const thumbnailRequests = new Map<string, AbortController>();
 let thumbnailMemoryBytes = 0;
 let previewGeneration = 0;
 let previewAbort: AbortController | undefined;
 let previewInvoker: HTMLElement | null = null;
+let tagDialogInvoker: HTMLElement | null = null;
+let bulkDialogInvoker: HTMLElement | null = null;
 let imageObserver: IntersectionObserver | undefined;
 let healthTimer: ReturnType<typeof setInterval> | undefined;
 let pageGeneration = 0;
@@ -203,7 +225,8 @@ let connectAbort: AbortController | undefined;
 let requestedLibraryAfterReconnect: string | undefined;
 let endpointSwitchNeedsFreshToken = false;
 const sessionRequests = new SessionRequestScope();
-const rowHeight = 164;
+const compactTimelineQuery = window.matchMedia('(max-width: 680px)');
+const rowHeight = ref(compactTimelineQuery.matches ? 130 : 164);
 const pageSize = 100;
 const systemTimeZone = (() => {
   try {
@@ -215,6 +238,46 @@ const systemTimeZone = (() => {
 const fullDateFormatter = computed(() => new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short', timeZone: systemTimeZone }));
 
 const searchTerm = computed(() => search.value.trim());
+const hasTimelineFilters = computed(() => Boolean(kindFilter.value || sourceKindFilter.value || availabilityFilter.value || dateFromFilter.value || dateToFilter.value));
+const dateRangeError = computed(() => dateFromFilter.value && dateToFilter.value && dateFromFilter.value >= dateToFilter.value
+  ? t('gallery.invalidDateRange')
+  : '');
+const activeFilterChips = computed(() => {
+  const chips: Array<{ key: TimelineFilterKey; label: string }> = [];
+  if (kindFilter.value) chips.push({ key: 'kind', label: `${t('gallery.mediaType')}: ${t(`gallery.media${kindFilter.value === 'live_photo' ? 'LivePhoto' : kindFilter.value === 'photo' ? 'Photo' : 'Video'}`)}` });
+  if (sourceKindFilter.value) chips.push({ key: 'sourceKind', label: `${t('gallery.source')}: ${t(`gallery.source${sourceKindFilter.value === 'upload' ? 'Upload' : 'Import'}`)}` });
+  if (availabilityFilter.value) chips.push({ key: 'availability', label: `${t('gallery.availabilityFilter')}: ${t(`gallery.availability.${availabilityFilter.value}`)}` });
+  if (dateFromFilter.value) chips.push({ key: 'dateFrom', label: `${t('gallery.dateFrom')}: ${dateFromFilter.value}` });
+  if (dateToFilter.value) chips.push({ key: 'dateTo', label: `${t('gallery.dateTo')}: ${dateToFilter.value}` });
+  return chips;
+});
+async function clearTimelineFilter(key: TimelineFilterKey): Promise<void> {
+  if (key === 'kind') kindFilter.value = '';
+  else if (key === 'sourceKind') sourceKindFilter.value = '';
+  else if (key === 'availability') availabilityFilter.value = '';
+  else if (key === 'dateFrom') dateFromFilter.value = '';
+  else dateToFilter.value = '';
+  await nextTick();
+  if (activeFilterChips.value.length) activeFilterSummary.value?.focus();
+  else scrollElement.value?.focus();
+}
+async function clearTimelineFilters(): Promise<void> {
+  kindFilter.value = ''; sourceKindFilter.value = ''; availabilityFilter.value = ''; dateFromFilter.value = ''; dateToFilter.value = '';
+  await nextTick();
+  scrollElement.value?.focus();
+}
+function updateGallerySearchCapability(enabled: boolean): void {
+  if (!enabled) { dateFromFilter.value = ''; dateToFilter.value = ''; }
+  gallerySearchEnabled.value = enabled;
+}
+function updateGalleryFilterCapability(enabled: boolean): void {
+  const lostCapability = galleryFiltersEnabled.value && !enabled;
+  galleryFiltersEnabled.value = enabled;
+  if (!enabled && hasTimelineFilters.value) {
+    kindFilter.value = ''; sourceKindFilter.value = ''; availabilityFilter.value = '';
+    if (lostCapability && connected.value && hasSession.value) void loadPage(true);
+  }
+}
 const filteredAssets = computed(() => {
   return assets.value.filter((asset) => {
     if (activeAlbum.value) {
@@ -223,6 +286,11 @@ const filteredAssets = computed(() => {
     }
     return true;
   });
+});
+const timelineResultsAnnouncement = computed(() => {
+  const count = filteredAssets.value.length;
+  if (!hasSession.value || !connected.value || busy.value || count === 0) return '';
+  return t(count === 1 ? 'gallery.timelineResultLoaded' : 'gallery.timelineResultsLoaded', { count: count.toLocaleString(locale.value) });
 });
 const searchFeedback = computed(() => {
   if (!hasSession.value || !connected.value) return '';
@@ -235,11 +303,23 @@ const searchFeedback = computed(() => {
     default: return '';
   }
 });
+const searchInputDisabled = computed(() => !connected.value || !hasSession.value || !gallerySearchEnabled.value || bulkBusy.value || bulkDialogOpen.value);
+const searchDescribedBy = computed(() => {
+  const ids = searchFeedback.value ? ['search-feedback'] : [];
+  if (!searchInputDisabled.value) ids.push('search-shortcut-description');
+  return ids.join(' ') || undefined;
+});
 const selectedLibraryTitle = computed(() => libraries.value.find((library) => library.libraryId === libraryId.value)?.title ?? t('gallery.timeline'));
 const bulkActionsAvailable = computed(() => assetTagsEnabled.value || assetFavoritesEnabled.value);
 const selectedAssets = computed(() => Array.from(selectedAssetIds.value)
   .map((assetId) => assets.value.find((asset) => asset.assetId === assetId))
   .filter((asset): asset is Asset => Boolean(asset && asset.libraryId === libraryId.value)));
+const loadedAssetIds = computed(() => filteredAssets.value.map((asset) => asset.assetId));
+const loadedSelectedCount = computed(() => loadedAssetIds.value.filter((assetId) => selectedAssetIds.value.has(assetId)).length);
+const allLoadedAssetsSelected = computed(() => loadedAssetIds.value.length > 0 && loadedSelectedCount.value === loadedAssetIds.value.length);
+const someLoadedAssetsSelected = computed(() => loadedSelectedCount.value > 0 && !allLoadedAssetsSelected.value);
+const loadedSelectionWouldExceedLimit = computed(() => selectedAssetIds.value.size
+  + loadedAssetIds.value.filter((assetId) => !selectedAssetIds.value.has(assetId)).length > maxBulkSelection);
 const selectedTagOptions = computed(() => mergeAssetTags(...selectedAssets.value.map((asset) => tags.value[asset.assetId] ?? [])));
 const activeBulkAction = computed(() => bulkOperation.value?.action ?? bulkActionDraft.value);
 const bulkActionCount = computed(() => bulkOperation.value?.entries.length ?? selectedAssetIds.value.size);
@@ -277,12 +357,12 @@ function bulkInterruptionText(summary: BulkInterruptedSummary): string {
   const key = summary.kind === 'tag' ? 'gallery.bulkInterruptedTag' : 'gallery.bulkInterruptedFavorite';
   return t(key, { total: summary.total, succeeded: summary.succeeded, failed: summary.failed, uncertain: summary.uncertain, notStarted: summary.notStarted });
 }
-const visibleStart = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeight) - 3));
+const visibleStart = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeight.value) - 3));
 const visibleEnd = computed(() => Math.min(filteredAssets.value.length, visibleStart.value + 24));
 const visibleAssets = computed(() => filteredAssets.value.slice(visibleStart.value, visibleEnd.value));
 const hasLegacyTagData = computed(() => Object.values(legacyTags.value).some((assetTags) => assetTags.length > 0));
-const topSpacer = computed(() => visibleStart.value * rowHeight);
-const bottomSpacer = computed(() => Math.max(0, (filteredAssets.value.length - visibleEnd.value) * rowHeight));
+const topSpacer = computed(() => visibleStart.value * rowHeight.value);
+const bottomSpacer = computed(() => Math.max(0, (filteredAssets.value.length - visibleEnd.value) * rowHeight.value));
 const apiBase = computed(() => endpoint.value.trim().replace(/\/+$/, ''));
 const desktopRemoteEndpoint = computed(() => {
   if (!isDesktopRuntime) return '';
@@ -356,15 +436,16 @@ function clearAuthorizedSession(clearCredentials = false): void {
   searchRevision += 1;
   busy.value = false; tombstonesBusy.value = false; peersBusy.value = false;
   if (healthTimer) { clearInterval(healthTimer); healthTimer = undefined; }
-  hasSession.value = false; connected.value = false; lastHealthCheck.value = null; gallerySearchEnabled.value = false; assetFavoritesEnabled.value = false;
+  hasSession.value = false; connected.value = false; lastHealthCheck.value = null; gallerySearchEnabled.value = false; galleryFiltersEnabled.value = false; assetFavoritesEnabled.value = false;
+  kindFilter.value = ''; sourceKindFilter.value = ''; availabilityFilter.value = ''; dateFromFilter.value = ''; dateToFilter.value = '';
   search.value = ''; searchStatus.value = 'idle';
   libraries.value = []; libraryId.value = ''; assets.value = []; cursor.value = null;
   tombstones.value = []; tombstoneError.value = ''; tombstoneStatus.value = ''; restoringTombstones.value = {};
   peers.value = []; pendingPeers.value = []; peersError.value = ''; tagWriteNotice.value = ''; grantLibraryByPeer.value = {}; tagWritersByLibrary.value = {}; tagSyncStatusByPeer.value = {}; invitation.value = null; scannedInvite.value = '';
   tags.value = {}; serverTags.value = {}; legacyTags.value = {}; importedLegacyTagAssets.value = {};
   legacyTagImportState.value = 'idle'; legacyTagImportFailures.value = 0; localMetadataUnavailable.value = false; legacyTagImportInFlight.clear(); legacyTagImportFailedKeys.clear();
-  albums.value = []; activeAlbum.value = ''; selectedAsset.value = null;
-  selectedAssetIds.value = new Set(); selectionError.value = ''; bulkActionDraft.value = null; bulkDialogOpen.value = false;
+  albums.value = []; activeAlbum.value = ''; closeTagDialog(false);
+  selectedAssetIds.value = new Set(); selectionError.value = ''; bulkActionDraft.value = null; bulkDialogOpen.value = false; bulkDialogInvoker = null;
   bulkTagInput.value = ''; bulkError.value = ''; bulkOperation.value = null; bulkBusy.value = false;
   tagInput.value = ''; tagDialogError.value = ''; tagWriteBusy.value = false; pendingIdempotencyKeys.clear();
   mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; tagSyncEnabled.value = false;
@@ -437,7 +518,8 @@ async function connect(preserveSession = false): Promise<void> {
     const healthResult = await health.json() as { capabilities?: unknown };
     if (generation !== connectionGeneration) return;
     const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
-    gallerySearchEnabled.value = capabilities.includes('gallerySearch');
+    updateGallerySearchCapability(capabilities.includes('gallerySearch'));
+    updateGalleryFilterCapability(capabilities.includes('galleryFilters'));
     duplicateCandidatesEnabled.value = capabilities.includes('duplicateCandidates');
        mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
     thumbnailsEnabled.value = capabilities.includes('thumbnails');
@@ -489,12 +571,13 @@ async function checkHealth(): Promise<void> {
     if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
     if (isAuthorizationFailure(response.status) && hasSession.value) { invalidateAuthorizationSession(); return; }
     connected.value = response.ok;
-    if (!response.ok) { gallerySearchEnabled.value = false; assetFavoritesEnabled.value = false; }
+    if (!response.ok) { updateGallerySearchCapability(false); updateGalleryFilterCapability(false); assetFavoritesEnabled.value = false; }
     if (response.ok) {
       const healthResult = await response.json() as { capabilities?: unknown };
       if (generation !== healthGeneration || expectedEndpoint !== apiBase.value) return;
       const capabilities = Array.isArray(healthResult.capabilities) ? healthResult.capabilities.filter((value): value is string => typeof value === 'string') : [];
-      gallerySearchEnabled.value = capabilities.includes('gallerySearch');
+      updateGallerySearchCapability(capabilities.includes('gallerySearch'));
+      updateGalleryFilterCapability(capabilities.includes('galleryFilters'));
       duplicateCandidatesEnabled.value = capabilities.includes('duplicateCandidates');
      externalScanReviewEnabled.value = capabilities.includes('externalScanReview');
        mediaVersionsEnabled.value = capabilities.includes('mediaVersions');
@@ -511,7 +594,7 @@ async function checkHealth(): Promise<void> {
     }
   } catch (cause) {
     if (generation === healthGeneration && !isRequestAborted(cause)) {
-      connected.value = false; gallerySearchEnabled.value = false; mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; assetFavoritesEnabled.value = false; tagSyncEnabled.value = false;
+      connected.value = false; updateGallerySearchCapability(false); updateGalleryFilterCapability(false); mediaVersionsEnabled.value = false; thumbnailsEnabled.value = false; assetTagsEnabled.value = false; assetFavoritesEnabled.value = false; tagSyncEnabled.value = false;
     }
   } finally { if (healthAbort === controller) healthAbort = undefined; }
 }
@@ -529,6 +612,15 @@ async function loadPage(reset = false, preserveOnFailure = false): Promise<boole
     const query = new URLSearchParams({ libraryId: libraryId.value, limit: String(pageSize) });
     if (cursor.value) query.set('cursor', cursor.value);
     if (requestedSearch) query.set('q', requestedSearch);
+    if (gallerySearchEnabled.value) {
+      if (dateFromFilter.value) query.set('dateFrom', dateFromFilter.value);
+      if (dateToFilter.value) query.set('dateTo', dateToFilter.value);
+    }
+    if (galleryFiltersEnabled.value) {
+      if (kindFilter.value) query.set('kind', kindFilter.value);
+      if (sourceKindFilter.value) query.set('sourceKind', sourceKindFilter.value);
+      if (availabilityFilter.value) query.set('availability', availabilityFilter.value);
+    }
     const page = await request<Page>(`/v1/assets?${query.toString()}`);
     if (generation !== pageGeneration) return false;
     const pageTags = Object.fromEntries(page.items.map((asset) => [asset.assetId, Array.isArray(asset.tags) ? asset.tags : []]));
@@ -594,6 +686,11 @@ function clearSearch(): void {
   searchInput.value?.focus();
 }
 watch(search, scheduleSearch, { flush: 'sync' });
+watch([kindFilter, sourceKindFilter, availabilityFilter, dateFromFilter, dateToFilter], () => {
+  selectedAssetIds.value = new Set(); selectionError.value = '';
+  if (dateRangeError.value) return;
+  if (connected.value && hasSession.value && (galleryFiltersEnabled.value || gallerySearchEnabled.value)) void loadPage(true);
+}, { flush: 'sync' });
 watch(activeAlbum, () => { selectedAssetIds.value = new Set(); selectionError.value = ''; });
 watch(libraryId, (value, previous) => {
   if (!suppressLibraryReload && hasSession.value && previous && value && value !== previous) {
@@ -612,15 +709,36 @@ watch(libraryId, (value, previous) => {
   if (!suppressLibraryReload && value) void loadLocalMetadata().then(() => { if (libraryId.value === value) void importLegacyTagsForAssets(assets.value); });
   if (connected.value && !suppressLibraryReload) void loadPage(true);
 }, { flush: 'sync' });
-watch(theme, (value) => { document.documentElement.dataset.theme = value; writePreference('photomesh-ui-theme', value); }, { immediate: true });
+watch(theme, (value) => { document.documentElement.dataset.theme = resolveThemeColor(value); writePreference('photomesh-ui-theme', value); }, { immediate: true });
+watch(timelineFiltersCollapsed, (value) => { writePreference('photomesh-ui-timeline-filters-collapsed', String(value)); }, { immediate: true });
 watch(locale, (value) => {
   const normalized = value === 'zh-CN' ? 'zh-CN' : 'en';
   document.documentElement.lang = normalized;
   writePreference('photomesh-ui-locale', normalized);
 }, { immediate: true });
+function onCompactTimelineQueryChange(event: MediaQueryListEvent): void {
+  const nextRowHeight = event.matches ? 130 : 164;
+  const previousRowHeight = rowHeight.value;
+  if (nextRowHeight === previousRowHeight) return;
+  const timeline = scrollElement.value;
+  const nextScrollTop = scrollTop.value / previousRowHeight * nextRowHeight;
+  rowHeight.value = nextRowHeight;
+  if (timeline) void nextTick(() => {
+    if (scrollElement.value !== timeline) return;
+    timeline.scrollTop = nextScrollTop;
+    scrollTop.value = timeline.scrollTop;
+  });
+}
 function onScroll(): void {
   scrollTop.value = scrollElement.value?.scrollTop ?? 0;
   if (!activeAlbum.value && visibleEnd.value >= filteredAssets.value.length - 8 && cursor.value && !busy.value) void loadPage();
+}
+function scrollTimelineToTop(): void {
+  const timeline = scrollElement.value;
+  if (!timeline) return;
+  const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+  timeline.scrollTo({ top: 0, behavior });
+  timeline.focus({ preventScroll: true });
 }
 function observeImages(): void {
   void nextTick(() => {
@@ -740,6 +858,7 @@ function clearThumbnailUrls(): void {
   thumbnailUrlCache.clear();
   thumbnailMemoryBytes = 0;
   thumbnailUrls.value = {};
+  failedThumbnailKeys.value = new Set();
 }
 
 function touchThumbnailUrl(assetId: string): void {
@@ -758,6 +877,20 @@ function removeThumbnailUrl(assetId: string): void {
   const nextUrls = { ...thumbnailUrls.value };
   delete nextUrls[assetId];
   thumbnailUrls.value = nextUrls;
+}
+
+function handleTimelineThumbnailError(asset: Asset): void {
+  const key = thumbnailCacheKey(asset);
+  const nextFailures = new Set(failedThumbnailKeys.value);
+  nextFailures.delete(key);
+  nextFailures.add(key);
+  while (nextFailures.size > cacheSettings.value.maxEntries) {
+    const oldest = nextFailures.values().next().value as string | undefined;
+    if (!oldest) break;
+    nextFailures.delete(oldest);
+  }
+  failedThumbnailKeys.value = nextFailures;
+  removeThumbnailUrl(asset.assetId);
 }
 
 function setThumbnailUrl(assetId: string, blob: Blob): void {
@@ -785,12 +918,13 @@ function setThumbnailUrl(assetId: string, blob: Blob): void {
 }
 
 async function ensureThumbnail(assetId: string): Promise<void> {
-  if (thumbnailUrls.value[assetId]) { touchThumbnailUrl(assetId); return; }
-  if (thumbnailRequests.has(assetId)) return;
   const asset = assets.value.find((item) => item.assetId === assetId);
   if (!asset || asset.kind !== 'photo') return;
-  const generation = cacheGeneration;
   const key = thumbnailCacheKey(asset);
+  if (failedThumbnailKeys.value.has(key)) return;
+  if (thumbnailUrls.value[assetId]) { touchThumbnailUrl(assetId); return; }
+  if (thumbnailRequests.has(assetId)) return;
+  const generation = cacheGeneration;
   const controller = new AbortController();
   const lease = sessionRequests.begin(controller.signal);
   thumbnailRequests.set(assetId, controller);
@@ -853,8 +987,12 @@ function closePreview(restoreFocus = false): void {
   previewAsset.value = null;
   previewBusy.value = false;
   previewErrorCode.value = null;
+  previewCopyStatus.value = '';
   isCachedPreview.value = false;
-  if (restoreFocus && invoker?.isConnected) void nextTick(() => invoker.focus());
+  if (restoreFocus) void nextTick(() => requestAnimationFrame(() => {
+    if (invoker?.isConnected && !invoker.matches(':disabled')) invoker.focus();
+    else scrollElement.value?.focus();
+  }));
 }
 
 async function resizeImage(source: Blob, maxWidth: number, maxHeight: number): Promise<Blob> {
@@ -952,6 +1090,33 @@ function findPreviewNeighbor(direction: -1 | 1): number {
 }
 const previousPreviewIndex = computed(() => findPreviewNeighbor(-1));
 const nextPreviewIndex = computed(() => findPreviewNeighbor(1));
+function onPreviewPointerDown(event: PointerEvent): void {
+  if (event.pointerType !== 'touch' || !event.isPrimary || previewBusy.value) {
+    previewSwipeStart.value = null;
+    return;
+  }
+  previewSwipeStart.value = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+}
+function onPreviewPointerUp(event: PointerEvent): void {
+  const start = previewSwipeStart.value;
+  previewSwipeStart.value = null;
+  if (!start || event.pointerType !== 'touch' || event.pointerId !== start.pointerId || previewBusy.value) return;
+  const deltaX = event.clientX - start.x;
+  const deltaY = event.clientY - start.y;
+  if (Math.abs(deltaX) < 56 || Math.abs(deltaX) < Math.abs(deltaY) * 1.4) return;
+  navigatePreview(deltaX < 0 ? 1 : -1);
+}
+function onPreviewPointerCancel(): void { previewSwipeStart.value = null; }
+async function copyPreviewFilename(): Promise<void> {
+  const filename = previewAsset.value?.filename;
+  if (!filename) return;
+  try {
+    await navigator.clipboard.writeText(filename);
+    previewCopyStatus.value = 'copied';
+  } catch {
+    previewCopyStatus.value = 'failed';
+  }
+}
 function navigatePreview(direction: -1 | 1): void {
   if (previewBusy.value) return;
   const targetIndex = direction < 0 ? previousPreviewIndex.value : nextPreviewIndex.value;
@@ -1309,6 +1474,32 @@ async function loadLocalMetadata(): Promise<void> {
     }
   }
 }
+function openTagDialog(asset: Asset, target: EventTarget | null): void {
+  tagDialogInvoker = target instanceof HTMLElement
+    ? target
+    : document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  selectedAsset.value = asset;
+  tagInput.value = '';
+  tagDialogError.value = '';
+  void nextTick(() => tagInputElement.value?.focus());
+}
+function closeTagDialog(restoreFocus = true): void {
+  const invoker = restoreFocus ? tagDialogInvoker : null;
+  tagDialogInvoker = null;
+  selectedAsset.value = null;
+  if (invoker?.isConnected) void nextTick(() => invoker.focus());
+}
+function trapTagDialogTab(event: KeyboardEvent): void {
+  if (event.key !== 'Tab' || !(event.currentTarget instanceof HTMLElement)) return;
+  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+    'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => element.getClientRects().length > 0);
+  if (!focusable.length) { event.preventDefault(); return; }
+  const first = focusable[0]!;
+  const last = focusable[focusable.length - 1]!;
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+}
 async function saveTagAndAlbum(): Promise<void> {
   const tag = normalizeAssetTag(tagInput.value); const asset = selectedAsset.value;
   if (!tag || !asset || !libraryId.value || !hasSession.value || !connected.value) {
@@ -1341,12 +1532,31 @@ async function saveTagAndAlbum(): Promise<void> {
         return;
       }
     }
-    tagInput.value = ''; selectedAsset.value = null;
+    tagInput.value = ''; closeTagDialog();
   } catch (cause) {
     if (revision === sessionRevision && hasSession.value) tagDialogError.value = tagMutationErrorText(cause);
   } finally {
     if (revision === sessionRevision) tagWriteBusy.value = false;
   }
+}
+function onLoadedAssetsSelectionChange(event: Event): void {
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement) || bulkBusy.value || bulkDialogOpen.value || bulkFailedCount.value > 0 || bulkOperation.value) return;
+  const next = new Set(selectedAssetIds.value);
+  const assetIds = loadedAssetIds.value;
+  if (input.checked) {
+    const additions = assetIds.filter((assetId) => !next.has(assetId));
+    if (next.size + additions.length > maxBulkSelection) {
+      input.checked = false;
+      selectionError.value = t('gallery.bulkSelectionLimitReached', { limit: maxBulkSelection });
+      return;
+    }
+    for (const assetId of additions) next.add(assetId);
+  } else {
+    for (const assetId of assetIds) next.delete(assetId);
+  }
+  selectedAssetIds.value = next;
+  selectionError.value = '';
 }
 function onAssetSelectionChange(assetId: string, event: Event): void {
   const input = event.target;
@@ -1360,21 +1570,52 @@ function clearAssetSelection(): void {
   selectedAssetIds.value = new Set();
   selectionError.value = '';
 }
-function openBulkTagAction(add: boolean): void {
+function rememberBulkDialogInvoker(target: EventTarget | null | undefined): void {
+  bulkDialogInvoker = target instanceof HTMLElement
+    ? target
+    : document.activeElement instanceof HTMLElement ? document.activeElement : null;
+}
+function focusBulkDialog(): void {
+  void nextTick(() => {
+    const dialog = document.querySelector<HTMLElement>('.bulk-dialog');
+    if (!dialog) return;
+    const target = dialog.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled)')
+      ?? dialog.querySelector<HTMLElement>('button:not(:disabled)')
+      ?? dialog;
+    target.focus();
+  });
+}
+function trapBulkDialogTab(event: KeyboardEvent): void {
+  if (event.key !== 'Tab' || !(event.currentTarget instanceof HTMLElement)) return;
+  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+    'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => element.getClientRects().length > 0);
+  if (!focusable.length) { event.preventDefault(); return; }
+  const current = focusable.indexOf(document.activeElement as HTMLElement);
+  if (event.shiftKey && current <= 0) { event.preventDefault(); focusable[focusable.length - 1]!.focus(); }
+  else if (!event.shiftKey && (current < 0 || current === focusable.length - 1)) { event.preventDefault(); focusable[0]!.focus(); }
+}
+function openBulkTagAction(add: boolean, target?: EventTarget | null): void {
   if (!hasSession.value || !connected.value || !assetTagsEnabled.value || bulkBusy.value || bulkOperation.value) return;
+  rememberBulkDialogInvoker(target);
   bulkActionDraft.value = { kind: 'tag', add };
   bulkTagInput.value = add ? '' : selectedTagOptions.value[0] ?? '';
   bulkError.value = '';
   bulkDialogOpen.value = true;
+  focusBulkDialog();
 }
-function openBulkFavoriteAction(favorite: boolean): void {
+function openBulkFavoriteAction(favorite: boolean, target?: EventTarget | null): void {
   if (!hasSession.value || !connected.value || !assetFavoritesEnabled.value || bulkBusy.value || bulkOperation.value) return;
+  rememberBulkDialogInvoker(target);
   bulkActionDraft.value = { kind: 'favorite', favorite };
   bulkError.value = '';
   bulkDialogOpen.value = true;
+  focusBulkDialog();
 }
 function closeBulkDialog(): void {
   if (bulkBusy.value) return;
+  const invoker = bulkDialogInvoker;
+  bulkDialogInvoker = null;
   bulkDialogOpen.value = false;
   bulkError.value = '';
   if (bulkFailedCount.value === 0) {
@@ -1382,12 +1623,22 @@ function closeBulkDialog(): void {
     bulkActionDraft.value = null;
     bulkTagInput.value = '';
   }
+  void nextTick(() => requestAnimationFrame(() => {
+    if (invoker?.isConnected && !invoker.matches(':disabled')) { invoker.focus(); return; }
+    if (bulkFailedCount.value > 0) {
+      const retryNotice = document.querySelector<HTMLElement>('.bulk-retry-notice button');
+      if (retryNotice) { retryNotice.focus(); return; }
+    }
+    scrollElement.value?.focus();
+  }));
 }
-function reviewBulkOperation(): void {
+function reviewBulkOperation(target?: EventTarget | null): void {
   if (!bulkOperation.value) return;
+  rememberBulkDialogInvoker(target);
   bulkActionDraft.value = null;
   bulkDialogOpen.value = true;
   bulkTagInput.value = bulkOperation.value.action.kind === 'tag' ? bulkOperation.value.action.tag : '';
+  focusBulkDialog();
 }
 async function confirmBulkOperation(): Promise<void> {
   const draft = bulkActionDraft.value;
@@ -1489,9 +1740,13 @@ async function runBulkOperation(retryOnly: boolean): Promise<void> {
     selectionError.value = '';
   }
 }
-function retryFailedBulkItems(): void {
+function retryFailedBulkItems(target?: EventTarget | null): void {
   if (!bulkOperation.value || bulkFailedCount.value === 0 || bulkBusy.value) return;
-  bulkDialogOpen.value = true;
+  if (!bulkDialogOpen.value) {
+    rememberBulkDialogInvoker(target);
+    bulkDialogOpen.value = true;
+    focusBulkDialog();
+  }
   void runBulkOperation(true);
 }
 function bulkEntryStatus(entry: BulkOperationEntry): string {
@@ -1565,12 +1820,16 @@ function changeSection(value: typeof section.value): void {
    if (value === 'scan-review') void loadScanReview();
 }
 onMounted(() => {
-  void loadLocalMetadata(); document.documentElement.dataset.theme = theme.value;
+  void loadLocalMetadata(); document.documentElement.dataset.theme = resolveThemeColor(theme.value);
+  compactTimelineQuery.addEventListener('change', onCompactTimelineQueryChange);
+  systemThemeQuery.addEventListener('change', onSystemThemeChange);
   document.addEventListener('keydown', onPreviewKeydown);
   document.addEventListener('keydown', onSearchShortcut);
   if (restoredNodeSession) void connect(true);
 });
 onBeforeUnmount(() => {
+  compactTimelineQuery.removeEventListener('change', onCompactTimelineQueryChange);
+  systemThemeQuery.removeEventListener('change', onSystemThemeChange);
   document.removeEventListener('keydown', onPreviewKeydown);
   document.removeEventListener('keydown', onSearchShortcut);
   requestedLibraryAfterReconnect = undefined;
@@ -1668,6 +1927,10 @@ async function idbClear(store: string): Promise<void> {
 
 <template>
   <div class="gallery-shell">
+    <a
+      class="skip-link"
+      href="#main-content"
+    >{{ t('gallery.skipToMainContent') }}</a>
     <header class="topbar">
       <a
         class="brand"
@@ -1690,12 +1953,27 @@ async function idbClear(store: string): Promise<void> {
           autocomplete="off"
           :placeholder="t('gallery.searchPlaceholder')"
           :aria-label="t('gallery.search')"
-          aria-keyshortcuts="/ Control+K Meta+K"
-          :aria-describedby="searchFeedback ? 'search-feedback' : undefined"
-          :disabled="!connected || !hasSession || !gallerySearchEnabled || bulkBusy || bulkDialogOpen"
+          :aria-keyshortcuts="searchInputDisabled ? undefined : '/ Control+K Meta+K'"
+          :aria-describedby="searchDescribedBy"
+          :disabled="searchInputDisabled"
           @keydown.enter.prevent="submitSearch"
           @keydown.esc.prevent.stop="clearSearch"
-        ><button
+        >
+        <kbd
+          v-if="!searchInputDisabled"
+          class="search-shortcut-hint"
+          aria-hidden="true"
+        >
+          /
+        </kbd>
+        <span
+          v-if="!searchInputDisabled"
+          id="search-shortcut-description"
+          class="sr-only"
+        >
+          {{ t('gallery.searchShortcutDescription') }}
+        </span>
+        <button
           v-if="search"
           type="button"
           class="search-clear-button"
@@ -1710,6 +1988,9 @@ async function idbClear(store: string): Promise<void> {
         <span
           class="connection-pill"
           :class="connected ? 'online' : 'offline'"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
         ><i />{{ connected ? t('gallery.online') : t('gallery.offline') }}</span>
         <label
           class="sr-only"
@@ -1731,18 +2012,19 @@ async function idbClear(store: string): Promise<void> {
           v-model="theme"
           class="compact-select"
         >
-          <option value="light">{{ t('gallery.light') }}</option><option value="dark">{{ t('gallery.dark') }}</option>
+          <option value="system">{{ t('gallery.systemTheme') }}</option><option value="light">{{ t('gallery.light') }}</option><option value="dark">{{ t('gallery.dark') }}</option>
         </select>
       </div>
     </header>
     <div class="workspace">
-      <aside
+      <nav
         class="sidebar"
         :aria-label="t('gallery.navigation')"
       >
         <button
           class="nav-item"
           :class="{ active: section === 'timeline' }"
+          :aria-current="section === 'timeline' ? 'page' : undefined"
           @click="changeSection('timeline')"
         >
           <span>▦</span>{{ t('gallery.timeline') }}
@@ -1753,6 +2035,7 @@ async function idbClear(store: string): Promise<void> {
           :key="album.id"
           class="nav-item album-nav"
           :class="{ active: activeAlbum === album.id }"
+          :aria-pressed="activeAlbum === album.id"
           @click="activeAlbum = activeAlbum === album.id ? '' : album.id; changeSection('timeline')"
         >
           <span>◷</span>{{ album.name }}
@@ -1761,6 +2044,7 @@ async function idbClear(store: string): Promise<void> {
           v-if="duplicateCandidatesEnabled"
           class="nav-item"
           :class="{ active: section === 'duplicates' }"
+          :aria-current="section === 'duplicates' ? 'page' : undefined"
           @click="changeSection('duplicates')"
         >
           <span>⧉</span>{{ t('gallery.duplicateCandidates') }}
@@ -1769,6 +2053,7 @@ async function idbClear(store: string): Promise<void> {
           v-if="externalScanReviewEnabled"
           class="nav-item"
           :class="{ active: section === 'scan-review' }"
+          :aria-current="section === 'scan-review' ? 'page' : undefined"
           @click="changeSection('scan-review')"
         >
           <span>⌕</span>{{ t('gallery.scanReview') }}
@@ -1776,6 +2061,7 @@ async function idbClear(store: string): Promise<void> {
         <button
           class="nav-item"
           :class="{ active: section === 'recycle' }"
+          :aria-current="section === 'recycle' ? 'page' : undefined"
           @click="changeSection('recycle')"
         >
           <span>↺</span>{{ t('gallery.recycleBin') }}
@@ -1784,6 +2070,7 @@ async function idbClear(store: string): Promise<void> {
         <button
           class="nav-item"
           :class="{ active: section === 'settings' }"
+          :aria-current="section === 'settings' ? 'page' : undefined"
           @click="changeSection('settings')"
         >
           <span>⚙</span>{{ t('gallery.nodeSettings') }}
@@ -1794,9 +2081,13 @@ async function idbClear(store: string): Promise<void> {
             :class="connected ? 'online' : 'offline'"
           /><div><strong>{{ t('gallery.currentNode') }}</strong><small>{{ endpoint }}</small></div>
         </div>
-      </aside>
+      </nav>
 
-      <main class="content">
+      <main
+        id="main-content"
+        class="content"
+        tabindex="-1"
+      >
         <div
           v-for="summary in bulkInterrupted"
           :key="summary.id"
@@ -1886,7 +2177,16 @@ async function idbClear(store: string): Promise<void> {
                 >
                   {{ library.title }}
                 </option>
-              </select><span class="count-chip">{{ filteredAssets.length.toLocaleString(locale) }} {{ t('gallery.items') }}</span><button
+              </select>
+              <span class="count-chip">{{ filteredAssets.length.toLocaleString(locale) }} {{ t(filteredAssets.length === 1 ? 'gallery.item' : 'gallery.items') }}</span>
+              <span
+                id="timeline-results-announcement"
+                class="sr-only"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >{{ timelineResultsAnnouncement }}</span>
+              <button
                 type="button"
                 class="secondary-button"
                 :disabled="busy"
@@ -1894,8 +2194,136 @@ async function idbClear(store: string): Promise<void> {
               >
                 {{ t('gallery.refreshNodeStatus') }}
               </button>
+              <small
+                v-if="cursor && cursor !== '' && !activeAlbum && !busy"
+                class="more-results-hint"
+              >{{ t('gallery.moreResultsOnScroll') }}</small>
             </div>
           </div>
+          <button
+            type="button"
+            class="secondary-button filter-toggle-button"
+            :aria-expanded="!timelineFiltersCollapsed"
+            aria-controls="timeline-filters"
+            @click="timelineFiltersCollapsed = !timelineFiltersCollapsed"
+          >
+            {{ t(timelineFiltersCollapsed ? 'gallery.showTimelineFilters' : 'gallery.hideTimelineFilters') }}
+            <span aria-hidden="true">{{ timelineFiltersCollapsed ? '＋' : '−' }}</span>
+          </button>
+          <div
+            v-show="!timelineFiltersCollapsed"
+            id="timeline-filters"
+            class="timeline-filters"
+            role="group"
+            :aria-label="t('gallery.timelineFilters')"
+          >
+            <label>
+              {{ t('gallery.mediaType') }}
+              <select
+                v-model="kindFilter"
+                class="field-select"
+                :disabled="!connected || !hasSession || !galleryFiltersEnabled || busy || bulkBusy || bulkDialogOpen"
+              >
+                <option value="">{{ t('gallery.allMediaTypes') }}</option>
+                <option value="photo">{{ t('gallery.mediaPhoto') }}</option>
+                <option value="video">{{ t('gallery.mediaVideo') }}</option>
+                <option value="live_photo">{{ t('gallery.mediaLivePhoto') }}</option>
+              </select>
+            </label>
+            <label>
+              {{ t('gallery.source') }}
+              <select
+                v-model="sourceKindFilter"
+                class="field-select"
+                :disabled="!connected || !hasSession || !galleryFiltersEnabled || busy || bulkBusy || bulkDialogOpen"
+              >
+                <option value="">{{ t('gallery.allSources') }}</option>
+                <option value="upload">{{ t('gallery.sourceUpload') }}</option>
+                <option value="import">{{ t('gallery.sourceImport') }}</option>
+              </select>
+            </label>
+            <label>
+              {{ t('gallery.availabilityFilter') }}
+              <select
+                v-model="availabilityFilter"
+                class="field-select"
+                :disabled="!connected || !hasSession || !galleryFiltersEnabled || busy || bulkBusy || bulkDialogOpen"
+              >
+                <option value="">{{ t('gallery.allAvailability') }}</option>
+                <option
+                  v-for="value in ['online', 'cached', 'offline', 'missing']"
+                  :key="value"
+                  :value="value"
+                >
+                  {{ t(`gallery.availability.${value}`) }}
+                </option>
+              </select>
+            </label>
+            <label>
+              {{ t('gallery.dateFrom') }}
+              <input
+                v-model="dateFromFilter"
+                type="date"
+                class="field-select"
+                :disabled="!connected || !hasSession || !gallerySearchEnabled || busy || bulkBusy || bulkDialogOpen"
+              >
+            </label>
+            <label>
+              {{ t('gallery.dateTo') }}
+              <input
+                v-model="dateToFilter"
+                type="date"
+                class="field-select"
+                :disabled="!connected || !hasSession || !gallerySearchEnabled || busy || bulkBusy || bulkDialogOpen"
+              >
+            </label>
+            <small class="date-range-hint">{{ t('gallery.dateRangeHint') }}</small>
+            <button
+              v-if="hasTimelineFilters"
+              type="button"
+              class="secondary-button"
+              :disabled="busy || bulkBusy || bulkDialogOpen"
+              @click="clearTimelineFilters"
+            >
+              {{ t('gallery.clearTimelineFilters') }}
+            </button>
+          </div>
+          <div
+            v-if="activeFilterChips.length"
+            ref="activeFilterSummary"
+            class="active-filter-summary"
+            role="group"
+            tabindex="-1"
+            :aria-label="t('gallery.activeFilters')"
+          >
+            <span
+              v-for="chip in activeFilterChips"
+              :key="chip.key"
+              class="active-filter-chip"
+            >
+              <span>{{ chip.label }}</span>
+              <button
+                type="button"
+                :aria-label="t('gallery.removeTimelineFilter', { filter: chip.label })"
+                :disabled="busy || bulkBusy || bulkDialogOpen"
+                @click="clearTimelineFilter(chip.key)"
+              >×</button>
+            </span>
+          </div>
+          <p
+            v-if="dateRangeError"
+            class="notice error-notice filter-compatibility-notice"
+            role="alert"
+          >
+            {{ dateRangeError }}
+          </p>
+          <p
+            v-if="hasSession && connected && !galleryFiltersEnabled"
+            class="notice filter-compatibility-notice"
+            role="status"
+          >
+            {{ t('gallery.timelineFiltersUnsupported') }}
+          </p>
           <div
             v-if="searchFeedback"
             id="search-feedback"
@@ -1980,14 +2408,14 @@ async function idbClear(store: string): Promise<void> {
             <span>{{ bulkStatusText }}</span><button
               type="button"
               class="secondary-button"
-              @click="reviewBulkOperation"
+              @click="reviewBulkOperation($event.currentTarget)"
             >
               {{ t('gallery.bulkReviewResults') }}
             </button><button
               type="button"
               class="secondary-button"
               :disabled="bulkBusy || !connected"
-              @click="retryFailedBulkItems"
+              @click="retryFailedBulkItems($event.currentTarget)"
             >
               {{ t('gallery.bulkRetryFailed') }}
             </button>
@@ -2010,7 +2438,7 @@ async function idbClear(store: string): Promise<void> {
               type="button"
               class="secondary-button"
               :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation"
-              @click="openBulkTagAction(true)"
+              @click="openBulkTagAction(true, $event.currentTarget)"
             >
               {{ t('gallery.bulkAddTag') }}
             </button>
@@ -2019,7 +2447,7 @@ async function idbClear(store: string): Promise<void> {
               type="button"
               class="secondary-button"
               :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation || !selectedTagOptions.length"
-              @click="openBulkTagAction(false)"
+              @click="openBulkTagAction(false, $event.currentTarget)"
             >
               {{ t('gallery.bulkRemoveTag') }}
             </button>
@@ -2028,7 +2456,7 @@ async function idbClear(store: string): Promise<void> {
               type="button"
               class="secondary-button"
               :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation"
-              @click="openBulkFavoriteAction(true)"
+              @click="openBulkFavoriteAction(true, $event.currentTarget)"
             >
               {{ t('gallery.bulkFavoriteOn') }}
             </button>
@@ -2037,7 +2465,7 @@ async function idbClear(store: string): Promise<void> {
               type="button"
               class="secondary-button"
               :disabled="!connected || !hasSession || bulkBusy || !!bulkOperation"
-              @click="openBulkFavoriteAction(false)"
+              @click="openBulkFavoriteAction(false, $event.currentTarget)"
             >
               {{ t('gallery.bulkFavoriteOff') }}
             </button>
@@ -2058,20 +2486,50 @@ async function idbClear(store: string): Promise<void> {
             {{ selectionError }}
           </p>
           <div
+            v-if="bulkActionsAvailable && filteredAssets.length"
+            class="loaded-selection-control"
+          >
+            <label>
+              <input
+                type="checkbox"
+                :aria-label="t('gallery.bulkSelectLoadedAssets', { count: filteredAssets.length })"
+                aria-describedby="loaded-selection-hint"
+                :checked="allLoadedAssetsSelected"
+                :indeterminate="someLoadedAssetsSelected"
+                :disabled="!hasSession || !connected || bulkBusy || bulkDialogOpen || bulkFailedCount > 0 || !!bulkOperation || (loadedSelectionWouldExceedLimit && !allLoadedAssetsSelected)"
+                @change="onLoadedAssetsSelectionChange"
+              >
+              <span>{{ t('gallery.bulkSelectLoadedAssets', { count: filteredAssets.length }) }}</span>
+            </label>
+            <small id="loaded-selection-hint">{{ loadedSelectionWouldExceedLimit ? t('gallery.bulkSelectLoadedLimit', { limit: maxBulkSelection }) : t('gallery.bulkSelectLoadedHint') }}</small>
+          </div>
+          <div
+            id="timeline-scroll"
             ref="scrollElement"
             class="timeline-scroll"
             role="region"
             :aria-label="t('gallery.timeline')"
+            :aria-busy="busy"
             tabindex="0"
             @scroll="onScroll"
           >
             <div
-              v-if="!filteredAssets.length && !busy && !['debouncing', 'loading', 'invalid', 'unsupported', 'error'].includes(searchStatus)"
+              v-if="!filteredAssets.length && !busy && !dateRangeError && !['debouncing', 'loading', 'invalid', 'unsupported', 'error'].includes(searchStatus)"
               class="empty-state"
               role="status"
               aria-live="polite"
             >
-              <span>◇</span><h2>{{ activeAlbum ? t('gallery.noTaggedItemsLoaded') : searchTerm ? t('gallery.noSearchResults') : t('gallery.emptyLibrary') }}</h2><p>{{ activeAlbum && cursor ? t('gallery.localAlbumPageHint') : searchTerm ? t('gallery.noSearchResultsHint') : t('gallery.emptyHint') }}</p>
+              <span aria-hidden="true">◇</span>
+              <h2>{{ activeAlbum ? t('gallery.noTaggedItemsLoaded') : searchTerm ? t('gallery.noSearchResults') : hasTimelineFilters ? t('gallery.noFilterResults') : t('gallery.emptyLibrary') }}</h2>
+              <p>{{ activeAlbum && cursor ? t('gallery.localAlbumPageHint') : searchTerm ? t('gallery.noSearchResultsHint') : hasTimelineFilters ? t('gallery.noFilterResultsHint') : t('gallery.emptyHint') }}</p>
+              <button
+                v-if="hasTimelineFilters"
+                type="button"
+                class="secondary-button"
+                @click="clearTimelineFilters"
+              >
+                {{ t('gallery.resetTimelineFilters') }}
+              </button>
             </div>
             <div
               :style="{ height: `${topSpacer}px` }"
@@ -2082,13 +2540,13 @@ async function idbClear(store: string): Promise<void> {
               :key="asset.assetId"
               class="asset-row"
               :data-asset-id="asset.assetId"
-              tabindex="0"
             >
               <div class="asset-preview">
                 <button
                   type="button"
                   class="asset-preview-trigger"
-                  :aria-label="t('gallery.previewAsset', { filename: asset.filename })"
+                  :aria-label="asset.kind === 'video' ? t('gallery.videoPreviewUnavailableFor', { filename: asset.filename }) : t('gallery.previewAsset', { filename: asset.filename })"
+                  :title="asset.kind === 'video' ? t('gallery.videoPreviewUnavailable') : undefined"
                   :disabled="asset.kind !== 'photo' || (!['online', 'cached'].includes(asset.availability) && !thumbnailUrls[asset.assetId]) || (!connected && !thumbnailUrls[asset.assetId])"
                   @click="openPreview(asset)"
                 >
@@ -2096,11 +2554,14 @@ async function idbClear(store: string): Promise<void> {
                     v-if="thumbnailUrls[asset.assetId]"
                     :src="thumbnailUrls[asset.assetId]"
                     alt=""
+                    @error="handleTimelineThumbnailError(asset)"
                   ><span
                     v-else
                     class="preview-placeholder"
                     aria-hidden="true"
-                  >{{ asset.kind === 'video' ? '▶' : '◇' }}</span><span class="preview-trigger-label">{{ t('gallery.preview') }}</span>
+                  >{{ asset.kind === 'video' ? '▶' : '◇' }}</span><span class="preview-trigger-label">
+                    {{ asset.kind === 'video' ? t('gallery.videoPreviewUnavailable') : t('gallery.preview') }}
+                  </span>
                 </button><span
                   v-if="asset.kind === 'video'"
                   class="media-badge"
@@ -2156,10 +2617,10 @@ async function idbClear(store: string): Promise<void> {
                 </label>
                 <button
                   class="icon-button"
-                  :aria-label="t('gallery.addTag')"
+                  :aria-label="t('gallery.manageTagsForAsset', { filename: asset.filename })"
                   :title="t('gallery.addTag')"
                   :disabled="!hasSession || !connected || !assetTagsEnabled"
-                  @click="selectedAsset = asset; tagInput = ''; tagDialogError = ''"
+                  @click="openTagDialog(asset, $event.currentTarget)"
                 >
                   ＋
                 </button><button
@@ -2185,6 +2646,9 @@ async function idbClear(store: string): Promise<void> {
             <div
               v-else-if="cursor === '' && assets.length"
               class="end-row"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
             >
               {{ t('gallery.endOfTimeline') }}
             </div>
@@ -2202,6 +2666,16 @@ async function idbClear(store: string): Promise<void> {
               </button>
             </div>
           </div>
+          <button
+            v-if="scrollTop > rowHeight * 2 && !previewAsset"
+            type="button"
+            class="secondary-button timeline-back-to-top"
+            :aria-label="t('gallery.backToTop')"
+            aria-controls="timeline-scroll"
+            @click="scrollTimelineToTop"
+          >
+            <span aria-hidden="true">↑</span>
+          </button>
         </template>
         <section
           v-else-if="section === 'scan-review'"
@@ -2689,16 +3163,23 @@ async function idbClear(store: string): Promise<void> {
               type="button"
               class="secondary-button"
               :aria-label="t('gallery.previousPhoto')"
+              :aria-keyshortcuts="previousPreviewIndex >= 0 && !previewBusy ? 'ArrowLeft' : undefined"
               :disabled="previousPreviewIndex < 0 || previewBusy"
               @click="navigatePreview(-1)"
             >
               ← {{ t('gallery.previousPhoto') }}
             </button>
-            <span aria-live="polite">{{ previewIndex + 1 }} / {{ filteredAssets.length }}</span>
+            <span
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              :aria-label="t('gallery.previewPosition', { current: previewIndex + 1, total: filteredAssets.length, filename: previewAsset.filename })"
+            >{{ previewIndex + 1 }} / {{ filteredAssets.length }}</span>
             <button
               type="button"
               class="secondary-button"
               :aria-label="t('gallery.nextPhoto')"
+              :aria-keyshortcuts="nextPreviewIndex >= 0 && !previewBusy ? 'ArrowRight' : undefined"
               :disabled="nextPreviewIndex < 0 || previewBusy"
               @click="navigatePreview(1)"
             >
@@ -2708,6 +3189,9 @@ async function idbClear(store: string): Promise<void> {
           <div
             class="preview-stage"
             :aria-busy="previewBusy"
+            @pointerdown="onPreviewPointerDown"
+            @pointerup="onPreviewPointerUp"
+            @pointercancel="onPreviewPointerCancel"
           >
             <p
               v-if="previewBusy"
@@ -2764,6 +3248,24 @@ async function idbClear(store: string): Promise<void> {
               ×
             </button>
             <h2>{{ previewAsset.filename }}</h2>
+            <div class="preview-copy-actions">
+              <button
+                type="button"
+                class="secondary-button"
+                @click="copyPreviewFilename"
+              >
+                {{ t('gallery.copyFilename') }}
+              </button>
+              <span
+                v-if="previewCopyStatus"
+                class="preview-copy-status muted"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                {{ previewCopyStatus === 'copied' ? t('gallery.previewFilenameCopied', { filename: previewAsset.filename }) : t('gallery.previewFilenameCopyFailed') }}
+              </span>
+            </div>
           </header>
           <dl class="preview-metadata">
             <div>
@@ -2942,24 +3444,25 @@ async function idbClear(store: string): Promise<void> {
     <div
       v-if="selectedAsset"
       class="modal-backdrop"
-      @click.self="selectedAsset = null"
-      @keydown.esc="selectedAsset = null"
+      @click.self="closeTagDialog()"
+      @keydown.esc.prevent="closeTagDialog()"
     >
       <section
         class="tag-dialog"
         role="dialog"
         aria-modal="true"
         :aria-label="t('gallery.addTag')"
+        @keydown.tab="trapTagDialogTab"
       >
         <button
           class="dialog-close"
           :aria-label="t('gallery.close')"
-          @click="selectedAsset = null"
+          @click="closeTagDialog()"
         >
           ×
         </button><p class="eyebrow">{{ t('gallery.virtualAlbum') }}</p><h2>{{ selectedAsset.filename }}</h2><label>{{ t('gallery.tagName') }}<input
+          ref="tagInputElement"
           v-model="tagInput"
-          autofocus
           :placeholder="t('gallery.tagPlaceholder')"
           :disabled="tagWriteBusy || !assetTagsEnabled || !connected"
           @input="tagDialogError = ''"
@@ -2973,7 +3476,7 @@ async function idbClear(store: string): Promise<void> {
         </p><div class="dialog-actions">
           <button
             class="secondary-button"
-            @click="selectedAsset = null"
+            @click="closeTagDialog()"
           >
             {{ t('gallery.cancel') }}
           </button><button
@@ -2996,7 +3499,9 @@ async function idbClear(store: string): Promise<void> {
         class="tag-dialog bulk-dialog"
         role="dialog"
         aria-modal="true"
+        tabindex="-1"
         :aria-label="bulkDialogTitle"
+        @keydown.tab="trapBulkDialogTab"
       >
         <button
           class="dialog-close"
@@ -3018,7 +3523,6 @@ async function idbClear(store: string): Promise<void> {
         </p>
         <label v-if="activeBulkAction?.kind === 'tag' && activeBulkAction.add">{{ t('gallery.tagName') }}<input
           v-model="bulkTagInput"
-          autofocus
           :placeholder="t('gallery.tagPlaceholder')"
           :disabled="bulkBusy || !!bulkOperation"
           @input="bulkError = ''"
@@ -3026,7 +3530,6 @@ async function idbClear(store: string): Promise<void> {
         ></label>
         <label v-else-if="activeBulkAction?.kind === 'tag'">{{ t('gallery.bulkTagToRemove') }}<select
           v-model="bulkTagInput"
-          autofocus
           :disabled="bulkBusy || !!bulkOperation"
         ><option
           v-for="tag in selectedTagOptions"
@@ -3063,7 +3566,7 @@ async function idbClear(store: string): Promise<void> {
             type="button"
             class="secondary-button"
             :disabled="bulkBusy || !connected"
-            @click="retryFailedBulkItems"
+            @click="retryFailedBulkItems($event.currentTarget)"
           >
             {{ t('gallery.bulkRetryFailed') }}
           </button>

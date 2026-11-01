@@ -8,8 +8,8 @@ const fixtureAsset = {
   sourcePath: null, sourceKind: 'import', byteSize: previewPng.byteLength, version: 'v1'
 };
 
-async function connectFixture(page: Page): Promise<void> {
-  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1 } }));
+async function connectFixture(page: Page, capabilities: string[] = []): Promise<void> {
+  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities } }));
   await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [{ libraryId: 'offline-library', title: 'Offline fixture' }] } }));
   await page.route('**/v1/assets?*', (route) => route.fulfill({ status: 200, json: { items: [fixtureAsset], nextCursor: null } }));
   await page.route('**/v1/pairing/peers', (route) => route.fulfill({ status: 200, json: { peers: [], pending: [] } }));
@@ -176,4 +176,91 @@ test('does not fail a valid preview when browser thumbnail storage is unavailabl
   const dialog = page.getByRole('dialog', { name: 'Preview offline-fixture.png' });
   await expect(dialog.locator('img')).toBeVisible();
   await expect(dialog.getByRole('alert')).toHaveCount(0);
+});
+
+test('avoids redundant tab stops on timeline cards while keeping actions keyboard reachable', async ({ page }, testInfo) => {
+  await connectFixture(page);
+  const row = page.getByRole('article').filter({ hasText: 'offline-fixture.png' });
+  await expect(row).toHaveJSProperty('tabIndex', -1);
+
+  const preview = row.getByRole('button', { name: 'Preview offline-fixture.png' });
+  const download = row.getByRole('button', { name: 'Download original' });
+  await preview.focus();
+  await page.screenshot({ path: testInfo.outputPath('timeline-card-action-focus.png') });
+  await page.keyboard.press('Tab');
+  await expect(download).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(preview).toBeFocused();
+});
+
+test('traps keyboard focus in the preview modal and restores it on close', async ({ page }, testInfo) => {
+  await connectFixture(page);
+  const opener = page.getByRole('button', { name: 'Preview offline-fixture.png' });
+  await opener.click();
+  const dialog = page.getByRole('dialog', { name: 'Preview offline-fixture.png' });
+  const closeButton = dialog.getByRole('button', { name: 'Close' });
+  const copyFilename = dialog.getByRole('button', { name: 'Copy filename' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator('.preview-stage')).toHaveAttribute('aria-busy', 'false');
+  await expect(dialog.locator('img.preview-image')).toBeVisible();
+
+  await closeButton.focus();
+  await page.keyboard.press('Shift+Tab');
+  await expect(copyFilename).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(closeButton).toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath('preview-modal-focus-boundary.png') });
+  await closeButton.click();
+  await expect(opener).toBeFocused();
+});
+
+test.describe('touch-only timeline affordances', () => {
+  test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+
+  test('keeps the preview action label visible without hover', async ({ page }, testInfo) => {
+    await connectFixture(page);
+    await expect.poll(() => page.evaluate(() => window.matchMedia('(hover: none)').matches)).toBe(true);
+    const label = page.locator('.preview-trigger-label');
+    await page.getByRole('button', { name: 'Preview offline-fixture.png' }).scrollIntoViewIfNeeded();
+    await expect(label).toHaveCSS('opacity', '1');
+    await expect(label).toHaveText('Preview');
+    await page.locator('#locale-choice').selectOption('zh-CN');
+    await expect(label).toHaveText('预览');
+    await expect(label).toHaveCSS('opacity', '1');
+    await page.getByRole('button', { name: '收起筛选' }).click();
+    await expect(label).toHaveCSS('opacity', '1');
+    await page.locator('.asset-preview').screenshot({ path: testInfo.outputPath('touch-preview-label.png') });
+  });
+
+  test('keeps timeline selection and action controls at 44-pixel touch size', async ({ page }, testInfo) => {
+    await connectFixture(page, ['assetTags', 'assetFavorites']);
+    const row = page.locator('.asset-row').filter({ hasText: 'offline-fixture.png' });
+    const selectionTarget = row.locator('.asset-selection');
+    const tagButton = row.locator('.icon-button');
+    const downloadButton = row.locator('.download-button');
+    await expect(selectionTarget.locator('input')).toBeEnabled();
+    await expect(tagButton).toBeEnabled();
+    await expect(downloadButton).toBeEnabled();
+
+    for (const target of [selectionTarget, tagButton, downloadButton]) {
+      const box = await target.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.width).toBeGreaterThanOrEqual(44);
+      expect(box!.height).toBeGreaterThanOrEqual(44);
+    }
+    await row.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+    await row.screenshot({ path: testInfo.outputPath('mobile-timeline-action-targets.png') });
+  });
+
+  test('keeps language and theme controls at 44-pixel touch height', async ({ page }, testInfo) => {
+    await connectFixture(page);
+    const controls = page.locator('.top-actions .compact-select');
+    await expect(controls).toHaveCount(2);
+    for (const control of await controls.all()) {
+      const box = await control.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.height).toBeGreaterThanOrEqual(44);
+    }
+    await page.screenshot({ path: testInfo.outputPath('mobile-header-touch-targets.png') });
+  });
 });
