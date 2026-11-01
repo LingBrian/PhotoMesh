@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
-type SearchFixtureOptions = { searchCapability?: boolean; failOnce?: boolean; captureProvenance?: 'offset' | 'floating' };
+type SearchFixtureOptions = { searchCapability?: boolean; failOnce?: boolean; captureProvenance?: 'offset' | 'floating'; delaySearchResponseMs?: number };
 
 async function connectSearchFixture(page: Page, options: SearchFixtureOptions = {}): Promise<{ queries: string[]; assetQueries: string[] }> {
   const queries: string[] = [];
@@ -19,6 +19,9 @@ async function connectSearchFixture(page: Page, options: SearchFixtureOptions = 
     const q = url.searchParams.get('q');
     assetQueries.push(q ?? '');
     if (q) queries.push(q);
+    if (q && options.delaySearchResponseMs) {
+      await new Promise((resolve) => setTimeout(resolve, options.delaySearchResponseMs));
+    }
     if (q && failOnce) {
       failOnce = false;
       await route.fulfill({ status: 503, json: { error: 'capability_unavailable', requestId: 'fixture' } });
@@ -48,6 +51,85 @@ async function connectSearchFixture(page: Page, options: SearchFixtureOptions = 
   await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
   return { queries, assetQueries };
 }
+
+test('provides a localized keyboard skip link to the main content', async ({ page }, testInfo) => {
+  await page.addInitScript(() => localStorage.setItem('photomesh-ui-locale', 'en'));
+  await page.goto('/');
+  const skipLink = page.getByRole('link', { name: 'Skip to main content' });
+  await page.keyboard.press('Tab');
+  await expect(skipLink).toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath('skip-to-main-content-focused.png') });
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('main')).toBeFocused();
+
+  await page.getByLabel('Interface language').selectOption('zh-CN');
+  await expect(page.getByRole('link', { name: '跳转到主要内容' })).toHaveCount(1);
+});
+
+test('uses system focus colors for the skip link and main content in forced-colors mode', async ({ page }, testInfo) => {
+  await page.emulateMedia({ forcedColors: 'active' });
+  await page.addInitScript(() => localStorage.setItem('photomesh-ui-locale', 'en'));
+  await page.goto('/');
+  const systemHighlight = await page.evaluate(() => {
+    const probe = document.createElement('span');
+    probe.style.color = 'Highlight';
+    document.body.append(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  });
+  const skipLink = page.getByRole('link', { name: 'Skip to main content' });
+  await page.keyboard.press('Tab');
+  await expect(skipLink).toBeFocused();
+  const skipOutline = await skipLink.evaluate((element) => getComputedStyle(element).outlineColor);
+  expect(skipOutline).toBe(systemHighlight);
+  await page.screenshot({ path: testInfo.outputPath('forced-colors-skip-link-focused.png') });
+
+  await page.keyboard.press('Enter');
+  const main = page.getByRole('main');
+  await expect(main).toBeFocused();
+  const mainOutline = await main.evaluate((element) => getComputedStyle(element).outlineColor);
+  expect(mainOutline).toBe(systemHighlight);
+});
+
+test('exposes timeline request loading state to assistive technology', async ({ page }) => {
+  await connectSearchFixture(page, { delaySearchResponseMs: 250 });
+  const timeline = page.getByRole('region', { name: 'Timeline' });
+  await expect(timeline).toHaveAttribute('aria-busy', 'false');
+
+  const search = page.getByRole('searchbox', { name: 'Search gallery' });
+  await search.fill('Trip');
+  await search.press('Enter');
+  await expect(timeline).toHaveAttribute('aria-busy', 'true');
+  await expect(page.getByRole('heading', { name: 'Trip photo.jpg' })).toBeVisible();
+  await expect(timeline).toHaveAttribute('aria-busy', 'false');
+});
+
+test('discloses search shortcuts visually and to assistive technology in both locales', async ({ page }, testInfo) => {
+  const visibleShortcut = page.locator('.search-shortcut-hint');
+  await page.goto('/');
+  const disconnectedSearch = page.getByRole('searchbox', { name: 'Search gallery' });
+  await expect(disconnectedSearch).toBeDisabled();
+  await expect(visibleShortcut).toHaveCount(0);
+  expect(await disconnectedSearch.getAttribute('aria-keyshortcuts')).toBeNull();
+
+  await connectSearchFixture(page);
+  const search = page.getByRole('searchbox', { name: 'Search gallery' });
+  const accessibleHint = page.locator('#search-shortcut-description');
+  await expect(visibleShortcut).toHaveText('/');
+  await expect(visibleShortcut).toBeVisible();
+  await expect(visibleShortcut).toHaveAttribute('aria-hidden', 'true');
+  await expect(search).toHaveAttribute('aria-keyshortcuts', '/ Control+K Meta+K');
+  await expect(search).toHaveAttribute('aria-describedby', 'search-shortcut-description');
+  await expect(accessibleHint).toHaveText('Press slash or Control/Command plus K to focus search.');
+  await page.screenshot({ path: testInfo.outputPath('search-shortcut-hint.png') });
+
+  await page.locator('#locale-choice').selectOption('zh-CN');
+  await expect(accessibleHint).toHaveText('按斜杠或 Control/Command+K 聚焦搜索框。');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(visibleShortcut).toBeHidden();
+  await expect(accessibleHint).toHaveText('按斜杠或 Control/Command+K 聚焦搜索框。');
+});
 
 test('supports keyboard search, validates short terms locally, and keeps terms out of navigation and storage', async ({ page }) => {
   const consoleMessages: string[] = [];
@@ -111,7 +193,7 @@ test('shows an actionable search error and retries the current query', async ({ 
   const { queries } = await connectSearchFixture(page, { failOnce: true });
   const search = page.getByRole('searchbox', { name: 'Search gallery' });
   await search.fill('orchid');
-  await expect(page.getByRole('alert').filter({ hasText: 'HTTP 503' })).toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: 'The node is busy or low on resources' })).toBeVisible();
   await page.getByRole('button', { name: 'Retry search' }).click();
   await expect(page.getByRole('heading', { name: 'Trip photo.jpg' })).toBeVisible();
   expect(queries).toEqual(['orchid', 'orchid']);
@@ -121,6 +203,6 @@ test('disables search when the node does not advertise gallery search', async ({
   const { queries } = await connectSearchFixture(page, { searchCapability: false });
   const search = page.getByRole('searchbox', { name: 'Search gallery' });
   await expect(search).toBeDisabled();
-  await expect(page.getByRole('status').filter({ hasText: 'not supported by this node' })).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: 'Search is not supported by this node.' })).toBeVisible();
   expect(queries).toEqual([]);
 });

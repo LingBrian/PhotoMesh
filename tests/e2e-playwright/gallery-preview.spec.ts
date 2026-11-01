@@ -86,6 +86,15 @@ test('Windows gallery loads image bytes only after an explicit preview action an
   await page.getByRole('button', { name: 'Connect node' }).click();
   await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Preview fixture-photo.png' })).toBeVisible();
+  const videoRow = page.locator('.asset-row').filter({ hasText: 'middle-video.mp4' });
+  const videoPreviewButton = videoRow.locator('.asset-preview-trigger');
+  await expect(videoPreviewButton).toBeDisabled();
+  await expect(videoPreviewButton).toHaveAttribute('aria-label', 'Video preview unavailable for middle-video.mp4');
+  const videoPreviewHint = videoRow.locator('.preview-trigger-label');
+  await expect(videoPreviewHint).toHaveText('Video preview unavailable');
+  await videoPreviewButton.hover();
+  await expect(videoPreviewHint).toBeVisible();
+  await videoRow.screenshot({ path: testInfo.outputPath('video-preview-unavailable.png') });
   const dateGroupHeadings = page.locator('.timeline-day-heading');
   await expect(dateGroupHeadings).toHaveCount(3);
   await expect(dateGroupHeadings.nth(0)).toHaveText(/.+/);
@@ -101,16 +110,52 @@ test('Windows gallery loads image bytes only after an explicit preview action an
   const dialog = page.locator('.preview-dialog');
   await expect(dialog).toBeVisible();
   await expect(dialog.locator('img')).toBeVisible();
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  const copyFilename = dialog.getByRole('button', { name: 'Copy filename' });
+  await expect(copyFilename).toBeVisible();
+  await copyFilename.click();
+  await expect(dialog.locator('.preview-copy-status')).toHaveText('Copied filename to clipboard: fixture-photo.png.');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('fixture-photo.png');
+  const initialViewport = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(copyFilename).toBeVisible();
+  expect(await copyFilename.evaluate((button) => button.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);
+  await page.setViewportSize(initialViewport ?? { width: 1280, height: 720 });
   await expect.poll(() => page.evaluate(() => (window as typeof window & { __idbWriteCount?: number }).__idbWriteCount ?? 0)).toBe(1);
   await dialog.screenshot({ path: testInfo.outputPath('gallery-preview.png') });
   expect(originalReads).toBe(1);
   await expect(dialog.getByText('node-fixture')).toBeVisible();
   await expect(dialog.getByText('Online')).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Next photo' })).toBeEnabled();
-  await expect(page.getByRole('button', { name: 'Preview middle-video.mp4' })).toBeVisible();
-  await dialog.getByRole('button', { name: 'Next photo' }).click();
+  const previousButton = dialog.getByRole('button', { name: 'Previous photo' });
+  const nextButton = dialog.getByRole('button', { name: 'Next photo' });
+  await expect(previousButton).toBeDisabled();
+  await expect(previousButton).not.toHaveAttribute('aria-keyshortcuts');
+  await expect(nextButton).toBeEnabled();
+  await expect(nextButton).toHaveAttribute('aria-keyshortcuts', 'ArrowRight');
+  await expect(page.getByRole('button', { name: 'Video preview unavailable for middle-video.mp4' })).toBeVisible();
+  await page.keyboard.press('ArrowRight');
   await expect(dialog).toHaveAttribute('aria-label', 'Preview second-photo.png');
+  await expect(previousButton).toHaveAttribute('aria-keyshortcuts', 'ArrowLeft');
   await expect(dialog.locator('img')).toBeVisible();
+  const positionStatus = dialog.locator('.preview-navigation > span');
+  await expect(positionStatus).toHaveAttribute('role', 'status');
+  await expect(positionStatus).toHaveAttribute('aria-label', 'Item 3 of 4: second-photo.png');
+  await page.getByLabel('Interface language').selectOption('zh-CN');
+  await expect(positionStatus).toHaveAttribute('aria-label', '第 3 项，共 4 项：second-photo.png');
+  await expect(videoPreviewButton).toHaveAttribute('aria-label', '无法预览视频：middle-video.mp4');
+  await expect(videoPreviewHint).toHaveText('视频预览不可用');
+  const localizedCopyFilename = dialog.getByRole('button', { name: '复制文件名' });
+  await localizedCopyFilename.click();
+  await expect(dialog.locator('.preview-copy-status')).toHaveText('已复制文件名：second-photo.png。');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('second-photo.png');
+  await page.evaluate(() => Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: async () => { throw new Error('clipboard_denied'); } } as Clipboard
+  }));
+  await localizedCopyFilename.click();
+  await expect(dialog.locator('.preview-copy-status')).toHaveText('无法复制文件名，请检查剪贴板权限后重试。');
+  await page.locator('#locale-choice').selectOption('en');
+  await dialog.screenshot({ path: testInfo.outputPath('preview-navigation-status.png') });
   expect(originalReads).toBe(2);
   await page.getByRole('searchbox', { name: 'Search gallery' }).focus();
   await page.keyboard.press('ArrowLeft');
@@ -120,9 +165,55 @@ test('Windows gallery loads image bytes only after an explicit preview action an
   await expect(dialog).toHaveAttribute('aria-label', 'Preview fixture-photo.png');
   expect(originalReads).toBe(3);
 
+  await page.setViewportSize({ width: 390, height: 844 });
+  const previewStage = dialog.locator('.preview-stage');
+  await expect(previewStage).toHaveAttribute('aria-busy', 'false');
+  await expect(previewStage.locator('img')).toBeVisible();
+  const dispatchTouchSwipe = (pointerId: number, start: { x: number; y: number }, end: { x: number; y: number }) => previewStage.evaluate((element, gesture) => {
+    const dispatch = (type: 'pointerdown' | 'pointerup', point: { x: number; y: number }) => element.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: gesture.pointerId, pointerType: 'touch', isPrimary: true,
+      button: 0, clientX: point.x, clientY: point.y
+    }));
+    dispatch('pointerdown', gesture.start);
+    dispatch('pointerup', gesture.end);
+  }, { pointerId, start, end });
+  await dispatchTouchSwipe(7, { x: 260, y: 200 }, { x: 270, y: 280 });
+  await expect(dialog).toHaveAttribute('aria-label', 'Preview fixture-photo.png');
+  expect(originalReads).toBe(3);
+  await previewStage.evaluate((element) => {
+    const dispatch = (type: 'pointerdown' | 'pointerup' | 'pointercancel', x: number) => element.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 11, pointerType: 'touch', isPrimary: true, button: 0, clientX: x, clientY: 200
+    }));
+    dispatch('pointerdown', 300);
+    dispatch('pointercancel', 220);
+    dispatch('pointerup', 220);
+  });
+  await expect(dialog).toHaveAttribute('aria-label', 'Preview fixture-photo.png');
+  expect(originalReads).toBe(3);
+  await dispatchTouchSwipe(8, { x: 300, y: 200 }, { x: 220, y: 205 });
+  await expect(dialog).toHaveAttribute('aria-label', 'Preview second-photo.png');
+  await expect(previewStage).toHaveAttribute('aria-busy', 'false');
+  await expect(previewStage.locator('img')).toBeVisible();
+  await expect.poll(() => originalReads).toBe(4);
+  await page.screenshot({ path: testInfo.outputPath('preview-touch-navigation-mobile.png') });
+  await dispatchTouchSwipe(9, { x: 100, y: 200 }, { x: 180, y: 205 });
+  await expect(dialog).toHaveAttribute('aria-label', 'Preview fixture-photo.png');
+  await expect(previewStage).toHaveAttribute('aria-busy', 'false');
+  await expect(previewStage.locator('img')).toBeVisible();
+  await expect.poll(() => originalReads).toBe(5);
+
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
   await expect(opener).toBeFocused();
+
+  await opener.click();
+  await expect(dialog).toBeVisible();
+  await opener.evaluate((element) => element.remove());
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole('region', { name: 'Timeline' })).toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath('preview-focus-fallback.png') });
+
   const cleanup = await page.evaluate(() => ({
     created: (window as typeof window & { __createdObjectUrls?: string[] }).__createdObjectUrls ?? [],
     revoked: (window as typeof window & { __revokedObjectUrls?: string[] }).__revokedObjectUrls ?? [],
@@ -132,7 +223,7 @@ test('Windows gallery loads image bytes only after an explicit preview action an
   expect(writeRequests).toEqual([]);
   expect(Buffer.from(previewPng).toString('hex')).toBe(originalDigestBefore);
 
-  await page.getByRole('article').filter({ hasText: 'fixture-photo.png' }).getByRole('button', { name: 'Add a tag or create a virtual album' }).click();
+  await page.getByRole('article').filter({ hasText: 'fixture-photo.png' }).getByRole('button', { name: 'Manage tags for fixture-photo.png' }).click();
   await page.getByLabel('Tag name').fill('Work');
   await page.getByRole('button', { name: 'Save tag' }).click();
   await expect(page.getByText('Work', { exact: true }).first()).toBeVisible();
@@ -146,7 +237,32 @@ test('Windows gallery loads image bytes only after an explicit preview action an
   await expect(page.getByRole('button', { name: 'Preview other-photo.png' })).toBeVisible();
   await expect(page.getByText('Work', { exact: true })).toHaveCount(0);
   await expect(page.locator('.asset-preview img')).toHaveCount(0);
-  expect(originalReads).toBe(3);
+  expect(originalReads).toBe(6);
+});
+
+test('falls back to a placeholder when an authorized thumbnail cannot be decoded', async ({ page }) => {
+  let thumbnailReads = 0;
+  let originalReads = 0;
+  page.on('request', (request) => {
+    if (request.url().includes('/original')) originalReads += 1;
+  });
+  await page.route('**/v1/health', (route) => route.fulfill({ status: 200, json: { status: 'ok', protocolMin: 1, protocolMax: 1, capabilities: ['thumbnails'] } }));
+  await page.route('**/v1/libraries', (route) => route.fulfill({ status: 200, json: { items: [{ libraryId: 'fixture-library', title: 'Fixture library' }] } }));
+  await page.route('**/v1/assets?*', (route) => route.fulfill({ status: 200, json: { items: [fixtureAsset], nextCursor: null } }));
+  await page.route('**/v1/libraries/*/assets/*/thumbnail*', async (route) => {
+    thumbnailReads += 1;
+    await route.fulfill({ status: 200, contentType: 'image/webp', body: Buffer.from('not a valid WebP image') });
+  });
+  await page.goto('/');
+  await page.getByLabel('Node address').fill('https://node.example');
+  await page.getByLabel('Admin access token').fill('fixture-token');
+  await page.getByRole('button', { name: 'Connect node' }).click();
+  await expect(page.getByRole('region', { name: 'Timeline' })).toBeVisible();
+  await expect.poll(() => thumbnailReads).toBe(1);
+  await expect(page.locator('.asset-preview-trigger .preview-placeholder')).toBeVisible();
+  await expect(page.locator('.asset-preview-trigger img')).toHaveCount(0);
+  await page.screenshot({ path: 'test-results/thumbnail-decode-fallback.png' });
+  expect(originalReads).toBe(0);
 });
 
 test('keeps placeholders and sends no thumbnail request to an older node without the capability', async ({ page }) => {
